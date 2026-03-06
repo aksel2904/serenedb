@@ -1,7 +1,7 @@
 ////////////////////////////////////////////////////////////////////////////////
 /// DISCLAIMER
 ///
-/// Copyright 2025 SereneDB GmbH, Berlin, Germany
+/// Copyright 2026 SereneDB GmbH, Berlin, Germany
 ///
 /// Licensed under the Apache License, Version 2.0 (the "License");
 /// you may not use this file except in compliance with the License.
@@ -39,8 +39,8 @@ field_visitor ByRegexp::visitor(bytes_view pattern) {
       bstring unescaped;
       UnescapeRegexp(pattern, unescaped);
       return [term = std::move(unescaped)](const SubReader& segment,
-                                            const TermReader& field,
-                                            FilterVisitor& visitor) {
+                                           const TermReader& field,
+                                           FilterVisitor& visitor) {
         ByTerm::visit(segment, field, term, visitor);
       };
     }
@@ -58,8 +58,8 @@ field_visitor ByRegexp::visitor(bytes_view pattern) {
       bstring unescaped;
       UnescapeRegexp(raw_prefix, unescaped);
       return [prefix = std::move(unescaped)](const SubReader& segment,
-                                              const TermReader& field,
-                                              FilterVisitor& visitor) {
+                                             const TermReader& field,
+                                             FilterVisitor& visitor) {
         ByPrefix::visit(segment, field, prefix, visitor);
       };
     }

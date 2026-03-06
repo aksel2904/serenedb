@@ -1,7 +1,7 @@
 ////////////////////////////////////////////////////////////////////////////////
 /// DISCLAIMER
 ///
-/// Copyright 2025 SereneDB GmbH, Berlin, Germany
+/// Copyright 2026 SereneDB GmbH, Berlin, Germany
 ///
 /// Licensed under the Apache License, Version 2.0 (the "License");
 /// you may not use this file except in compliance with the License.
@@ -48,7 +48,6 @@ struct ByRegexpOptions : ByRegexpFilterOptions {
   }
 };
 
-
 class ByRegexp final : public FilterWithField<ByRegexpOptions> {
  public:
   static Query::ptr prepare(const PrepareContext& ctx, std::string_view field,
@@ -57,7 +56,6 @@ class ByRegexp final : public FilterWithField<ByRegexpOptions> {
   static field_visitor visitor(bytes_view pattern);
 
   Query::ptr prepare(const PrepareContext& ctx) const final {
-
     return prepare(ctx.Boost(Boost()), field(), options().pattern,
                    options().scored_terms_limit);
   }

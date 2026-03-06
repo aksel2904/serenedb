@@ -32,20 +32,19 @@ enum class RegexpType {
   Complex,         // everything else — requires full automaton
 };
 
-
 enum RegexpMeta : byte_type {
-  kDot = '.',      
-  kStar = '*',     
-  kPlus = '+',      
-  kQuestion = '?', 
-  kPipe = '|',      
-  kLParen = '(',   
-  kRParen = ')',   
-  kLBracket = '[',  
-  kRBracket = ']',  
-  kCaret = '^',    
-  kDollar = '$',   
-  kEscape = '\\',  
+  kDot = '.',
+  kStar = '*',
+  kPlus = '+',
+  kQuestion = '?',
+  kPipe = '|',
+  kLParen = '(',
+  kRParen = ')',
+  kLBracket = '[',
+  kRBracket = ']',
+  kCaret = '^',
+  kDollar = '$',
+  kEscape = '\\',
 };
 
 constexpr bool IsRegexpMeta(byte_type c) noexcept {
@@ -67,7 +66,6 @@ constexpr bool IsRegexpMeta(byte_type c) noexcept {
       return false;
   }
 }
-
 
 RegexpType ComputeRegexpType(bytes_view pattern) noexcept;
 

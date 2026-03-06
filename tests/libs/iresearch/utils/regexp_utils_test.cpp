@@ -109,8 +109,8 @@ TEST_F(RegexpUtilsTest, extract_prefix) {
             irs::ViewCast<char>(irs::ExtractRegexpPrefix(ToBytesView("x.*"))));
   EXPECT_EQ("",
             irs::ViewCast<char>(irs::ExtractRegexpPrefix(ToBytesView(".*"))));
-  EXPECT_EQ("hello world",
-            irs::ViewCast<char>(irs::ExtractRegexpPrefix(ToBytesView("hello world.*"))));
+  EXPECT_EQ("hello world", irs::ViewCast<char>(irs::ExtractRegexpPrefix(
+                             ToBytesView("hello world.*"))));
 }
 
 // Basic patterns - literals and empty
@@ -151,9 +151,9 @@ TEST_F(RegexpUtilsTest, match_dot_middle) {
   EXPECT_TRUE(Accepts(a, "abc"));
   EXPECT_TRUE(Accepts(a, "aXc"));
   EXPECT_TRUE(Accepts(a, "a1c"));
-  EXPECT_TRUE(Accepts(a, "a c"));  // space
-  EXPECT_FALSE(Accepts(a, "ac"));   // no char between
-  EXPECT_FALSE(Accepts(a, "abbc")); // two chars
+  EXPECT_TRUE(Accepts(a, "a c"));    // space
+  EXPECT_FALSE(Accepts(a, "ac"));    // no char between
+  EXPECT_FALSE(Accepts(a, "abbc"));  // two chars
 }
 
 TEST_F(RegexpUtilsTest, match_dot_multiple) {
@@ -182,10 +182,10 @@ TEST_F(RegexpUtilsTest, match_dot_single) {
 TEST_F(RegexpUtilsTest, match_star_middle) {
   auto a = irs::FromRegexp("ab*c");
   AssertProperties(a);
-  EXPECT_TRUE(Accepts(a, "ac"));      
-  EXPECT_TRUE(Accepts(a, "abc"));     
+  EXPECT_TRUE(Accepts(a, "ac"));
+  EXPECT_TRUE(Accepts(a, "abc"));
   EXPECT_TRUE(Accepts(a, "abbc"));
-  EXPECT_TRUE(Accepts(a, "abbbbbc")); 
+  EXPECT_TRUE(Accepts(a, "abbbbbc"));
   EXPECT_FALSE(Accepts(a, "aXc"));
   EXPECT_FALSE(Accepts(a, "ab"));
 }
@@ -194,8 +194,8 @@ TEST_F(RegexpUtilsTest, match_star_alone) {
   auto a = irs::FromRegexp("a*");
   AssertProperties(a);
   EXPECT_TRUE(Accepts(a, ""));
-  EXPECT_TRUE(Accepts(a, "a")); 
-  EXPECT_TRUE(Accepts(a, "aaaa")); 
+  EXPECT_TRUE(Accepts(a, "a"));
+  EXPECT_TRUE(Accepts(a, "aaaa"));
   EXPECT_FALSE(Accepts(a, "b"));
   EXPECT_FALSE(Accepts(a, "ab"));
 }
@@ -203,9 +203,9 @@ TEST_F(RegexpUtilsTest, match_star_alone) {
 TEST_F(RegexpUtilsTest, match_star_at_end) {
   auto a = irs::FromRegexp("foo*");
   AssertProperties(a);
-  EXPECT_TRUE(Accepts(a, "fo")); 
-  EXPECT_TRUE(Accepts(a, "foo")); 
-  EXPECT_TRUE(Accepts(a, "fooo")); 
+  EXPECT_TRUE(Accepts(a, "fo"));
+  EXPECT_TRUE(Accepts(a, "foo"));
+  EXPECT_TRUE(Accepts(a, "fooo"));
   EXPECT_FALSE(Accepts(a, "f"));
   EXPECT_FALSE(Accepts(a, "foobar"));
 }
@@ -216,15 +216,15 @@ TEST_F(RegexpUtilsTest, match_plus_middle) {
   auto a = irs::FromRegexp("ab+c");
   AssertProperties(a);
   EXPECT_FALSE(Accepts(a, "ac"));
-  EXPECT_TRUE(Accepts(a, "abc")); 
-  EXPECT_TRUE(Accepts(a, "abbc"));  
-  EXPECT_TRUE(Accepts(a, "abbbbbc")); 
+  EXPECT_TRUE(Accepts(a, "abc"));
+  EXPECT_TRUE(Accepts(a, "abbc"));
+  EXPECT_TRUE(Accepts(a, "abbbbbc"));
 }
 
 TEST_F(RegexpUtilsTest, match_plus_alone) {
   auto a = irs::FromRegexp("a+");
   AssertProperties(a);
-  EXPECT_FALSE(Accepts(a, ""));    
+  EXPECT_FALSE(Accepts(a, ""));
   EXPECT_TRUE(Accepts(a, "a"));
   EXPECT_TRUE(Accepts(a, "aaaa"));
   EXPECT_FALSE(Accepts(a, "b"));
@@ -234,7 +234,7 @@ TEST_F(RegexpUtilsTest, match_plus_at_end) {
   auto a = irs::FromRegexp("foo+");
   AssertProperties(a);
   EXPECT_FALSE(Accepts(a, "fo"));
-  EXPECT_TRUE(Accepts(a, "foo")); 
+  EXPECT_TRUE(Accepts(a, "foo"));
   EXPECT_TRUE(Accepts(a, "fooo"));
   EXPECT_FALSE(Accepts(a, "f"));
 }
@@ -242,7 +242,7 @@ TEST_F(RegexpUtilsTest, match_plus_at_end) {
 TEST_F(RegexpUtilsTest, match_dot_plus_alone) {
   auto a = irs::FromRegexp(".+");
   AssertProperties(a);
-  EXPECT_FALSE(Accepts(a, ""));  
+  EXPECT_FALSE(Accepts(a, ""));
   EXPECT_TRUE(Accepts(a, "a"));
   EXPECT_TRUE(Accepts(a, "abc"));
   EXPECT_TRUE(Accepts(a, "anything"));
@@ -253,23 +253,23 @@ TEST_F(RegexpUtilsTest, match_dot_plus_alone) {
 TEST_F(RegexpUtilsTest, match_question_middle) {
   auto a = irs::FromRegexp("ab?c");
   AssertProperties(a);
-  EXPECT_TRUE(Accepts(a, "ac"));  
-  EXPECT_TRUE(Accepts(a, "abc")); 
+  EXPECT_TRUE(Accepts(a, "ac"));
+  EXPECT_TRUE(Accepts(a, "abc"));
   EXPECT_FALSE(Accepts(a, "abbc"));
 }
 
 TEST_F(RegexpUtilsTest, match_question_realistic) {
   auto a = irs::FromRegexp("colou?r");
   AssertProperties(a);
-  EXPECT_TRUE(Accepts(a, "color"));  
-  EXPECT_TRUE(Accepts(a, "colour")); 
-  EXPECT_FALSE(Accepts(a, "colouur")); 
+  EXPECT_TRUE(Accepts(a, "color"));
+  EXPECT_TRUE(Accepts(a, "colour"));
+  EXPECT_FALSE(Accepts(a, "colouur"));
 }
 
 TEST_F(RegexpUtilsTest, match_question_at_end) {
   auto a = irs::FromRegexp("foo?");
   AssertProperties(a);
-  EXPECT_TRUE(Accepts(a, "fo")); 
+  EXPECT_TRUE(Accepts(a, "fo"));
   EXPECT_TRUE(Accepts(a, "foo"));
   EXPECT_FALSE(Accepts(a, "fooo"));
   EXPECT_FALSE(Accepts(a, "f"));
@@ -278,8 +278,8 @@ TEST_F(RegexpUtilsTest, match_question_at_end) {
 TEST_F(RegexpUtilsTest, match_question_at_start) {
   auto a = irs::FromRegexp("a?bc");
   AssertProperties(a);
-  EXPECT_TRUE(Accepts(a, "bc"));  
-  EXPECT_TRUE(Accepts(a, "abc")); 
+  EXPECT_TRUE(Accepts(a, "bc"));
+  EXPECT_TRUE(Accepts(a, "abc"));
   EXPECT_FALSE(Accepts(a, "aabc"));
 }
 
@@ -599,9 +599,7 @@ TEST_F(RegexpUtilsTest, match_escape_brackets) {
   EXPECT_FALSE(Accepts(a, "test"));
 }
 
-
 // .* patterns (primary use case for search)
-
 
 TEST_F(RegexpUtilsTest, match_dot_star_alone) {
   auto a = irs::FromRegexp(".*");
@@ -668,18 +666,16 @@ TEST_F(RegexpUtilsTest, match_dot_star_vs_dot_plus) {
   }
 }
 
-
 // foo.*bar - key pattern (DFA handles without backtracking)
-
 
 TEST_F(RegexpUtilsTest, match_foo_dot_star_bar_basic) {
   auto a = irs::FromRegexp("foo.*bar");
   AssertProperties(a);
-  
+
   EXPECT_TRUE(Accepts(a, "foobar"));
   EXPECT_TRUE(Accepts(a, "foo123bar"));
   EXPECT_TRUE(Accepts(a, "fooXXXbar"));
-  
+
   EXPECT_FALSE(Accepts(a, "foo"));
   EXPECT_FALSE(Accepts(a, "bar"));
   EXPECT_FALSE(Accepts(a, "fooba"));
@@ -689,7 +685,7 @@ TEST_F(RegexpUtilsTest, match_foo_dot_star_bar_basic) {
 TEST_F(RegexpUtilsTest, match_foo_dot_star_bar_tricky) {
   auto a = irs::FromRegexp("foo.*bar");
   AssertProperties(a);
-  
+
   EXPECT_TRUE(Accepts(a, "foobarbar"));
   EXPECT_TRUE(Accepts(a, "foobarbazbar"));
   EXPECT_TRUE(Accepts(a, "foobaXbar"));
@@ -702,15 +698,13 @@ TEST_F(RegexpUtilsTest, match_foo_dot_star_bar_tricky) {
 TEST_F(RegexpUtilsTest, match_foo_dot_star_bar_no_match) {
   auto a = irs::FromRegexp("foo.*bar");
   AssertProperties(a);
-  
+
   EXPECT_FALSE(Accepts(a, "foobasba"));
   EXPECT_FALSE(Accepts(a, "foobarbaz"));
   EXPECT_FALSE(Accepts(a, "fooXbar "));
 }
 
-
 // foo*bar vs foo.*bar (common confusion)
-
 
 TEST_F(RegexpUtilsTest, match_foo_star_bar_vs_foo_dot_star_bar) {
   // foo*bar = fo + (o*) + bar
@@ -721,11 +715,11 @@ TEST_F(RegexpUtilsTest, match_foo_star_bar_vs_foo_dot_star_bar) {
     EXPECT_TRUE(Accepts(a, "foobar"));
     EXPECT_TRUE(Accepts(a, "fooobar"));
     EXPECT_TRUE(Accepts(a, "foooobar"));
-    
+
     EXPECT_FALSE(Accepts(a, "fooXbar"));
     EXPECT_FALSE(Accepts(a, "foobasbar"));
   }
-  
+
   // foo.*bar = foo + (any chars) + bar
   {
     auto a = irs::FromRegexp("foo.*bar");
@@ -736,7 +730,6 @@ TEST_F(RegexpUtilsTest, match_foo_star_bar_vs_foo_dot_star_bar) {
     EXPECT_TRUE(Accepts(a, "foobasbar"));
   }
 }
-
 
 TEST_F(RegexpUtilsTest, match_utf8_literal) {
   auto a = irs::FromRegexp("привет");
@@ -1211,11 +1204,11 @@ TEST_F(RegexpUtilsTest, edge_deeply_nested) {
 TEST_F(RegexpUtilsTest, edge_mixed_quantifiers) {
   auto a = irs::FromRegexp("a+b*c?d");
   AssertProperties(a);
-  EXPECT_TRUE(Accepts(a, "ad"));       // a+ b* c? d
-  EXPECT_TRUE(Accepts(a, "abd"));      // a+ b* c? d
-  EXPECT_TRUE(Accepts(a, "acd"));      // a+ b* c? d
-  EXPECT_TRUE(Accepts(a, "abcd"));     // all present
-  EXPECT_TRUE(Accepts(a, "aaabbbcd")); // multiple a, b
-  EXPECT_FALSE(Accepts(a, "d"));       // missing a+
-  EXPECT_FALSE(Accepts(a, "abccd"));   // two c
+  EXPECT_TRUE(Accepts(a, "ad"));        // a+ b* c? d
+  EXPECT_TRUE(Accepts(a, "abd"));       // a+ b* c? d
+  EXPECT_TRUE(Accepts(a, "acd"));       // a+ b* c? d
+  EXPECT_TRUE(Accepts(a, "abcd"));      // all present
+  EXPECT_TRUE(Accepts(a, "aaabbbcd"));  // multiple a, b
+  EXPECT_FALSE(Accepts(a, "d"));        // missing a+
+  EXPECT_FALSE(Accepts(a, "abccd"));    // two c
 }
