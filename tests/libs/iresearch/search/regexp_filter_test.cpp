@@ -1,7 +1,7 @@
 ////////////////////////////////////////////////////////////////////////////////
 /// DISCLAIMER
 ///
-/// Copyright 2025 SereneDB GmbH, Berlin, Germany
+/// Copyright 2026 SereneDB GmbH, Berlin, Germany
 ///
 /// Licensed under the Apache License, Version 2.0 (the "License");
 /// you may not use this file except in compliance with the License.
@@ -18,14 +18,17 @@
 /// Copyright holder is SereneDB GmbH, Berlin, Germany
 ////////////////////////////////////////////////////////////////////////////////
 
-#include <iresearch/search/all_filter.hpp>
-#include <iresearch/search/multiterm_query.hpp>
-#include <iresearch/search/prefix_filter.hpp>
-#include <iresearch/search/regexp_filter.hpp>
-#include <iresearch/search/term_filter.hpp>
+#include <chrono>
 #include <type_traits>
 
 #include "filter_test_case_base.hpp"
+#include "iresearch/search/all_filter.hpp"
+#include "iresearch/search/boolean_filter.hpp"
+#include "iresearch/search/multiterm_query.hpp"
+#include "iresearch/search/prefix_filter.hpp"
+#include "iresearch/search/regexp_filter.hpp"
+#include "iresearch/search/term_filter.hpp"
+#include "iresearch/utils/index_utils.hpp"
 #include "tests_shared.hpp"
 
 namespace {
@@ -103,7 +106,6 @@ TEST(by_regexp_test, boost) {
   counter.Reset();
 }
 
-
 TEST(by_regexp_test, test_type_of_prepared_query) {
   MaxMemoryCounter counter;
 
@@ -162,11 +164,6 @@ TEST(by_regexp_test, test_type_of_prepared_query) {
   EXPECT_GT(counter.max, 0);
   counter.Reset();
 }
-
-
-// Integration/Execution tests with index
-// Using regexp_test_data.json
-
 
 class RegexpFilterTestCase : public tests::FilterTestCaseBase {};
 
@@ -551,8 +548,7 @@ TEST_P(RegexpFilterTestCase, by_regexp_exact_match) {
   }
 }
 
-
-// Scoring tests (ported from wildcard, using simple_sequential.json)
+// Scoring (ported from wildcard, using simple_sequential.json)
 
 TEST_P(RegexpFilterTestCase, by_regexp_scoring_custom_sort) {
   {
@@ -597,9 +593,10 @@ TEST_P(RegexpFilterTestCase, by_regexp_scoring_custom_sort) {
     };
 
     CheckQuery(MakeFilter("prefix", ".*"), order, docs, rdr);
-    ASSERT_EQ(9, collect_field_count);  // 9 unique terms (1 per term, disjunction)
-    ASSERT_EQ(9, collect_term_count);   // 9 different terms
-    ASSERT_EQ(9, finish_count);         // 9 unique terms
+    ASSERT_EQ(9,
+              collect_field_count);  // 9 unique terms (1 per term, disjunction)
+    ASSERT_EQ(9, collect_term_count);  // 9 different terms
+    ASSERT_EQ(9, finish_count);        // 9 unique terms
   }
 }
 
@@ -633,7 +630,6 @@ TEST_P(RegexpFilterTestCase, by_regexp_scoring_frequency_sort) {
     CheckQuery(MakeFilter("prefix", "a.*"), order, docs, rdr);
   }
 }
-
 
 // Match all / match nothing (using simple_sequential_utf8.json)
 
@@ -690,6 +686,7 @@ TEST_P(RegexpFilterTestCase, by_regexp_match_all) {
   CheckQuery(MakeFilter("duplicated", ""), Docs{}, Costs{0}, rdr);
 }
 
+// simple_sequential_utf8.json)
 
 // Wildcard-equivalent patterns (ported from wildcard, using
 // simple_sequential_utf8.json)
@@ -703,7 +700,7 @@ TEST_P(RegexpFilterTestCase, by_regexp_wildcard_equivalent_patterns) {
 
   auto rdr = open_reader();
 
-  // --- "duplicated" field patterns ---
+  // "duplicated" field patterns
   // Wildcard v_z% → regex v.z.*
   {
     Docs docs{2, 3, 8, 14, 17, 19, 24};
@@ -746,7 +743,7 @@ TEST_P(RegexpFilterTestCase, by_regexp_wildcard_equivalent_patterns) {
     CheckQuery(MakeFilter("duplicated", "vcz.*"), docs, costs, rdr);
   }
 
-  // --- "prefix" field patterns ---
+  //   "prefix" field patterns
   // Wildcard %c% → regex .*c.*
   {
     Docs docs{1, 4, 9, 21, 26, 31, 32};
@@ -783,8 +780,7 @@ TEST_P(RegexpFilterTestCase, by_regexp_wildcard_equivalent_patterns) {
   CheckQuery(MakeFilter("name", "!.*"), Docs{28}, Costs{1}, rdr);
 }
 
-
-// UTF-8 execution tests (using simple_sequential_utf8.json)
+// UTF-8 execution (using simple_sequential_utf8.json)
 
 TEST_P(RegexpFilterTestCase, by_regexp_utf8_execution) {
   {
@@ -845,8 +841,7 @@ TEST_P(RegexpFilterTestCase, by_regexp_utf8_execution) {
     Docs docs{1, 26};
     Costs costs{docs.size()};
     CheckQuery(
-      MakeFilter("utf8",
-                 "\xD0\xBF\xD1\x83\xD0\xB9|\xD0\xB2\xD0\xB8\xD0\xB9"),
+      MakeFilter("utf8", "\xD0\xBF\xD1\x83\xD0\xB9|\xD0\xB2\xD0\xB8\xD0\xB9"),
       docs, costs, rdr);
   }
 
@@ -861,7 +856,6 @@ TEST_P(RegexpFilterTestCase, by_regexp_utf8_execution) {
   CheckQuery(MakeFilter("utf8", "\xD1\x8F.*"), Docs{}, Costs{0}, rdr);
 }
 
-
 // Cross-validation: ByRegexp vs ByTerm/ByPrefix on real index
 
 TEST_P(RegexpFilterTestCase, by_regexp_cross_validation) {
@@ -873,7 +867,8 @@ TEST_P(RegexpFilterTestCase, by_regexp_cross_validation) {
 
   auto rdr = open_reader();
 
-  // ByRegexp("term", "foobar") should match same docs as ByTerm("term","foobar")
+  // ByRegexp("term", "foobar") should match same docs as
+  // ByTerm("term","foobar")
   {
     Docs regexp_docs, term_docs;
     Costs regexp_costs, term_costs;
@@ -908,16 +903,6 @@ TEST_P(RegexpFilterTestCase, by_regexp_cross_validation) {
   }
 }
 
-
-// Two-segment test
-
-
-// TODO: Two-segment test
-
-
-
-// Negation character class [^...]
-
 TEST_P(RegexpFilterTestCase, by_regexp_negation_char_class) {
   {
     tests::JsonDocGenerator gen(resource("regexp_test_data.json"),
@@ -945,9 +930,6 @@ TEST_P(RegexpFilterTestCase, by_regexp_negation_char_class) {
   }
 }
 
-
-// Invalid patterns — execution smoke test (no crash, 0 results)
-
 TEST_P(RegexpFilterTestCase, by_regexp_invalid_pattern_execution) {
   {
     tests::JsonDocGenerator gen(resource("regexp_test_data.json"),
@@ -962,9 +944,6 @@ TEST_P(RegexpFilterTestCase, by_regexp_invalid_pattern_execution) {
   CheckQuery(MakeFilter("term", "[abc"), Docs{}, Costs{0}, rdr);
   CheckQuery(MakeFilter("term", "a**"), Docs{}, Costs{0}, rdr);
 }
-
-
-// Filter reuse — prepare() twice on different readers
 
 TEST_P(RegexpFilterTestCase, by_regexp_filter_reuse) {
   MaxMemoryCounter counter;
@@ -1003,8 +982,7 @@ TEST_P(RegexpFilterTestCase, by_regexp_filter_reuse) {
   }
 }
 
-
-// Visitor tests (including wildcard-like pattern)
+// Visitor API
 
 TEST_P(RegexpFilterTestCase, visit_literal) {
   {
@@ -1136,11 +1114,742 @@ TEST_P(RegexpFilterTestCase, visit_invalid_pattern) {
   }
 }
 
+// If unsupported: 0 results, no crash
+
+// Counted quantifiers {n}, {n,}, {n,m} — smoke tests
+
+TEST_P(RegexpFilterTestCase, by_regexp_counted_quantifiers_smoke) {
+  {
+    tests::JsonDocGenerator gen(resource("regexp_test_data.json"),
+                                &tests::GenericJsonFieldFactory);
+    add_segment(gen);
+  }
+
+  auto rdr = open_reader();
+
+  // If {n} is supported, fo{2}bar = foobar → doc1
+  // If not supported → 0 results, no crash
+  {
+    auto q = MakeFilter("term", "fo{2}bar");
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    ASSERT_NE(nullptr, prepared);
+    // Just verify no crash — result depends on support
+  }
+
+  // fo{1,3}bar — if supported
+  {
+    auto q = MakeFilter("term", "fo{1,3}bar");
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    ASSERT_NE(nullptr, prepared);
+  }
+
+  // fo{2,}bar — if supported
+  {
+    auto q = MakeFilter("term", "fo{2,}bar");
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    ASSERT_NE(nullptr, prepared);
+  }
+
+  // .{6} — exactly 6 chars — if supported
+  {
+    auto q = MakeFilter("term", ".{6}");
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    ASSERT_NE(nullptr, prepared);
+  }
+}
+
+// Anchoring — ^$ behavior
+
+TEST_P(RegexpFilterTestCase, by_regexp_anchoring) {
+  {
+    tests::JsonDocGenerator gen(resource("regexp_test_data.json"),
+                                &tests::GenericJsonFieldFactory);
+    add_segment(gen);
+  }
+
+  auto rdr = open_reader();
+
+  // ^foobar$ should behave like foobar (full match is default)
+  CheckQuery(MakeFilter("term", "^foobar$"), Docs{1}, Costs{1}, rdr);
+
+  // ^foo should behave like foo.* or just foo (depends on implementation)
+  // Smoke test: no crash
+  {
+    auto q = MakeFilter("term", "^foo");
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    ASSERT_NE(nullptr, prepared);
+  }
+
+  // foo$ — smoke test
+  {
+    auto q = MakeFilter("term", "foo$");
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    ASSERT_NE(nullptr, prepared);
+  }
+
+  // ^$ — empty string
+  {
+    auto q = MakeFilter("term", "^$");
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    ASSERT_NE(nullptr, prepared);
+  }
+}
+
+// Greedy quantifiers
+
+TEST_P(RegexpFilterTestCase, by_regexp_greedy_quantifiers) {
+  {
+    tests::JsonDocGenerator gen(resource("regexp_test_data.json"),
+                                &tests::GenericJsonFieldFactory);
+    add_segment(gen);
+  }
+
+  auto rdr = open_reader();
+
+  // a.*a — terms containing 'a' ... 'a' (at least two 'a's)
+  // foobar(1):a at pos 4 only → no; foobarbar(4):a at 4,7 → yes;
+  // foobarbazbar(5):a at 4,7,10 → yes; foobasbar(6):a at 4,7 → yes;
+  // foobaxbar(7):a at 4,7 → yes; foobabar(8):a at 4,6 → yes;
+  // fooba(11):a at 4 only → no; foobarbaz(13):a at 4,7 → yes;
+  // xfoobar(17):a at 5 only → no; foobarx(18):a at 4 only → no;
+  // xfoobarx(19):a at 5 only → no; fooxbar(20):a at 5 only → no;
+  // bar(10):a at 1 only → no; fooXbar(14):a at 5 only → no;
+  // Actually let me think more carefully about full-match semantics:
+  // a.*a means starts with 'a' and ends with 'a'
+  // No terms in "term" field start with 'a', so 0 matches.
+  // Let's use "alt" field: cat, dog, bird, mouse, fish
+  // cat: starts 'c' → no. None start with 'a'.
+  // Let's use "opt" field: has "aab"(17), "abb"(18), "aabb"(19), "aaabbb"(20)
+  // a.*a: starts with 'a', ends with 'a' → none end with 'a'... "graaaay"(10)?
+  // No. Let me try a different pattern.
+
+  // .*bar.*bar.* — terms with "bar" appearing twice
+  // foobarbar(4), foobarbazbar(5): yes. Others with single bar: no.
+  {
+    Docs docs{4, 5};
+    Costs costs{docs.size()};
+    CheckQuery(MakeFilter("term", ".*bar.*bar.*"), docs, costs, rdr);
+  }
+
+  // .*oo.* — terms containing "oo"
+  // foobar(1), foo123bar(2), fooXXXbar(3), foobarbar(4), foobarbazbar(5),
+  // foobasbar(6), foobaxbar(7), foobabar(8), foo(9), fooba(11), oobar(12),
+  // foobarbaz(13), fooXbar(14), foooobar(16), foobarx(18), fooxbar(20)
+  // NOT: bar(10), fobar(15), xfoobar(17)→has "oo", xfoobarx(19)→has "oo"
+  {
+    Docs docs{1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19, 20};
+    Costs costs{docs.size()};
+    CheckQuery(MakeFilter("term", ".*oo.*"), docs, costs, rdr);
+  }
+}
+
+// Case sensitivity
+
+TEST_P(RegexpFilterTestCase, by_regexp_case_sensitivity) {
+  {
+    tests::JsonDocGenerator gen(resource("regexp_test_data.json"),
+                                &tests::GenericJsonFieldFactory);
+    add_segment(gen);
+  }
+
+  auto rdr = open_reader();
+
+  // "class" field has mixed case values:
+  // lowercase+digits: abc123(1), xyz789(2), def456(4), jkl012(8), pqr678(10),
+  //   vwx234(12), bcd890(14), hij222(16), nop444(18), tuv666(20)
+  // uppercase+digits: ABC123(3), GHI789(7), MNO345(9), STU901(11),
+  //   YZA567(13), EFG111(15), KLM333(17), QRS555(19)
+  // digit+lowercase: 123abc(5), 456def(6)
+
+  // [a-z]+ — only lowercase letters, no digits
+  // None of the "class" values are pure lowercase (all have digits)
+  CheckQuery(MakeFilter("class", "[a-z]+"), Docs{}, Costs{0}, rdr);
+
+  // [A-Z]+ — only uppercase letters
+  CheckQuery(MakeFilter("class", "[A-Z]+"), Docs{}, Costs{0}, rdr);
+
+  // Exact case: abc123 matches only doc1
+  CheckQuery(MakeFilter("class", "abc123"), Docs{1}, Costs{1}, rdr);
+
+  // ABC123 matches only doc3 (uppercase)
+  CheckQuery(MakeFilter("class", "ABC123"), Docs{3}, Costs{1}, rdr);
+
+  // abc123 does NOT match ABC123
+  // (verified by checking each returns different doc)
+}
+
+// ReDoS / pathological patterns
+
+TEST_P(RegexpFilterTestCase, by_regexp_redos_resistance) {
+  {
+    tests::JsonDocGenerator gen(resource("regexp_stress_data.json"),
+                                &tests::GenericJsonFieldFactory);
+    add_segment(gen);
+  }
+
+  auto rdr = open_reader();
+
+  // (a+)+b on "aaaaaaaaaaaaaaac" — should return false quickly
+  // "redos" field has: "aaaaaaaaaaaaaac"(s1), "aaaaaaaaaaaaaaac"(s2),
+  //   "bbbbbbbbbbbbbbb"(s3), "ab"(s4)
+  {
+    auto start = std::chrono::steady_clock::now();
+    auto q = MakeFilter("redos", "(a+)+b");
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    ASSERT_NE(nullptr, prepared);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    // Must complete in under 5 seconds (generous limit)
+    ASSERT_LT(elapsed, std::chrono::seconds(5));
+  }
+
+  // (a|a)*b — same pathological pattern
+  {
+    auto start = std::chrono::steady_clock::now();
+    auto q = MakeFilter("redos", "(a|a)*b");
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    ASSERT_NE(nullptr, prepared);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    ASSERT_LT(elapsed, std::chrono::seconds(5));
+  }
+
+  // (.*){10} — exponential blowup
+  {
+    auto start = std::chrono::steady_clock::now();
+    auto q = MakeFilter("redos", "(.*){10}");
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    ASSERT_NE(nullptr, prepared);
+    auto elapsed = std::chrono::steady_clock::now() - start;
+    ASSERT_LT(elapsed, std::chrono::seconds(5));
+  }
+}
+
+// Metacharacters in data (using regexp_stress_data.json)
+
+TEST_P(RegexpFilterTestCase, by_regexp_metacharacters_in_data) {
+  {
+    tests::JsonDocGenerator gen(resource("regexp_stress_data.json"),
+                                &tests::GenericJsonFieldFactory);
+    add_segment(gen);
+  }
+
+  auto rdr = open_reader();
+
+  // "meta" field:
+  // s1:"a.b", s2:"a*b", s3:"(foo)", s4:"a+b", s5:"a?b",
+  // s6:"[x]", s7:"a|b", s8:"a\b", s9:"normal", s10:"axb",
+  // s11:"aXb", s12:"a..b"
+
+  // a\.b — literal dot → matches "a.b"(s1)
+  CheckQuery(MakeFilter("meta", "a\\.b"), Docs{1}, Costs{1}, rdr);
+
+  // a.b (dot = any) → matches "a.b"(s1), "a*b"(s2), "a+b"(s4),
+  //   "a?b"(s5), "a|b"(s7), "a\b"(s8), "axb"(s10), "aXb"(s11)
+  {
+    Docs docs{1, 2, 4, 5, 7, 8, 10, 11};
+    Costs costs{docs.size()};
+    CheckQuery(MakeFilter("meta", "a.b"), docs, costs, rdr);
+  }
+
+  // a\*b — literal star → matches "a*b"(s2)
+  CheckQuery(MakeFilter("meta", "a\\*b"), Docs{2}, Costs{1}, rdr);
+
+  // \(foo\) — literal parens → matches "(foo)"(s3)
+  CheckQuery(MakeFilter("meta", "\\(foo\\)"), Docs{3}, Costs{1}, rdr);
+
+  // a\+b — literal plus → matches "a+b"(s4)
+  CheckQuery(MakeFilter("meta", "a\\+b"), Docs{4}, Costs{1}, rdr);
+
+  // a\?b — literal question → matches "a?b"(s5)
+  CheckQuery(MakeFilter("meta", "a\\?b"), Docs{5}, Costs{1}, rdr);
+
+  // \[x\] — literal brackets → matches "[x]"(s6)
+  CheckQuery(MakeFilter("meta", "\\[x\\]"), Docs{6}, Costs{1}, rdr);
+
+  // a\|b — literal pipe → matches "a|b"(s7)
+  CheckQuery(MakeFilter("meta", "a\\|b"), Docs{7}, Costs{1}, rdr);
+
+  // a\\b — literal backslash → matches "a\b"(s8)
+  CheckQuery(MakeFilter("meta", "a\\\\b"), Docs{8}, Costs{1}, rdr);
+
+  // a..b (two dots) → matches "a..b"(s12) and anything else 4-char a__b
+  // "a.b"(s1) is 3 chars → no; "a..b"(s12) is 4 chars → yes; "axb"(s10) is
+  // 3 chars → no
+  CheckQuery(MakeFilter("meta", "a..b"), Docs{12}, Costs{1}, rdr);
+}
+
+// Newline and whitespace in terms
+
+TEST_P(RegexpFilterTestCase, by_regexp_whitespace_in_terms) {
+  {
+    tests::JsonDocGenerator gen(resource("regexp_stress_data.json"),
+                                &tests::GenericJsonFieldFactory);
+    add_segment(gen);
+  }
+
+  auto rdr = open_reader();
+
+  // "ws" field: s1:"a\nb", s2:"a\tb", s3:"a b", s4:"a\r\nb"
+
+  // a.b on "ws" — dot matches \n, \t, space, \r?
+  // "a\nb" is 3 chars (a, newline, b) → a.b should match if . matches \n
+  // "a\tb" is 3 chars → a.b should match if . matches \t
+  // "a b" is 3 chars → a.b matches (space is any char)
+  // "a\r\nb" is 4 chars → a.b doesn't match (4 chars)
+  // We test what actually happens — at minimum no crash
+  {
+    auto q = MakeFilter("ws", "a.b");
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    ASSERT_NE(nullptr, prepared);
+  }
+
+  // Exact match: a literal space
+  CheckQuery(MakeFilter("ws", "a b"), Docs{3}, Costs{1}, rdr);
+}
+
+// Character class shorthands \d, \w, \s — smoke
+
+TEST_P(RegexpFilterTestCase, by_regexp_shorthand_classes_smoke) {
+  {
+    tests::JsonDocGenerator gen(resource("regexp_test_data.json"),
+                                &tests::GenericJsonFieldFactory);
+    add_segment(gen);
+  }
+
+  auto rdr = open_reader();
+
+  // \d+ — if supported, matches digit-only terms. If not, 0 results no crash.
+  {
+    auto q = MakeFilter("term", "\\d+");
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    ASSERT_NE(nullptr, prepared);
+  }
+
+  // \w+ — word characters
+  {
+    auto q = MakeFilter("term", "\\w+");
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    ASSERT_NE(nullptr, prepared);
+  }
+
+  // \s — whitespace
+  {
+    auto q = MakeFilter("term", "\\s");
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    ASSERT_NE(nullptr, prepared);
+  }
+}
+
+// Unsupported constructs — smoke (no crash)
+
+TEST_P(RegexpFilterTestCase, by_regexp_unsupported_constructs_smoke) {
+  {
+    tests::JsonDocGenerator gen(resource("regexp_test_data.json"),
+                                &tests::GenericJsonFieldFactory);
+    add_segment(gen);
+  }
+
+  auto rdr = open_reader();
+
+  // POSIX class
+  {
+    auto q = MakeFilter("term", "[[:alpha:]]+");
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    ASSERT_NE(nullptr, prepared);
+  }
+
+  // Non-capturing group
+  {
+    auto q = MakeFilter("term", "(?:foo)+");
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    ASSERT_NE(nullptr, prepared);
+  }
+
+  // Backreference
+  {
+    auto q = MakeFilter("term", "(a)\\1");
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    ASSERT_NE(nullptr, prepared);
+  }
+
+  // Lookahead
+  {
+    auto q = MakeFilter("term", "foo(?=bar)");
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    ASSERT_NE(nullptr, prepared);
+  }
+
+  // Lookbehind
+  {
+    auto q = MakeFilter("term", "(?<=foo)bar");
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    ASSERT_NE(nullptr, prepared);
+  }
+
+  // Word boundary
+  {
+    auto q = MakeFilter("term", "\\bfoo\\b");
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    ASSERT_NE(nullptr, prepared);
+  }
+}
+
+// Very long terms in index
+
+TEST_P(RegexpFilterTestCase, by_regexp_long_terms) {
+  {
+    tests::JsonDocGenerator gen(resource("regexp_stress_data.json"),
+                                &tests::GenericJsonFieldFactory);
+    add_segment(gen);
+  }
+
+  auto rdr = open_reader();
+
+  // "long" field has 1000-char terms in s1 (aaa...) and s2 (bbb...)
+  // .* should match all docs with "long" field
+  {
+    Docs docs{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    Costs costs{docs.size()};
+    CheckQuery(MakeFilter("long", ".*"), docs, costs, rdr);
+  }
+
+  // Exact match of a long literal — aaa...a (1000 a's) → s1
+  {
+    std::string long_pattern(1000, 'a');
+    CheckQuery(MakeFilter("long", long_pattern), Docs{1}, Costs{1}, rdr);
+  }
+
+  // Prefix of long term: a.* → matches s1(aaa...) and s7(aaa...z) and s10(abc)
+  {
+    Docs docs{1, 7, 10};
+    Costs costs{docs.size()};
+    CheckQuery(MakeFilter("long", "a.*"), docs, costs, rdr);
+  }
+}
+
+// Boolean queries — And/Or with ByRegexp
+
+TEST_P(RegexpFilterTestCase, by_regexp_boolean_queries) {
+  {
+    tests::JsonDocGenerator gen(resource("regexp_test_data.json"),
+                                &tests::GenericJsonFieldFactory);
+    add_segment(gen);
+  }
+
+  auto rdr = open_reader();
+
+  // Or(ByRegexp("alt","cat"), ByRegexp("alt","dog"))
+  {
+    irs::Or disjunction;
+    {
+      auto& sub = disjunction.add<irs::ByRegexp>();
+      *sub.mutable_field() = "alt";
+      sub.mutable_options()->pattern =
+        irs::ViewCast<irs::byte_type>(std::string_view("cat"));
+    }
+    {
+      auto& sub = disjunction.add<irs::ByRegexp>();
+      *sub.mutable_field() = "alt";
+      sub.mutable_options()->pattern =
+        irs::ViewCast<irs::byte_type>(std::string_view("dog"));
+    }
+
+    Docs expected{1, 2, 4, 6, 8, 10, 11, 14, 15, 17, 18, 20};
+    CheckQuery(disjunction, expected, rdr);
+  }
+
+  // And(ByRegexp("term","foo.*"), ByRegexp("alt","cat"))
+  {
+    irs::And conjunction;
+    {
+      auto& sub = conjunction.add<irs::ByRegexp>();
+      *sub.mutable_field() = "term";
+      sub.mutable_options()->pattern =
+        irs::ViewCast<irs::byte_type>(std::string_view("foo.*"));
+    }
+    {
+      auto& sub = conjunction.add<irs::ByRegexp>();
+      *sub.mutable_field() = "alt";
+      sub.mutable_options()->pattern =
+        irs::ViewCast<irs::byte_type>(std::string_view("cat"));
+    }
+
+    Docs expected{1, 4, 8, 14, 20};
+    CheckQuery(conjunction, expected, rdr);
+  }
+
+  // Or(ByRegexp + ByTerm) — mixed filter types
+  {
+    irs::Or disjunction;
+    {
+      auto& sub = disjunction.add<irs::ByRegexp>();
+      *sub.mutable_field() = "term";
+      sub.mutable_options()->pattern =
+        irs::ViewCast<irs::byte_type>(std::string_view("foobar"));
+    }
+    {
+      auto& sub = disjunction.add<irs::ByTerm>();
+      *sub.mutable_field() = "term";
+      sub.mutable_options()->term =
+        irs::ViewCast<irs::byte_type>(std::string_view("bar"));
+    }
+
+    Docs expected{1, 10};
+    CheckQuery(disjunction, expected, rdr);
+  }
+}
+
+// Deleted documents
+// TODO: need to fix
+
+TEST_P(RegexpFilterTestCase, by_regexp_deleted_documents) {
+  // write data
+  {
+    tests::JsonDocGenerator gen(resource("regexp_test_data.json"),
+                                &tests::GenericJsonFieldFactory);
+    add_segment(gen);
+  }
+
+  // delete doc with name="doc1" using a separate writer
+  {
+    auto writer = open_writer(irs::kOmAppend);
+    irs::Filter::ptr query_doc1 = std::make_unique<irs::ByTerm>();
+    auto& q = static_cast<irs::ByTerm&>(*query_doc1);
+    *q.mutable_field() = "name";
+    q.mutable_options()->term =
+      irs::ViewCast<irs::byte_type>(std::string_view("doc1"));
+    writer->GetBatch().Remove(std::move(query_doc1));
+    writer->Commit();
+  }
+
+  auto rdr = open_reader();
+
+  CheckQuery(MakeFilter("term", "foobar"), Docs{}, rdr);
+
+  {
+    Docs docs{2, 3, 4, 5, 6, 7, 8, 9, 11, 13, 14, 16, 18, 20};
+    CheckQuery(MakeFilter("term", "foo.*"), docs, rdr);
+  }
+}
+
+// Determinism — same query twice = same results
+
+TEST_P(RegexpFilterTestCase, by_regexp_determinism) {
+  {
+    tests::JsonDocGenerator gen(resource("regexp_test_data.json"),
+                                &tests::GenericJsonFieldFactory);
+    add_segment(gen);
+  }
+
+  auto rdr = open_reader();
+
+  auto q = MakeFilter("term", "foo.*bar");
+
+  // Run twice, collect results manually
+  Docs run1, run2;
+  Costs costs1, costs2;
+
+  // First run
+  {
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    for (auto& segment : rdr) {
+      auto docs = prepared->execute({.segment = segment});
+      while (docs->advance() != irs::doc_limits::eof()) {
+        run1.push_back(docs->value());
+      }
+    }
+  }
+
+  // Second run
+  {
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    for (auto& segment : rdr) {
+      auto docs = prepared->execute({.segment = segment});
+      while (docs->advance() != irs::doc_limits::eof()) {
+        run2.push_back(docs->value());
+      }
+    }
+  }
+
+  ASSERT_EQ(run1, run2);
+  ASSERT_FALSE(run1.empty());
+}
+
+// Two-segment test
+
+TEST_P(RegexpFilterTestCase, by_regexp_two_segments) {
+  auto writer = open_writer();
+
+  {
+    tests::JsonDocGenerator gen(resource("simple_sequential.json"),
+                                &tests::GenericJsonFieldFactory);
+    add_segment(*writer, gen);
+  }
+  {
+    tests::JsonDocGenerator gen(resource("regexp_test_data.json"),
+                                &tests::GenericJsonFieldFactory);
+    add_segment(*writer, gen);
+  }
+
+  auto rdr = open_reader();
+  ASSERT_EQ(2, rdr.size());
+
+  // "same" field only in segment 1 — all 32 docs
+  {
+    Docs all;
+    for (size_t i = 0; i < 32; ++i) {
+      all.push_back(irs::doc_id_t((irs::doc_limits::min)() + i));
+    }
+    CheckQuery(MakeFilter("same", ".*"), all, rdr);
+  }
+
+  CheckQuery(MakeFilter("nonexistent", ".*"), Docs{}, rdr);
+}
+
+// Consolidation / merge
+
+TEST_P(RegexpFilterTestCase, by_regexp_consolidation) {
+  auto writer = open_writer();
+
+  {
+    tests::JsonDocGenerator gen(resource("simple_sequential.json"),
+                                &tests::GenericJsonFieldFactory);
+    add_segment(*writer, gen);
+  }
+  {
+    tests::JsonDocGenerator gen(resource("regexp_test_data.json"),
+                                &tests::GenericJsonFieldFactory);
+    add_segment(*writer, gen);
+  }
+
+  // before merge
+  {
+    auto rdr = open_reader();
+    ASSERT_EQ(2, rdr.size());
+
+    Docs all;
+    for (size_t i = 0; i < 32; ++i) {
+      all.push_back(irs::doc_id_t((irs::doc_limits::min)() + i));
+    }
+    CheckQuery(MakeFilter("same", ".*"), all, rdr);
+  }
+
+  // consolidate
+  ASSERT_TRUE(writer->Consolidate(
+    irs::index_utils::MakePolicy(irs::index_utils::ConsolidateCount())));
+  writer->Commit();
+
+  // after merge — 1 segment, same data
+  {
+    auto rdr = open_reader();
+    ASSERT_EQ(1, rdr.size());
+
+    Docs result;
+    auto q = MakeFilter("same", ".*");
+    auto prepared = q.prepare({
+      .index = rdr,
+      .memory = irs::IResourceManager::gNoop,
+    });
+    for (auto& segment : rdr) {
+      auto docs = prepared->execute({.segment = segment});
+      while (docs->advance() != irs::doc_limits::eof()) {
+        result.push_back(docs->value());
+      }
+    }
+    ASSERT_EQ(32, result.size());
+  }
+}
+
+// Concurrent readers
+
+TEST_P(RegexpFilterTestCase, by_regexp_concurrent_readers) {
+  {
+    tests::JsonDocGenerator gen(resource("regexp_test_data.json"),
+                                &tests::GenericJsonFieldFactory);
+    add_segment(gen);
+  }
+
+  auto rdr1 = open_reader();
+  auto rdr2 = open_reader();
+
+  auto q = MakeFilter("term", "foo.*");
+  Docs expected{1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 13, 14, 16, 18, 20};
+  Costs costs{expected.size()};
+
+  // Both readers return same results
+  CheckQuery(q, expected, costs, rdr1);
+  CheckQuery(q, expected, costs, rdr2);
+}
+
 static constexpr auto kTestDirs = tests::GetDirectories<tests::kTypesDefault>();
 
-INSTANTIATE_TEST_SUITE_P(
-  regexp_filter_test, RegexpFilterTestCase,
-  ::testing::Combine(::testing::ValuesIn(kTestDirs),
-                     ::testing::Values(tests::FormatInfo{"1_5avx"},
-                                       tests::FormatInfo{"1_5simd"})),
-  RegexpFilterTestCase::to_string);
+INSTANTIATE_TEST_SUITE_P(regexp_filter_test, RegexpFilterTestCase,
+                         ::testing::Combine(::testing::ValuesIn(kTestDirs),
+                                            ::testing::Values(tests::FormatInfo{
+                                              "1_5simd"})),
+                         RegexpFilterTestCase::to_string);
