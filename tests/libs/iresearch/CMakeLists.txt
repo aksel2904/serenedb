@@ -74,6 +74,7 @@ set(iresearch-tests_sources
     ./search/prefix_filter_test.cpp
     ./search/range_filter_test.cpp
     ./search/phrase_filter_tests.cpp
+    ./search/slop_phrase_seek_gather_tests.cpp
     ./search/column_existence_filter_test.cpp
     ./search/same_position_filter_tests.cpp
     ./search/ngram_similarity_filter_tests.cpp
