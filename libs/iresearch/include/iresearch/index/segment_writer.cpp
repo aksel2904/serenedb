@@ -23,44 +23,29 @@
 
 #include "iresearch/index/segment_writer.hpp"
 
-#include "basics/logger/logger.h"
+#include "basics/log.h"
 #include "basics/shared.hpp"
 #include "index_meta.hpp"
 #include "iresearch/analysis/token_attributes.hpp"
 #include "iresearch/analysis/tokenizer.hpp"
+#include "iresearch/formats/column/col_reader.hpp"
+#include "iresearch/formats/column/col_writer.hpp"
+#include "iresearch/formats/column/norm_writer.hpp"
+#include "iresearch/formats/index/idx_reader.hpp"
+#include "iresearch/formats/index/idx_writer.hpp"
 #include "iresearch/store/store_utils.hpp"
 #include "iresearch/utils/index_utils.hpp"
-#include "iresearch/utils/lz4compression.hpp"
 #include "iresearch/utils/type_limits.hpp"
 
 namespace irs {
+namespace {
 
-SegmentWriter::StoredColumn::StoredColumn(
-  const hashed_string_view& name, ColumnstoreWriter& columnstore,
-  IResourceManager& rm, const ColumnInfoProvider& column_info,
-  std::deque<CachedColumn, ManagedTypedAllocator<CachedColumn>>& cached_columns,
-  bool cache)
-  : name{name}, name_hash{name.Hash()} {
-  const auto info = column_info(name);
-
-  ColumnFinalizer finalizer{
-    [](DataOutput&) noexcept {},
-    [this]() noexcept -> std::string_view {
-      return std::string_view{this->name};
-    },
-  };
-
-  // Force to cache column if HNSW index is requested
-  if (!cache && !info.hnsw_info) {
-    auto column = columnstore.push_column(info, std::move(finalizer));
-    id = column.id;
-    writer = &column.out;
-  } else {
-    cached = &cached_columns.emplace_back(&id, info, std::move(finalizer), rm);
-
-    writer = &cached->Stream();
-  }
+duckdb::DatabaseInstance& DerefDb(duckdb::DatabaseInstance* db) {
+  SDB_ASSERT(db != nullptr);
+  return *db;
 }
+
+}  // namespace
 
 doc_id_t SegmentWriter::begin(DocContext ctx, doc_id_t batch_size) {
   SDB_ASSERT(LastDocId() < doc_limits::eof());
@@ -71,7 +56,6 @@ doc_id_t SegmentWriter::begin(DocContext ctx, doc_id_t batch_size) {
   const auto needed_docs = buffered_docs() + batch_size;
 
   if (needed_docs >= _docs_mask.set.capacity()) {
-    // reserve in blocks of power-of-2
     const auto count = math::RoundupPower2(needed_docs);
     _docs_mask.set.reserve(count);
   }
@@ -88,40 +72,15 @@ std::unique_ptr<SegmentWriter> SegmentWriter::make(
 }
 
 size_t SegmentWriter::memory_active() const noexcept {
-  auto column_cache_active = absl::c_accumulate(
-    _columns, size_t{0}, [](size_t lhs, const StoredColumn& rhs) noexcept {
-      return lhs + rhs.name.size() + sizeof(rhs);
-    });
-
-  column_cache_active += absl::c_accumulate(
-    _cached_columns, size_t{0}, [](size_t lhs, const CachedColumn& rhs) {
-      return lhs + rhs.Stream().MemoryActive();
-    });
-
   return _docs_context.size() * sizeof(DocContext) +
          bitset::bits_to_words(_docs_mask.count) * sizeof(bitset::word_t) +
-         _fields.memory_active() + _sort.stream.MemoryActive() +
-         column_cache_active;
+         _fields.memory_active();
 }
 
 size_t SegmentWriter::memory_reserved() const noexcept {
-  auto column_cache_reserved =
-    _columns.capacity() * sizeof(decltype(_columns)::value_type);
-
-  column_cache_reserved += absl::c_accumulate(
-    _columns, size_t{0}, [](size_t lhs, const StoredColumn& rhs) noexcept {
-      return lhs + rhs.name.size();
-    });
-
-  column_cache_reserved += absl::c_accumulate(
-    _cached_columns, size_t{0}, [](size_t lhs, const CachedColumn& rhs) {
-      return lhs + rhs.Stream().MemoryActive() + sizeof(rhs);
-    });
-
   return sizeof(SegmentWriter) + _docs_context.capacity() * sizeof(DocContext) +
          _docs_mask.set.capacity() / BitsRequired<char>() +
-         _fields.memory_reserved() + _sort.stream.MemoryReserved() +
-         column_cache_reserved;
+         _fields.memory_reserved();
 }
 
 bool SegmentWriter::remove(doc_id_t doc_id) noexcept {
@@ -144,29 +103,24 @@ SegmentWriter::SegmentWriter(ConstructToken, Directory& dir,
                              const SegmentWriterOptions& options) noexcept
   : _dir{dir},
     _scorer{options.scorer},
-    _cached_columns{{options.resource_manager}},
-    _sort{options.column_info, {}, options.resource_manager},
     _docs_context{{options.resource_manager}},
-    _fields{_cached_columns, options.scorers_features, options.comparator},
-    _columns{{options.resource_manager}},
-    _column_info{&options.column_info} {
+    _fields{options.resource_manager, options.scorers_features},
+    _db{DerefDb(options.db)},
+    _column_options{options.column_options},
+    _norm_column_options{options.norm_column_options} {
   _docs_mask.set = decltype(_docs_mask.set){{options.resource_manager}};
 }
 
-bool SegmentWriter::index(const hashed_string_view& name, doc_id_t doc,
+bool SegmentWriter::index(field_id id, doc_id_t doc,
                           IndexFeatures index_features, Tokenizer& tokens) {
-  SDB_ASSERT(_col_writer);
+  auto* slot = _fields.emplace(id, index_features);
 
-  auto* slot = _fields.emplace(name, index_features, *_col_writer);
-
-  // invert only if new field index features are a subset of slot index features
   if (IsSubsetOf(index_features, slot->requested_features()) &&
       slot->invert(tokens, doc)) {
     if (!slot->seen() && slot->has_features()) {
       _doc.emplace_back(slot);
       slot->seen(true);
     }
-
     return true;
   }
 
@@ -174,20 +128,10 @@ bool SegmentWriter::index(const hashed_string_view& name, doc_id_t doc,
   return false;
 }
 
-ColumnOutput& SegmentWriter::stream(const hashed_string_view& name,
-                                    const doc_id_t doc_id) {
-  SDB_ASSERT(_column_info);
-  auto& out = *_columns
-                 .lazy_emplace(name,
-                               [this, &name](const auto& ctor) {
-                                 ctor(name, *_col_writer,
-                                      _docs_context.get_allocator().Manager(),
-                                      *_column_info, _cached_columns,
-                                      nullptr != _fields.comparator());
-                               })
-                 ->writer;
-  out.Prepare(doc_id);
-  return out;
+void SegmentWriter::finish() {
+  for (const auto* field : _doc) {
+    field->compute_features();
+  }
 }
 
 void SegmentWriter::FlushFields(FlushState& state) {
@@ -196,7 +140,7 @@ void SegmentWriter::FlushFields(FlushState& state) {
   try {
     _fields.flush(*_field_writer, state);
   } catch (...) {
-    _field_writer.reset();  // invalidate field writer
+    _field_writer.reset();
     throw;
   }
 }
@@ -207,60 +151,50 @@ void SegmentWriter::FlushFields(FlushState& state) {
 
   FlushState state{
     .dir = &_dir,
-    .columns = this,
+    .norms = this,
     .name = _seg_name,
     .scorer = _scorer,
     .doc_count = buffered_docs(),
   };
 
-  DocMap docmap;
-  if (_fields.comparator() != nullptr) {
-    std::tie(docmap, _sort.id) = _sort.stream.Flush(
-      *_col_writer, std::move(_sort.finalizer),
-      static_cast<doc_id_t>(state.doc_count), *_fields.comparator());
+  IdxWriter idx{_dir, _seg_name, _db};
 
-    meta.sort = _sort.id;  // Store sorted column id in segment meta
-
-    if (!docmap.empty()) {
-      state.docmap = &docmap;
+  if (_col_writer) {
+    _col_writer->Commit(buffered_docs());
+    auto built = _col_writer->TakeBuiltHnsw();
+    _col_writer.reset();
+    if (!built.empty()) {
+      _built_hnsw_graphs.reserve(built.size());
+      for (auto& b : built) {
+        _built_hnsw_graphs.emplace(b.column_id, b.graph);
+        idx.AddHNSW(b.column_id, b.info, std::move(b.graph));
+      }
     }
   }
 
-  // Flush all cached columns
-  SDB_ASSERT(_column_ids.empty());
-  _column_ids.reserve(_cached_columns.size());
-  for (BufferedColumn::BufferedValues buffer{_cached_columns.get_allocator()};
-       auto& column : _cached_columns) {
-    if (!field_limits::valid(column.id())) [[likely]] {
-      column.Flush(*_col_writer, docmap, buffer);
-    }
-    // invalid when was empty column
-    if (field_limits::valid(column.id())) [[likely]] {
-      [[maybe_unused]] auto [_, emplaced] =
-        _column_ids.emplace(column.id(), &column);
-      SDB_ASSERT(emplaced);
-    }
-  }
-
-  // Flush columnstore
-  meta.column_store = _col_writer->commit(state);
-
-  // Flush fields metadata & inverted data,
   if (state.doc_count != 0) {
+    _col_reader = std::make_unique<ColReader>(_dir, _seg_name, _db);
+  }
+
+  if (state.doc_count != 0) {
+    _field_writer->SetIdxWriter(idx);
     FlushFields(state);
   }
 
-  // Get document mask
+  _col_reader.reset();
+
+  idx.Commit();
+
   SDB_ASSERT(_docs_mask.set.count() == _docs_mask.count);
   docs_mask = std::move(_docs_mask);
   _docs_mask.count = 0;
 
-  // Update segment metadata
   meta.docs_count = state.doc_count;
   meta.live_docs_count = meta.docs_count - docs_mask.count;
   meta.files = _dir.FlushTracked(meta.byte_size);
 
-  return docmap;
+  // SegmentWriter writes posting lists in doc-order with no comparator.
+  return DocMap{};
 }
 
 void SegmentWriter::reset() noexcept {
@@ -271,13 +205,12 @@ void SegmentWriter::reset() noexcept {
   _docs_mask.count = 0;
   _batch_first_doc_id = doc_limits::eof();
   _fields.reset();
-  _columns.clear();
-  _column_ids.clear();
-  _cached_columns.clear();  // FIXME(@gnusi): we loose all per-column buffers
-  _sort.stream.Clear();
+  _col_reader.reset();
   if (_col_writer) {
-    _col_writer->rollback();
+    _col_writer->Rollback();
+    _col_writer.reset();
   }
+  _built_hnsw_graphs.clear();
 }
 
 void SegmentWriter::reset(const SegmentMeta& meta) {
@@ -286,18 +219,15 @@ void SegmentWriter::reset(const SegmentMeta& meta) {
   _seg_name = meta.name;
 
   if (!_field_writer) {
-    _field_writer = meta.codec->get_field_writer(
-      false, _docs_context.get_allocator().Manager());
-    SDB_ASSERT(_field_writer);
+    auto& rm = _docs_context.get_allocator().Manager();
+    _field_writer = std::make_unique<burst_trie::FieldWriter>(
+      meta.codec->get_postings_writer(/*compaction=*/false, rm),
+      /*compaction=*/false, rm);
   }
 
-  if (!_col_writer) {
-    _col_writer = meta.codec->get_columnstore_writer(
-      false, _docs_context.get_allocator().Manager());
-    SDB_ASSERT(_col_writer);
-  }
-
-  _col_writer->prepare(_dir, meta);
+  _col_writer = std::make_unique<ColWriter>(
+    _dir, meta.name, _db, _column_options, _norm_column_options);
+  _fields.SetColWriter(_col_writer.get(), _norm_column_options);
 
   _initialized = true;
 }

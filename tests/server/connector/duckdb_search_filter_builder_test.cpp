@@ -18,10 +18,7 @@
 /// Copyright holder is SereneDB GmbH, Berlin, Germany
 ////////////////////////////////////////////////////////////////////////////////
 
-#include <absl/base/internal/endian.h>
-#include <iresearch/search/geo_filter.h>
 #include <s2/s2latlng.h>
-#include <vpack/parser.h>
 
 #include <duckdb.hpp>
 #include <duckdb/optimizer/optimizer_extension.hpp>
@@ -29,12 +26,17 @@
 #include <duckdb/planner/logical_operator.hpp>
 #include <duckdb/planner/operator/logical_filter.hpp>
 #include <duckdb/planner/operator/logical_get.hpp>
-#include <iresearch/analysis/analyzers.hpp>
+#include <iresearch/analysis/analyzer.hpp>
+#include <iresearch/analysis/geo_analyzer.hpp>
+#include <iresearch/analysis/ngram_tokenizer.hpp>
+#include <iresearch/analysis/segmentation_tokenizer.hpp>
+#include <iresearch/analysis/tokenizer_config.hpp>
 #include <iresearch/analysis/tokenizers.hpp>
 #include <iresearch/analysis/wildcard_analyzer.hpp>
 #include <iresearch/formats/formats.hpp>
 #include <iresearch/search/all_filter.hpp>
 #include <iresearch/search/boolean_filter.hpp>
+#include <iresearch/search/geo_filter.hpp>
 #include <iresearch/search/granular_range_filter.hpp>
 #include <iresearch/search/levenshtein_filter.hpp>
 #include <iresearch/search/mixed_boolean_filter.hpp>
@@ -43,7 +45,6 @@
 #include <iresearch/search/prefix_filter.hpp>
 #include <iresearch/search/range_filter.hpp>
 #include <iresearch/search/regexp_filter.hpp>
-#include <iresearch/search/scorers.hpp>
 #include <iresearch/search/term_filter.hpp>
 #include <iresearch/search/terms_filter.hpp>
 #include <iresearch/search/wildcard_filter.hpp>
@@ -56,8 +57,6 @@
 
 #include "basics/assert.h"
 #include "basics/down_cast.h"
-#include "basics/string_utils.h"
-#include "catalog/mangling.h"
 #include "connector/functions/search.h"
 #include "connector/search_filter_builder.hpp"
 #include "connector/search_filter_printer.hpp"
@@ -68,6 +67,14 @@ namespace {
 using namespace sdb;
 using sdb::connector::ColumnGetter;
 using sdb::connector::SearchColumnInfo;
+
+// Sentinel tokenizer column id shared by analyzer-provider stubs that need
+// a non-null column reference but do not care which one. Use a value
+// outside `[1, kMaxRealIdValue]` (the real-column range) and outside the
+// {PK, score, offsets} synthetics so it can never collide with anything
+// the catalog or filter machinery might allocate.
+constexpr catalog::Column::Id kTestTokenizerColumnId =
+  catalog::Column::Id{catalog::Column::kMaxRealIdValue + 4};
 
 // ---------------------------------------------------------------------------
 // Plan capture: the production MakeSearchFilter runs from an OptimizerExtension
@@ -117,27 +124,24 @@ FindFilterAndGet(const duckdb::LogicalOperator& op) {
 
 // ---------------------------------------------------------------------------
 // ColumnSpec: the test fixture's view of a table column. `id` is the catalog
-// column id carried through into the iresearch field name mangling; `type`
-// is the DuckDB column type used both for CREATE TABLE and for the
-// SearchColumnInfo returned by the ColumnGetter; `name` is the unquoted
-// column name that the SQL query references.
+// column id carried through into the iresearch field_id; `type` is the DuckDB
+// column type used both for CREATE TABLE and for the SearchColumnInfo returned
+// by the ColumnGetter; `name` is the unquoted column name that the SQL query
+// references.
 // ---------------------------------------------------------------------------
 struct ColumnSpec {
-  catalog::Column::Id id;
+  uint64_t id;
   duckdb::LogicalType type;
   std::string name;
 };
 
-using AnalyzerProvider =
-  std::function<catalog::ColumnTokenizer(catalog::Column::Id)>;
+using AnalyzerProvider = std::function<catalog::ColumnTokenizer(uint64_t)>;
 
-catalog::ColumnTokenizer IdentityAnalyzerProvider(catalog::Column::Id) {
-  auto make_identity = [] {
-    return std::string(vpack::Slice::emptyObjectSlice().startAs<char>(),
-                       vpack::Slice::emptyObjectSlice().byteSize());
-  };
+catalog::ColumnTokenizer IdentityAnalyzerProvider(uint64_t) {
   static catalog::Tokenizer gStringTokenizer(
-    ObjectId{12345}, "test_string_verbartim", {}, make_identity());
+    ObjectId{0}, ObjectId{12345}, "test_string_verbartim", {},
+    DEFAULT_ROW_GROUP_SIZE,
+    irs::analysis::TokenizerConfig{.config = irs::StringTokenizer::Options{}});
   auto tokenizer = gStringTokenizer.GetTokenizer();
   EXPECT_TRUE(tokenizer);
   return {.analyzer = *std::move(tokenizer),
@@ -145,98 +149,80 @@ catalog::ColumnTokenizer IdentityAnalyzerProvider(catalog::Column::Id) {
 }
 
 template<irs::IndexFeatures Features>
-catalog::ColumnTokenizer SegmentationAnalyzerProviderBase(catalog::Column::Id) {
-  auto make_segmentation = [] {
-    auto builder =
-      vpack::Parser::fromJson("{ \"tokenizer\": {\"type\":\"segmentation\"}}");
-    return std::string(builder->slice().startAs<char>(),
-                       builder->slice().byteSize());
-  };
+catalog::ColumnTokenizer SegmentationAnalyzerProviderBase(uint64_t) {
   static catalog::Tokenizer gStringTokenizer(
-    ObjectId{12346}, "test_segmentation", {}, make_segmentation());
+    ObjectId{0}, ObjectId{12346}, "test_segmentation", {},
+    DEFAULT_ROW_GROUP_SIZE,
+    irs::analysis::TokenizerConfig{
+      .config = irs::analysis::SegmentationTokenizer::Options{}});
   auto tokenizer = gStringTokenizer.GetTokenizer();
   EXPECT_TRUE(tokenizer);
   return {.analyzer = *std::move(tokenizer), .features = Features};
 }
 
-[[maybe_unused]] catalog::ColumnTokenizer SegmentationAnalyzerProvider(
-  catalog::Column::Id id) {
+catalog::ColumnTokenizer SegmentationAnalyzerProvider(uint64_t id) {
   return SegmentationAnalyzerProviderBase<irs::IndexFeatures::Pos |
                                           irs::IndexFeatures::Freq>(id);
 }
 
-[[maybe_unused]] catalog::ColumnTokenizer NgramAnalyzerProvider(
-  catalog::Column::Id) {
-  auto make_ngram = [] {
-    auto builder = vpack::Parser::fromJson(
-      "{ \"tokenizer\": {\"type\":\"ngram\","
-      "\"properties\":{\"min\":2,\"max\":2,"
-      "\"preserveOriginal\":false,\"streamType\":\"utf8\"}}}");
-    return std::string(builder->slice().startAs<char>(),
-                       builder->slice().byteSize());
+[[maybe_unused]] catalog::ColumnTokenizer NgramAnalyzerProvider(uint64_t) {
+  irs::analysis::NGramTokenizerBase::Options ngram_opts{
+    .min_gram = 2,
+    .max_gram = 2,
+    .preserve_original = false,
+    .stream_bytes_type = irs::analysis::NGramTokenizerBase::InputType::UTF8,
   };
-  static catalog::Tokenizer gNgramTokenizer(ObjectId{12347}, "test_ngram", {},
-                                            make_ngram());
+  static catalog::Tokenizer gNgramTokenizer(
+    ObjectId{0}, ObjectId{12347}, "test_ngram", {}, DEFAULT_ROW_GROUP_SIZE,
+    irs::analysis::TokenizerConfig{.config = std::move(ngram_opts)});
   auto tokenizer = gNgramTokenizer.GetTokenizer();
   EXPECT_TRUE(tokenizer);
   return {.analyzer = *std::move(tokenizer),
           .features = irs::IndexFeatures::Pos | irs::IndexFeatures::Freq};
 }
 
-[[maybe_unused]] catalog::ColumnTokenizer WildcardAnalyzerProvider(
-  catalog::Column::Id) {
-  auto make_wildcard = [] {
-    auto builder = vpack::Parser::fromJson(
-      "{ \"tokenizer\": {\"type\":\"wildcard\","
-      "\"properties\":{\"ngramSize\":3,"
-      "\"tokenizer\":{\"type\":\"keyword\"}}}}");
-    return std::string(builder->slice().startAs<char>(),
-                       builder->slice().byteSize());
+[[maybe_unused]] catalog::ColumnTokenizer WildcardAnalyzerProvider(uint64_t) {
+  irs::analysis::WildcardAnalyzer::Options wildcard_opts{
+    .base_analyzer = std::make_unique<irs::analysis::TokenizerConfig>(
+      irs::analysis::TokenizerConfig{.config =
+                                       irs::StringTokenizer::Options{}}),
+    .ngram_size = 3,
   };
-  static catalog::Tokenizer gWildcardTokenizer(ObjectId{12348}, "test_wildcard",
-                                               {}, make_wildcard());
+  static catalog::Tokenizer gWildcardTokenizer(
+    ObjectId{0}, ObjectId{12348}, "test_wildcard", {}, DEFAULT_ROW_GROUP_SIZE,
+    irs::analysis::TokenizerConfig{.config = std::move(wildcard_opts)});
   auto tokenizer = gWildcardTokenizer.GetTokenizer();
   EXPECT_TRUE(tokenizer);
-  return {.analyzer = *std::move(tokenizer),
-          .features = irs::IndexFeatures::Pos | irs::IndexFeatures::Freq};
+  return {
+    .analyzer = *std::move(tokenizer),
+    .features = irs::IndexFeatures::Pos | irs::IndexFeatures::Freq,
+    .tokenizer_column = kTestTokenizerColumnId,
+  };
 }
 
-[[maybe_unused]] catalog::ColumnTokenizer GeoJsonAnalyzerProvider(
-  catalog::Column::Id) {
-  auto make_geojson = [] {
-    auto builder = vpack::Parser::fromJson(
-      "{ \"tokenizer\": {\"type\":\"geojson\",\"properties\":{}}}");
-    return std::string(builder->slice().startAs<char>(),
-                       builder->slice().byteSize());
-  };
-  static catalog::Tokenizer gGeoTokenizer(ObjectId{12349}, "test_geojson", {},
-                                          make_geojson());
+[[maybe_unused]] catalog::ColumnTokenizer GeoJsonAnalyzerProvider(uint64_t) {
+  static catalog::Tokenizer gGeoTokenizer(
+    ObjectId{0}, ObjectId{12349}, "test_geojson", {}, DEFAULT_ROW_GROUP_SIZE,
+    irs::analysis::TokenizerConfig{
+      .config = irs::analysis::GeoJsonAnalyzer::Options{}});
   auto tokenizer = gGeoTokenizer.GetTokenizer();
   EXPECT_TRUE(tokenizer);
-  return {.analyzer = *std::move(tokenizer),
-          .features = irs::IndexFeatures::None};
+  return {
+    .analyzer = *std::move(tokenizer),
+    .features = irs::IndexFeatures::None,
+    .tokenizer_column = kTestTokenizerColumnId,
+  };
 }
 
-// ---------------------------------------------------------------------------
 // Expected-filter builders (ported from velox test suite).
-// Type dispatch is now by duckdb::LogicalType / native C++ type.
-// ---------------------------------------------------------------------------
-template<typename T>
-std::string MakeFieldName(catalog::Column::Id column_id) {
-  std::string field_name;
-  basics::StrResize(field_name, sizeof(column_id));
-  absl::big_endian::Store(field_name.data(), column_id);
-  if constexpr (std::is_same_v<T, bool>) {
-    search::mangling::MangleBool(field_name);
-  } else if constexpr (std::is_same_v<T, std::string_view> ||
-                       std::is_same_v<T, std::string>) {
-    search::mangling::MangleString(field_name);
-  } else if constexpr (std::is_floating_point_v<T> || std::is_integral_v<T>) {
-    search::mangling::MangleNumeric(field_name);
-  } else {
-    static_assert(sizeof(T) == 0, "Unsupported term type for MakeFieldName");
-  }
-  return field_name;
+// The test's ColumnGetter returns a `SearchColumnInfo` with the column id
+// stored as `field_id` and no per-kind ids set. With the field_id-only
+// rewrite, the production filter builder's `PickPerKindFieldId` falls
+// back to the entry's primary `field_id`, so the expected
+// `mutable_field_id()` is simply the catalog column id cast to
+// `irs::field_id`.
+constexpr irs::field_id ExpectedFieldId(uint64_t column_id) {
+  return static_cast<irs::field_id>(column_id);
 }
 
 template<typename Filter, typename Source>
@@ -249,10 +235,9 @@ auto& AddFilter(Source& parent) {
 }
 
 template<typename T, typename Filter>
-irs::ByTerm& AddTermFilter(Filter& root, catalog::Column::Id column,
-                           const T& value) {
+irs::ByTerm& AddTermFilter(Filter& root, uint64_t column, const T& value) {
   auto& term = AddFilter<irs::ByTerm>(root);
-  *term.mutable_field() = MakeFieldName<T>(column);
+  *term.mutable_field_id() = ExpectedFieldId(column);
   if constexpr (std::is_same_v<T, bool>) {
     term.mutable_options()->term.assign(
       irs::ViewCast<irs::byte_type>(irs::BooleanTokenizer::value(value)));
@@ -276,7 +261,7 @@ irs::ByTerm& AddTermFilter(Filter& root, catalog::Column::Id column,
 }
 
 template<typename T, typename Filter>
-irs::FilterWithBoost& AddRangeFilter(Filter& root, catalog::Column::Id column,
+irs::FilterWithBoost& AddRangeFilter(Filter& root, uint64_t column,
                                      const std::optional<T>& min_value,
                                      bool min_inclusive,
                                      const std::optional<T>& max_value,
@@ -284,7 +269,7 @@ irs::FilterWithBoost& AddRangeFilter(Filter& root, catalog::Column::Id column,
   if constexpr (std::is_same_v<T, std::string_view> ||
                 std::is_same_v<T, std::string>) {
     auto& range = AddFilter<irs::ByRange>(root);
-    *range.mutable_field() = MakeFieldName<T>(column);
+    *range.mutable_field_id() = ExpectedFieldId(column);
     auto& options = range.mutable_options()->range;
     irs::StringTokenizer stream;
     const irs::TermAttr* token = irs::get<irs::TermAttr>(stream);
@@ -311,7 +296,7 @@ irs::FilterWithBoost& AddRangeFilter(Filter& root, catalog::Column::Id column,
     static_assert(std::is_floating_point_v<T> || std::is_integral_v<T>,
                   "Unexpected range type");
     auto& range = AddFilter<irs::ByGranularRange>(root);
-    *range.mutable_field() = MakeFieldName<T>(column);
+    *range.mutable_field_id() = ExpectedFieldId(column);
     auto& options = range.mutable_options()->range;
     irs::NumericTokenizer stream;
     if (min_value.has_value()) {
@@ -335,42 +320,42 @@ irs::FilterWithBoost& AddRangeFilter(Filter& root, catalog::Column::Id column,
 }
 
 template<typename Filter>
-irs::ByTerm& AddNullFilter(Filter& root, catalog::Column::Id column) {
+irs::ByTerm& AddNullFilter(Filter& root, uint64_t column) {
   auto& term = AddFilter<irs::ByTerm>(root);
-  std::string field_name;
-  basics::StrResize(field_name, sizeof(column));
-  absl::big_endian::Store(field_name.data(), column);
-  search::mangling::MangleNull(field_name);
-  *term.mutable_field() = field_name;
+  // Test catalog doesn't allocate a per-column `null_field_id`, so
+  // production's
+  // `valid(null_field_id) ? null_field_id : column_info.field_id` resolves
+  // to the primary id.
+  *term.mutable_field_id() = ExpectedFieldId(column);
   term.mutable_options()->term.assign(
     irs::ViewCast<irs::byte_type>(irs::NullTokenizer::value_null()));
   return term;
 }
 
 template<typename Filter>
-irs::ByWildcard& AddLikeFilter(Filter& root, catalog::Column::Id column,
+irs::ByWildcard& AddLikeFilter(Filter& root, uint64_t column,
                                std::string_view value) {
   auto& wc = AddFilter<irs::ByWildcard>(root);
-  *wc.mutable_field() = MakeFieldName<std::string_view>(column);
+  *wc.mutable_field_id() = ExpectedFieldId(column);
   wc.mutable_options()->term.assign(irs::ViewCast<irs::byte_type>(value));
   return wc;
 }
 
 template<typename Filter>
-irs::ByPrefix& AddPrefixFilter(Filter& root, catalog::Column::Id column,
+irs::ByPrefix& AddPrefixFilter(Filter& root, uint64_t column,
                                std::string_view value) {
   auto& pf = AddFilter<irs::ByPrefix>(root);
-  *pf.mutable_field() = MakeFieldName<std::string_view>(column);
+  *pf.mutable_field_id() = ExpectedFieldId(column);
   pf.mutable_options()->term.assign(irs::ViewCast<irs::byte_type>(value));
   return pf;
 }
 
 template<typename Filter>
 irs::ByRegexp& AddRegexpFilter(
-  Filter& root, catalog::Column::Id column, std::string_view pattern,
+  Filter& root, uint64_t column, std::string_view pattern,
   irs::RegexpSyntax syntax = irs::RegexpSyntax::Perl) {
   auto& re = AddFilter<irs::ByRegexp>(root);
-  *re.mutable_field() = MakeFieldName<std::string_view>(column);
+  *re.mutable_field_id() = ExpectedFieldId(column);
   auto* opts = re.mutable_options();
   opts->pattern.assign(irs::ViewCast<irs::byte_type>(pattern));
   opts->syntax = syntax;
@@ -379,10 +364,10 @@ irs::ByRegexp& AddRegexpFilter(
 
 template<typename Filter>
 irs::ByNGramSimilarity& AddNgramSimilarityFilter(
-  Filter& root, catalog::Column::Id column,
-  std::vector<std::string_view> ngrams, float threshold = 0.7f) {
+  Filter& root, uint64_t column, std::vector<std::string_view> ngrams,
+  float threshold = 0.7f) {
   auto& ngf = AddFilter<irs::ByNGramSimilarity>(root);
-  *ngf.mutable_field() = MakeFieldName<std::string_view>(column);
+  *ngf.mutable_field_id() = ExpectedFieldId(column);
   ngf.mutable_options()->threshold = threshold;
   for (auto ngram : ngrams) {
     ngf.mutable_options()->ngrams.emplace_back(
@@ -392,12 +377,14 @@ irs::ByNGramSimilarity& AddNgramSimilarityFilter(
 }
 
 template<typename Filter>
-irs::ByEditDistance& AddEditDistanceFilter(
-  Filter& root, catalog::Column::Id column, std::string_view term,
-  uint8_t max_distance, bool with_transpositions = true,
-  size_t max_terms = 1024, std::string_view prefix = "") {
+irs::ByEditDistance& AddEditDistanceFilter(Filter& root, uint64_t column,
+                                           std::string_view term,
+                                           uint8_t max_distance,
+                                           bool with_transpositions = true,
+                                           size_t max_terms = 1024,
+                                           std::string_view prefix = "") {
   auto& ed = AddFilter<irs::ByEditDistance>(root);
-  *ed.mutable_field() = MakeFieldName<std::string_view>(column);
+  *ed.mutable_field_id() = ExpectedFieldId(column);
   ed.mutable_options()->term.assign(irs::ViewCast<irs::byte_type>(term));
   ed.mutable_options()->max_distance = max_distance;
   ed.mutable_options()->with_transpositions = with_transpositions;
@@ -409,10 +396,10 @@ irs::ByEditDistance& AddEditDistanceFilter(
 }
 
 template<typename Filter>
-irs::ByPhrase& AddPhraseFilter(Filter& root, catalog::Column::Id column,
+irs::ByPhrase& AddPhraseFilter(Filter& root, uint64_t column,
                                std::vector<std::string_view> values) {
   auto& wc = AddFilter<irs::ByPhrase>(root);
-  *wc.mutable_field() = MakeFieldName<std::string_view>(column);
+  *wc.mutable_field_id() = ExpectedFieldId(column);
   for (auto value : values) {
     wc.mutable_options()->template push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(value);
@@ -449,12 +436,14 @@ S2Point GeoPointFromDegrees(double lat, double lng) {
 // set those two -- exactly what FromGeoInRange / FromGeoDistanceComparison
 // populate from user inputs.
 template<typename Filter>
-irs::GeoDistanceFilter& AddGeoDistanceFilter(
-  Filter& root, catalog::Column::Id column, const S2Point& origin,
-  std::optional<double> min_distance, bool min_inclusive,
-  std::optional<double> max_distance, bool max_inclusive) {
+irs::GeoDistanceFilter& AddGeoDistanceFilter(Filter& root, uint64_t column,
+                                             const S2Point& origin,
+                                             std::optional<double> min_distance,
+                                             bool min_inclusive,
+                                             std::optional<double> max_distance,
+                                             bool max_inclusive) {
   auto& geo = AddFilter<irs::GeoDistanceFilter>(root);
-  *geo.mutable_field() = MakeFieldName<std::string_view>(column);
+  *geo.mutable_field_id() = ExpectedFieldId(column);
   auto* options = geo.mutable_options();
   options->origin = origin;
   if (min_distance.has_value()) {
@@ -467,6 +456,11 @@ irs::GeoDistanceFilter& AddGeoDistanceFilter(
     options->range.max_type =
       max_inclusive ? irs::BoundType::Inclusive : irs::BoundType::Exclusive;
   }
+  // FromGeoDistanceComparison stamps the tokenizer column id onto the
+  // filter; mirror that here so operator== matches.
+  auto column_analyzer = GeoJsonAnalyzerProvider(column);
+  SDB_ASSERT(irs::field_limits::valid(column_analyzer.tokenizer_column));
+  options->store_field_id = column_analyzer.tokenizer_column;
   return geo;
 }
 
@@ -478,37 +472,44 @@ irs::GeoDistanceFilter& AddGeoDistanceFilter(
 // type + S2 contents (coding compared via IsSameLoss, where Invalid and
 // any non-U32 coding compare equal).
 template<typename Filter>
-irs::GeoFilter& AddGeoFilter(Filter& root, catalog::Column::Id column,
+irs::GeoFilter& AddGeoFilter(Filter& root, uint64_t column,
                              const S2Point& shape_point,
                              irs::GeoFilterType type) {
   auto& gf = AddFilter<irs::GeoFilter>(root);
-  *gf.mutable_field() = MakeFieldName<std::string_view>(column);
+  *gf.mutable_field_id() = ExpectedFieldId(column);
   auto* options = gf.mutable_options();
   options->type = type;
   options->shape.reset(shape_point);
+  // FromGeoInRange stamps the tokenizer column id onto the filter;
+  // mirror that here so operator== matches.
+  auto column_analyzer = GeoJsonAnalyzerProvider(column);
+  SDB_ASSERT(irs::field_limits::valid(column_analyzer.tokenizer_column));
+  options->store_field_id = column_analyzer.tokenizer_column;
   return gf;
 }
 
 template<typename Filter>
-irs::ByWildcardNgram& AddWildcardNgramFilter(Filter& root,
-                                             catalog::Column::Id column,
+irs::ByWildcardNgram& AddWildcardNgramFilter(Filter& root, uint64_t column,
                                              std::string_view pattern,
                                              bool has_positions) {
   auto column_analyzer = WildcardAnalyzerProvider(column);
   auto& wf = AddFilter<irs::ByWildcardNgram>(root);
-  *wf.mutable_field() = MakeFieldName<std::string_view>(column);
-  *wf.mutable_options() = {pattern,
-                           basics::downCast<irs::analysis::WildcardAnalyzer>(
-                             *column_analyzer.analyzer.get()),
-                           has_positions};
+  *wf.mutable_field_id() = ExpectedFieldId(column);
+  auto* opts = wf.mutable_options();
+  *opts = {pattern,
+           basics::downCast<irs::analysis::WildcardAnalyzer>(
+             *column_analyzer.analyzer.get()),
+           has_positions};
+  SDB_ASSERT(irs::field_limits::valid(column_analyzer.tokenizer_column));
+  opts->store_field_id = column_analyzer.tokenizer_column;
   return wf;
 }
 
 template<typename T, typename Filter>
-irs::ByTerms& AddTermsFilter(Filter& root, catalog::Column::Id column,
+irs::ByTerms& AddTermsFilter(Filter& root, uint64_t column,
                              const std::vector<T>& values) {
   auto& terms = AddFilter<irs::ByTerms>(root);
-  *terms.mutable_field() = MakeFieldName<T>(column);
+  *terms.mutable_field_id() = ExpectedFieldId(column);
   for (const auto& value : values) {
     if constexpr (std::is_same_v<T, bool>) {
       terms.mutable_options()->terms.emplace(
@@ -540,12 +541,7 @@ class SearchFilterBuilderTest : public ::testing::Test {
  public:
   SearchFilterBuilderTest() : _db(nullptr), _conn(_db) {}
 
-  static void SetUpTestCase() {
-    irs::analysis::analyzers::Init();
-    irs::formats::Init();
-    irs::scorers::Init();
-    irs::compression::Init();
-  }
+  static void SetUpTestCase() { irs::formats::Init(); }
 
   void SetUp() final {
     sdb::connector::RegisterSearchFunctions(*_db.instance);
@@ -634,9 +630,14 @@ class SearchFilterBuilderTest : public ::testing::Test {
       SDB_ASSERT(ref.binding.table_index == table_index);
       const auto local = ref.binding.column_index.GetIndexUnsafe();
       const auto phys = projected[local].GetPrimaryIndex();
-      return SearchColumnInfo{.column_id = columns[phys].id,
-                              .logical_type = columns[phys].type,
-                              .tokenizer = analyzer_provider(columns[phys].id)};
+      // FromIsNull SDB_ENSUREs `null_field_id` is valid; production mints a
+      // separate NextId() for the IS-NULL marker. The test schema doesn't
+      // allocate per-kind columns, so reusing the column id here is safe.
+      return SearchColumnInfo{
+        .field_id = static_cast<irs::field_id>(columns[phys].id),
+        .null_field_id = static_cast<irs::field_id>(columns[phys].id),
+        .logical_type = columns[phys].type,
+        .tokenizer = analyzer_provider(columns[phys].id)};
     };
 
     // Per-expression claim loop, mirroring production
@@ -659,10 +660,8 @@ class SearchFilterBuilderTest : public ::testing::Test {
         // filter builder's named-analyzer resolver runs with a real
         // context (the resolver returns nullptr for unknown names,
         // surfacing the "tokenizer not found in catalog" error).
-        sdb::connector::SearchFilterOptions opts{.client_context =
-                                                   *_conn.context};
-        auto result =
-          sdb::connector::MakeSearchFilter(root, single, getter, opts);
+        auto result = sdb::connector::MakeSearchFilter(root, single, getter,
+                                                       *_conn.context);
         if (result.ok() && root.size() > before) {
           ++claimed;
         } else {
@@ -1674,7 +1673,7 @@ TEST_F(SearchFilterBuilderTest, test_PhraseExactGap) {
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "category"}};
   irs::And expected;
   auto& phrase = AddFilter<irs::ByPhrase>(expected);
-  *phrase.mutable_field() = MakeFieldName<std::string_view>(1);
+  *phrase.mutable_field_id() = ExpectedFieldId(1);
   // First term: offsets zeroed by insert() for the first element
   phrase.mutable_options()->push_back<irs::ByTermOptions>().term =
     irs::ViewCast<irs::byte_type>(std::string_view{"quick"});
@@ -1694,7 +1693,7 @@ TEST_F(SearchFilterBuilderTest, test_PhraseRangeGap) {
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "category"}};
   irs::And expected;
   auto& phrase = AddFilter<irs::ByPhrase>(expected);
-  *phrase.mutable_field() = MakeFieldName<std::string_view>(1);
+  *phrase.mutable_field_id() = ExpectedFieldId(1);
   phrase.mutable_options()->push_back<irs::ByTermOptions>().term =
     irs::ViewCast<irs::byte_type>(std::string_view{"quick"});
   // gap=[1,2] words -> offs_min=2, offs_max=3 (min+1, max+1)
@@ -1712,7 +1711,7 @@ TEST_F(SearchFilterBuilderTest, test_PhraseMultipleGaps) {
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "category"}};
   irs::And expected;
   auto& phrase = AddFilter<irs::ByPhrase>(expected);
-  *phrase.mutable_field() = MakeFieldName<std::string_view>(1);
+  *phrase.mutable_field_id() = ExpectedFieldId(1);
   phrase.mutable_options()->push_back<irs::ByTermOptions>().term =
     irs::ViewCast<irs::byte_type>(std::string_view{"quick"});
   // gap=1 -> offs=2 (1+1)
@@ -1734,7 +1733,7 @@ TEST_F(SearchFilterBuilderTest, test_PhraseGapBetweenMultiTokenPatterns) {
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "category"}};
   irs::And expected;
   auto& phrase = AddFilter<irs::ByPhrase>(expected);
-  *phrase.mutable_field() = MakeFieldName<std::string_view>(1);
+  *phrase.mutable_field_id() = ExpectedFieldId(1);
   phrase.mutable_options()->push_back<irs::ByTermOptions>().term =
     irs::ViewCast<irs::byte_type>(std::string_view{"quick"});
   // 'brown' is adjacent to 'quick' (within same pattern)
@@ -1807,7 +1806,7 @@ TEST_F(SearchFilterBuilderTest, test_PhraseGap_BroadNumericTypes) {
        }) {
     irs::And expected;
     auto& phrase = AddFilter<irs::ByPhrase>(expected);
-    *phrase.mutable_field() = MakeFieldName<std::string_view>(1);
+    *phrase.mutable_field_id() = ExpectedFieldId(1);
     phrase.mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view{"quick"});
     phrase.mutable_options()->push_back<irs::ByTermOptions>(3, 3).term =
@@ -1962,7 +1961,7 @@ TEST_F(SearchFilterBuilderTest, test_TermLessEq_BooleanColumn) {
     {.id = 1, .type = duckdb::LogicalType::BOOLEAN, .name = "b"}};
   irs::And expected;
   auto& range = expected.add<irs::ByRange>();
-  *range.mutable_field() = MakeFieldName<bool>(1);
+  *range.mutable_field_id() = ExpectedFieldId(1);
   auto& opts = range.mutable_options()->range;
   opts.max.assign(
     irs::ViewCast<irs::byte_type>(irs::BooleanTokenizer::value(true)));
@@ -2318,7 +2317,7 @@ TEST_F(SearchFilterBuilderTest, test_Boost_Like) {
   std::vector<ColumnSpec> columns{
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;
-  AddLikeFilter(expected, 1, "foo%").boost(3.0f);
+  AddPrefixFilter(expected, 1, "foo").boost(3.0f);
   AssertFilter(expected, "SELECT * FROM foo WHERE b @@ (ts_like('foo%')) ^ 3.0",
                columns, true);
 }
@@ -2503,7 +2502,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_BoostCastTokenizeThenBoost) {
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;
   auto& phrase = expected.add<irs::ByPhrase>();
-  *phrase.mutable_field() = MakeFieldName<std::string_view>(1);
+  *phrase.mutable_field_id() = ExpectedFieldId(1);
   phrase.boost(42.0f);
   phrase.mutable_options()->push_back<irs::ByTermOptions>().term.assign(
     irs::ViewCast<irs::byte_type>(std::string_view{"quick fox"}));
@@ -2520,7 +2519,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_BoostCastBoostThenTokenize) {
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;
   auto& phrase = expected.add<irs::ByPhrase>();
-  *phrase.mutable_field() = MakeFieldName<std::string_view>(1);
+  *phrase.mutable_field_id() = ExpectedFieldId(1);
   phrase.boost(42.0f);
   phrase.mutable_options()->push_back<irs::ByTermOptions>().term.assign(
     irs::ViewCast<irs::byte_type>(std::string_view{"quick fox"}));
@@ -2893,7 +2892,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_BoostCastLike) {
   std::vector<ColumnSpec> columns{
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;
-  AddLikeFilter(expected, 1, "foo%").boost(3.0f);
+  AddPrefixFilter(expected, 1, "foo").boost(3.0f);
   AssertFilter(expected,
                "SELECT * FROM foo WHERE b @@ (ts_like('foo%'))::boost(3.0)",
                columns, true);
@@ -3370,7 +3369,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_CompoundTokenizeCast) {
   irs::And expected;
   auto& and_filter = expected.add<irs::And>();
   auto& phrase = and_filter.add<irs::ByPhrase>();
-  *phrase.mutable_field() = MakeFieldName<std::string_view>(1);
+  *phrase.mutable_field_id() = ExpectedFieldId(1);
   phrase.mutable_options()->push_back<irs::ByTermOptions>().term.assign(
     irs::ViewCast<irs::byte_type>(std::string_view{"quick fox"}));
   AssertFilter(
@@ -3390,7 +3389,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_CompoundPerClauseTokenize) {
   auto& and_filter = expected.add<irs::And>();
   // must clause -- identity-tokenized phrase.
   auto& phrase_must = and_filter.add<irs::ByPhrase>();
-  *phrase_must.mutable_field() = MakeFieldName<std::string_view>(1);
+  *phrase_must.mutable_field_id() = ExpectedFieldId(1);
   phrase_must.mutable_options()->push_back<irs::ByTermOptions>().term.assign(
     irs::ViewCast<irs::byte_type>(std::string_view{"quick fox"}));
   // must_not clause -- segmentation analyzer.
@@ -3534,7 +3533,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_Not) {
   irs::And expected;
   auto& not_group = expected.add<irs::Not>();
   auto& inner = not_group.filter<irs::ByTerm>();
-  *inner.mutable_field() = MakeFieldName<std::string_view>(1);
+  *inner.mutable_field_id() = ExpectedFieldId(1);
   irs::StringTokenizer stream;
   const irs::TermAttr* token = irs::get<irs::TermAttr>(stream);
   stream.reset(std::string_view{"spam"});
@@ -3636,7 +3635,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_CommutativeLhsPhraseSeq) {
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;
   auto& phrase = expected.add<irs::ByPhrase>();
-  *phrase.mutable_field() = MakeFieldName<std::string_view>(1);
+  *phrase.mutable_field_id() = ExpectedFieldId(1);
   phrase.mutable_options()->push_back<irs::ByTermOptions>(0, 0).term =
     irs::ViewCast<irs::byte_type>(std::string_view{"a"});
   phrase.mutable_options()->push_back<irs::ByTermOptions>(2, 2).term =
@@ -3661,7 +3660,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_CommutativeLhsLike) {
   std::vector<ColumnSpec> columns{
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;
-  AddLikeFilter(expected, 1, std::string_view{"quic%"});
+  AddPrefixFilter(expected, 1, std::string_view{"quic"});
   AssertFilter(expected, "SELECT * FROM foo WHERE ts_like('quic%') @@ b",
                columns, true);
 }
@@ -3708,7 +3707,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_LikeWildcard) {
   std::vector<ColumnSpec> columns{
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;
-  AddLikeFilter(expected, 1, std::string_view{"quic%"});
+  AddPrefixFilter(expected, 1, std::string_view{"quic"});
   AssertFilter(expected, "SELECT * FROM foo WHERE b @@ ts_like('quic%')",
                columns, true);
 }
@@ -3758,8 +3757,9 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_RegexpSyntaxCaseInsensitive) {
   std::vector<ColumnSpec> columns{
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;
-  AddRegexpFilter(expected, 1, std::string_view{"abc"},
-                  irs::RegexpSyntax::PosixEre);
+  expected.add(irs::CreateByRegexp(
+    ExpectedFieldId(1),
+    irs::ViewCast<irs::byte_type>(std::string_view{"abc"})));
   AssertFilter(expected,
                "SELECT * FROM foo WHERE b @@ ts_regexp('abc', 'POSIX')",
                columns, true);
@@ -3786,11 +3786,9 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_RegexpUnderNot) {
   std::vector<ColumnSpec> columns{
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;
-  auto& not_filter = expected.add<irs::Not>();
-  auto& re = not_filter.filter<irs::ByRegexp>();
-  *re.mutable_field() = MakeFieldName<std::string_view>(1);
-  re.mutable_options()->pattern.assign(
-    irs::ViewCast<irs::byte_type>(std::string_view{"foo.*"}));
+  expected.add(std::make_unique<irs::Not>(irs::CreateByRegexp(
+    ExpectedFieldId(1),
+    irs::ViewCast<irs::byte_type>(std::string_view{"foo.*"}))));
   AssertFilter(expected, "SELECT * FROM foo WHERE b @@ !!ts_regexp('foo.*')",
                columns, true);
 }
@@ -3854,7 +3852,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_RangeBool) {
     {.id = 1, .type = duckdb::LogicalType::BOOLEAN, .name = "b"}};
   irs::And expected;
   auto& range = expected.add<irs::ByRange>();
-  *range.mutable_field() = MakeFieldName<bool>(1);
+  *range.mutable_field_id() = ExpectedFieldId(1);
   auto& opts = range.mutable_options()->range;
   opts.min.assign(
     irs::ViewCast<irs::byte_type>(irs::BooleanTokenizer::value(false)));
@@ -3886,7 +3884,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_RangePhrasePart) {
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;
   auto& phrase = expected.add<irs::ByPhrase>();
-  *phrase.mutable_field() = MakeFieldName<std::string_view>(1);
+  *phrase.mutable_field_id() = ExpectedFieldId(1);
   phrase.mutable_options()->push_back<irs::ByTermOptions>(0, 0).term =
     irs::ViewCast<irs::byte_type>(std::string_view{"a"});
   auto& rng_opts =
@@ -4073,7 +4071,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_RangeBoolOpenRight) {
     {.id = 1, .type = duckdb::LogicalType::BOOLEAN, .name = "b"}};
   irs::And expected;
   auto& range = expected.add<irs::ByRange>();
-  *range.mutable_field() = MakeFieldName<bool>(1);
+  *range.mutable_field_id() = ExpectedFieldId(1);
   auto& opts = range.mutable_options()->range;
   opts.min.assign(
     irs::ViewCast<irs::byte_type>(irs::BooleanTokenizer::value(false)));
@@ -4331,7 +4329,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_PhraseSeqExactGap) {
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;
   auto& phrase = expected.add<irs::ByPhrase>();
-  *phrase.mutable_field() = MakeFieldName<std::string_view>(1);
+  *phrase.mutable_field_id() = ExpectedFieldId(1);
   phrase.mutable_options()->push_back<irs::ByTermOptions>(0, 0).term =
     irs::ViewCast<irs::byte_type>(std::string_view{"a"});
   phrase.mutable_options()->push_back<irs::ByTermOptions>(3, 3).term =
@@ -4348,7 +4346,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_PhraseSeqInterval) {
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;
   auto& phrase = expected.add<irs::ByPhrase>();
-  *phrase.mutable_field() = MakeFieldName<std::string_view>(1);
+  *phrase.mutable_field_id() = ExpectedFieldId(1);
   phrase.mutable_options()->push_back<irs::ByTermOptions>(0, 0).term =
     irs::ViewCast<irs::byte_type>(std::string_view{"a"});
   phrase.mutable_options()->push_back<irs::ByTermOptions>(2, 4).term =
@@ -4366,7 +4364,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_PhraseSeqIntervalArray) {
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;
   auto& phrase = expected.add<irs::ByPhrase>();
-  *phrase.mutable_field() = MakeFieldName<std::string_view>(1);
+  *phrase.mutable_field_id() = ExpectedFieldId(1);
   phrase.mutable_options()->push_back<irs::ByTermOptions>(0, 0).term =
     irs::ViewCast<irs::byte_type>(std::string_view{"a"});
   phrase.mutable_options()->push_back<irs::ByTermOptions>(2, 4).term =
@@ -4384,7 +4382,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_PhraseSeqAnyOfPart) {
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;
   auto& phrase = expected.add<irs::ByPhrase>();
-  *phrase.mutable_field() = MakeFieldName<std::string_view>(1);
+  *phrase.mutable_field_id() = ExpectedFieldId(1);
   phrase.mutable_options()->push_back<irs::ByTermOptions>(0, 0).term =
     irs::ViewCast<irs::byte_type>(std::string_view{"a"});
   auto& terms = phrase.mutable_options()->push_back<irs::ByTermsOptions>(1, 1);
@@ -4404,7 +4402,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_PhraseSeqAnyOfPartExplicit1) {
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;
   auto& phrase = expected.add<irs::ByPhrase>();
-  *phrase.mutable_field() = MakeFieldName<std::string_view>(1);
+  *phrase.mutable_field_id() = ExpectedFieldId(1);
   phrase.mutable_options()->push_back<irs::ByTermOptions>(0, 0).term =
     irs::ViewCast<irs::byte_type>(std::string_view{"a"});
   auto& terms = phrase.mutable_options()->push_back<irs::ByTermsOptions>(1, 1);
@@ -4449,10 +4447,10 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_TsqueryPhraseFunction) {
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;
   auto& phrase = expected.add<irs::ByPhrase>();
-  *phrase.mutable_field() = MakeFieldName<std::string_view>(1);
+  *phrase.mutable_field_id() = ExpectedFieldId(1);
   phrase.mutable_options()->push_back<irs::ByTermOptions>(0, 0).term =
     irs::ViewCast<irs::byte_type>(std::string_view{"hello"});
-  phrase.mutable_options()->push_back<irs::ByTermOptions>(4, 4).term =
+  phrase.mutable_options()->push_back<irs::ByTermOptions>(3, 3).term =
     irs::ViewCast<irs::byte_type>(std::string_view{"world"});
   AssertFilter(expected,
                "SELECT * FROM foo WHERE b @@ "
@@ -4550,7 +4548,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_PhraseCastIdentity) {
   // for the whole input string, so the phrase has one part.
   {
     auto& phrase = expected.add<irs::ByPhrase>();
-    *phrase.mutable_field() = MakeFieldName<std::string_view>(1);
+    *phrase.mutable_field_id() = ExpectedFieldId(1);
     phrase.mutable_options()->push_back<irs::ByTermOptions>().term.assign(
       irs::ViewCast<irs::byte_type>(std::string_view{"quick fox"}));
   }
@@ -4684,7 +4682,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_AllOfTokenizeListIdentity) {
   irs::And expected;
   {
     auto& terms = expected.add<irs::ByTerms>();
-    *terms.mutable_field() = MakeFieldName<std::string_view>(1);
+    *terms.mutable_field_id() = ExpectedFieldId(1);
     auto& opts = *terms.mutable_options();
     opts.min_match = 2;
     opts.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view{"foo"}));
@@ -4781,7 +4779,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_AnyOfTokenizeListMinMatch) {
   irs::And expected;
   {
     auto& terms = expected.add<irs::ByTerms>();
-    *terms.mutable_field() = MakeFieldName<std::string_view>(1);
+    *terms.mutable_field_id() = ExpectedFieldId(1);
     auto& opts = *terms.mutable_options();
     opts.min_match = 2;
     opts.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view{"foo"}));
@@ -4845,7 +4843,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_PlainToTsqueryAnd) {
   irs::And expected;
   {
     auto& terms = expected.add<irs::ByTerms>();
-    *terms.mutable_field() = MakeFieldName<std::string_view>(1);
+    *terms.mutable_field_id() = ExpectedFieldId(1);
     auto& opts = *terms.mutable_options();
     opts.min_match = 2;  // ALL of 2 tokens
     {
@@ -4955,7 +4953,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_WebsearchNegation) {
   AddTermFilter<std::string_view>(and_group, 1, std::string_view{"quick"});
   auto& not_group = and_group.add<irs::Not>();
   auto& inner = not_group.filter<irs::ByTerm>();
-  *inner.mutable_field() = MakeFieldName<std::string_view>(1);
+  *inner.mutable_field_id() = ExpectedFieldId(1);
   {
     irs::StringTokenizer stream;
     const irs::TermAttr* token = irs::get<irs::TermAttr>(stream);
@@ -4981,7 +4979,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_WebsearchFullExample) {
   AddTermFilter<std::string_view>(or_group, 1, std::string_view{"slow"});
   auto& not_group = and_group.add<irs::Not>();
   auto& inner = not_group.filter<irs::ByTerm>();
-  *inner.mutable_field() = MakeFieldName<std::string_view>(1);
+  *inner.mutable_field_id() = ExpectedFieldId(1);
   {
     irs::StringTokenizer stream;
     const irs::TermAttr* token = irs::get<irs::TermAttr>(stream);
@@ -5028,7 +5026,7 @@ TEST_F(SearchFilterBuilderTest, test_PhraseMatches_WithGap_eq_AtAtTsPhrase) {
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "category"}};
   irs::And expected;
   auto& phrase = AddFilter<irs::ByPhrase>(expected);
-  *phrase.mutable_field() = MakeFieldName<std::string_view>(1);
+  *phrase.mutable_field_id() = ExpectedFieldId(1);
   phrase.mutable_options()->push_back<irs::ByTermOptions>().term =
     irs::ViewCast<irs::byte_type>(std::string_view{"quick"});
   phrase.mutable_options()->push_back<irs::ByTermOptions>(3, 3).term =
@@ -5090,7 +5088,7 @@ TEST_F(SearchFilterBuilderTest, test_HasAllTokens_eq_AtAtTsAllTsTokenize) {
   irs::And expected;
   {
     auto& terms = expected.add<irs::ByTerms>();
-    *terms.mutable_field() = MakeFieldName<std::string_view>(1);
+    *terms.mutable_field_id() = ExpectedFieldId(1);
     auto& opts = *terms.mutable_options();
     opts.min_match = 2;
     opts.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view{"foo"}));
@@ -5119,7 +5117,7 @@ TEST_F(SearchFilterBuilderTest,
   irs::And expected;
   {
     auto& terms = expected.add<irs::ByTerms>();
-    *terms.mutable_field() = MakeFieldName<std::string_view>(1);
+    *terms.mutable_field_id() = ExpectedFieldId(1);
     auto& opts = *terms.mutable_options();
     opts.min_match = 2;
     opts.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view{"foo"}));
@@ -5150,7 +5148,7 @@ TEST_F(SearchFilterBuilderTest,
   // analyzer -- both must match (min_match=2).
   {
     auto& terms = expected.add<irs::ByTerms>();
-    *terms.mutable_field() = MakeFieldName<std::string_view>(1);
+    *terms.mutable_field_id() = ExpectedFieldId(1);
     auto& opts = *terms.mutable_options();
     opts.min_match = 2;
     opts.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view{"foo"}));
@@ -5199,7 +5197,7 @@ TEST_F(SearchFilterBuilderTest, test_PhraseMatches_MultipleGaps) {
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "category"}};
   irs::And expected;
   auto& phrase = AddFilter<irs::ByPhrase>(expected);
-  *phrase.mutable_field() = MakeFieldName<std::string_view>(1);
+  *phrase.mutable_field_id() = ExpectedFieldId(1);
   phrase.mutable_options()->push_back<irs::ByTermOptions>().term =
     irs::ViewCast<irs::byte_type>(std::string_view{"quick"});
   phrase.mutable_options()->push_back<irs::ByTermOptions>(2, 2).term =
@@ -5217,7 +5215,7 @@ TEST_F(SearchFilterBuilderTest, test_PhraseMatches_RangeGap) {
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "category"}};
   irs::And expected;
   auto& phrase = AddFilter<irs::ByPhrase>(expected);
-  *phrase.mutable_field() = MakeFieldName<std::string_view>(1);
+  *phrase.mutable_field_id() = ExpectedFieldId(1);
   phrase.mutable_options()->push_back<irs::ByTermOptions>().term =
     irs::ViewCast<irs::byte_type>(std::string_view{"quick"});
   phrase.mutable_options()->push_back<irs::ByTermOptions>(2, 3).term =
@@ -5475,7 +5473,7 @@ TEST_F(SearchFilterBuilderTest, test_HasAllTokens_MultiTokenElement) {
   irs::And expected;
   {
     auto& terms = expected.add<irs::ByTerms>();
-    *terms.mutable_field() = MakeFieldName<std::string_view>(1);
+    *terms.mutable_field_id() = ExpectedFieldId(1);
     auto& opts = *terms.mutable_options();
     opts.min_match = 3;
     opts.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view{"foo"}));
@@ -5494,7 +5492,7 @@ TEST_F(SearchFilterBuilderTest, test_HasAllTokens_Negated) {
   auto& not_filter = expected.add<irs::Not>();
   {
     auto& terms = AddFilter<irs::ByTerms>(not_filter);
-    *terms.mutable_field() = MakeFieldName<std::string_view>(1);
+    *terms.mutable_field_id() = ExpectedFieldId(1);
     auto& opts = *terms.mutable_options();
     opts.min_match = 2;
     opts.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view{"foo"}));
@@ -5511,7 +5509,7 @@ TEST_F(SearchFilterBuilderTest, test_HasAllTokens_AndedWithSelf) {
   irs::And expected;
   {
     auto& terms = expected.add<irs::ByTerms>();
-    *terms.mutable_field() = MakeFieldName<std::string_view>(1);
+    *terms.mutable_field_id() = ExpectedFieldId(1);
     auto& opts = *terms.mutable_options();
     opts.min_match = 2;
     opts.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view{"foo"}));
@@ -5519,7 +5517,7 @@ TEST_F(SearchFilterBuilderTest, test_HasAllTokens_AndedWithSelf) {
   }
   {
     auto& terms = expected.add<irs::ByTerms>();
-    *terms.mutable_field() = MakeFieldName<std::string_view>(1);
+    *terms.mutable_field_id() = ExpectedFieldId(1);
     auto& opts = *terms.mutable_options();
     opts.min_match = 2;
     opts.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view{"baz"}));
@@ -5538,7 +5536,7 @@ TEST_F(SearchFilterBuilderTest, test_HasAllTokens_OredWithSelf) {
   auto& or_filter = expected.add<irs::Or>();
   {
     auto& terms = or_filter.add<irs::ByTerms>();
-    *terms.mutable_field() = MakeFieldName<std::string_view>(1);
+    *terms.mutable_field_id() = ExpectedFieldId(1);
     auto& opts = *terms.mutable_options();
     opts.min_match = 2;
     opts.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view{"foo"}));
@@ -5546,7 +5544,7 @@ TEST_F(SearchFilterBuilderTest, test_HasAllTokens_OredWithSelf) {
   }
   {
     auto& terms = or_filter.add<irs::ByTerms>();
-    *terms.mutable_field() = MakeFieldName<std::string_view>(1);
+    *terms.mutable_field_id() = ExpectedFieldId(1);
     auto& opts = *terms.mutable_options();
     opts.min_match = 2;
     opts.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view{"baz"}));
@@ -5564,7 +5562,7 @@ TEST_F(SearchFilterBuilderTest, test_HasAllTokens_BoostCastWraps) {
   irs::And expected;
   {
     auto& terms = expected.add<irs::ByTerms>();
-    *terms.mutable_field() = MakeFieldName<std::string_view>(1);
+    *terms.mutable_field_id() = ExpectedFieldId(1);
     auto& opts = *terms.mutable_options();
     opts.min_match = 2;
     opts.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view{"foo"}));
@@ -5588,7 +5586,7 @@ TEST_F(SearchFilterBuilderTest, test_HasAllTokens_IdentityAnalyzer) {
   irs::And expected;
   {
     auto& terms = expected.add<irs::ByTerms>();
-    *terms.mutable_field() = MakeFieldName<std::string_view>(1);
+    *terms.mutable_field_id() = ExpectedFieldId(1);
     auto& opts = *terms.mutable_options();
     opts.min_match = 2;
     opts.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view{"Foo"}));
@@ -5622,7 +5620,7 @@ TEST_F(SearchFilterBuilderTest, test_HasAnyToken_List_MinMatchEqualsSize) {
   irs::And expected;
   {
     auto& terms = expected.add<irs::ByTerms>();
-    *terms.mutable_field() = MakeFieldName<std::string_view>(1);
+    *terms.mutable_field_id() = ExpectedFieldId(1);
     auto& opts = *terms.mutable_options();
     opts.min_match = 2;
     opts.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view{"foo"}));
@@ -5715,7 +5713,7 @@ TEST_F(SearchFilterBuilderTest, test_HasAnyToken_TextWithMinMatch_BoostCast) {
   irs::And expected;
   {
     auto& terms = expected.add<irs::ByTerms>();
-    *terms.mutable_field() = MakeFieldName<std::string_view>(1);
+    *terms.mutable_field_id() = ExpectedFieldId(1);
     auto& opts = *terms.mutable_options();
     opts.min_match = 2;
     opts.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view{"foo"}));

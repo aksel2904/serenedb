@@ -126,12 +126,11 @@ class NthPartitionScoreCollector final : public ScoreCollector {
 
   void SetSegment(uint32_t idx) noexcept { _current_segment = idx; }
 
-  IRS_FORCE_INLINE uint64_t Finalize() {
-    std::sort(_hits_begin, _hits_end, [](const ScoreDoc& l, const ScoreDoc& r) {
-      return l.score > r.score;
-    });
-    return _count;
+  IRS_FORCE_INLINE size_t AcceptedCount() const noexcept {
+    return _hits_it - _hits_begin;
   }
+
+  IRS_FORCE_INLINE uint64_t TotalMatches() const noexcept { return _count; }
 
   IRS_FORCE_INLINE void AddWindow(const score_t* scores, const uint64_t* mask,
                                   doc_id_t min, size_t num_blocks,
@@ -289,15 +288,10 @@ struct DocIterator : AttributeProvider {
   // (for more information see class description)
   virtual doc_id_t seek(doc_id_t target) = 0;
 
-  // Can be mixed with other API only after return target
-  // In general doing seek but if it understands that seek to target impossible
-  // return doc that is greater than target, and this doc less or equal than
-  // first doc in iterator that is greater than target.
-  // In other words: `target <= LazySeek(target) <= seek(target)`
-  virtual doc_id_t LazySeek(doc_id_t target) {
-    SDB_ASSERT(target >= value());
-    return seek(target);
-  }
+  // If target is in the iterator: returns target and value() == target.
+  // If target isn't in the iterator: value() is unchanged (no advance).
+  // If target <= value(): returns target
+  virtual doc_id_t LazySeek(doc_id_t target) { return seek(target); }
 
   virtual void Collect(const ScoreFunction& scorer, ColumnArgsFetcher& fetcher,
                        ScoreCollector& collector) {
@@ -474,30 +468,6 @@ struct ResettableDocIterator : DocIterator {
 };
 
 struct TermReader;
-
-// An iterator providing sequential and random access to indexed fields
-struct FieldIterator : Iterator<const TermReader&> {
-  using ptr = memory::managed_ptr<FieldIterator>;
-
-  [[nodiscard]] static FieldIterator::ptr empty() noexcept;
-
-  // Position iterator at a specified target.
-  // Return if the target is found, false otherwise.
-  virtual bool seek(std::string_view target) = 0;
-};
-
-struct ColumnReader;
-
-// An iterator providing sequential and random access to stored columns.
-struct ColumnIterator : Iterator<const ColumnReader&> {
-  using ptr = memory::managed_ptr<ColumnIterator>;
-
-  [[nodiscard]] static ColumnIterator::ptr empty() noexcept;
-
-  // Position iterator at a specified target.
-  // Return if the target is found, false otherwise.
-  virtual bool seek(std::string_view name) = 0;
-};
 
 // An iterator providing sequential access to term dictionary
 struct TermIterator : Iterator<bytes_view, AttributeProvider> {

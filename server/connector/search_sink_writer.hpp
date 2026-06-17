@@ -20,73 +20,81 @@
 
 #pragma once
 
+#include <absl/container/flat_hash_map.h>
+#include <absl/functional/any_invocable.h>
 #include <simdjson.h>
 
+#include <duckdb/common/enums/compression_type.hpp>
+#include <duckdb/common/vector/unified_vector_format.hpp>
+#include <functional>
 #include <iresearch/analysis/token_attributes.hpp>
+#include <iresearch/formats/column/col_reader.hpp>
+#include <iresearch/formats/column/column_writer.hpp>
+#include <iresearch/index/column_info.hpp>
 #include <iresearch/index/index_writer.hpp>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
 
+#include "basics/containers/node_hash_map.h"
 #include "catalog/inverted_index.h"
 #include "catalog/search_analyzer_impl.h"
+#include "connector/index_expression.hpp"
 #include "primary_key.hpp"
-#include "search/inverted_index_shard.h"
+#include "search/inverted_index_storage.h"
 #include "search_remove_filter.hpp"
 #include "sink_writer_base.hpp"
-#include "storage_engine/engine_feature.h"
 
 namespace sdb::connector {
 
 class SearchRemoveFilterBase;
 
 using TokenizerProvider =
-  absl::AnyInvocable<catalog::ColumnTokenizer(catalog::Column::Id)>;
-
-// One JSON path's worth of indexing config, resolved against the catalog.
-struct JsonPathSinkConfig {
-  std::span<const std::string> path;
-  catalog::ColumnTokenizer tokenizer;
-};
-
-using JsonPathsProvider =
-  absl::AnyInvocable<std::vector<JsonPathSinkConfig>(catalog::Column::Id)>;
-
-// A JsonPathsProvider that returns an empty vector for every column. Useful
-// for code paths that do not yet support path-based JSON indexing.
-inline JsonPathsProvider NoJsonPaths() {
-  return [](catalog::Column::Id) { return std::vector<JsonPathSinkConfig>{}; };
-}
+  absl::AnyInvocable<catalog::ColumnTokenizer(irs::field_id)>;
 
 inline TokenizerProvider MakeTokenizerProvider(
-  const std::shared_ptr<const catalog::Snapshot>& snapshot,
+  std::shared_ptr<const catalog::Snapshot> snapshot,
   const catalog::InvertedIndex& index) {
-  return [snapshot, &index](catalog::Column::Id column_id) {
-    return index.GetColumnTokenizer(snapshot, column_id);
+  return [snapshot = std::move(snapshot),
+          &index](irs::field_id field_id) -> catalog::ColumnTokenizer {
+    return index.GetTokenizer(snapshot, field_id);
   };
 }
 
-// Resolves every configured JSON path for `column_id` against the catalog.
-// Returns an empty vector for columns without path-based indexing.
-inline JsonPathsProvider MakeJsonPathsProvider(
-  std::shared_ptr<const catalog::Snapshot> snapshot,
+inline std::vector<IndexedExpression> MakeIndexedExpressions(
+  const catalog::InvertedIndex& index, duckdb::ClientContext& client_context) {
+  std::vector<IndexedExpression> entries;
+  entries.reserve(index.GetEntries().size());
+  for (const auto& [field_id, entry] : index.GetEntries()) {
+    const auto* expr = entry.GetExpressionData();
+    if (!expr) {
+      continue;
+    }
+    SDB_ASSERT(!expr->serialized_expr.empty());
+    SDB_ASSERT(!expr->dependent_columns.empty());
+    SDB_ASSERT(irs::field_limits::valid(field_id));
+    auto bound =
+      DeserializeBoundExpression(expr->serialized_expr, client_context);
+    const bool is_geojson = expr->return_type.IsJSONType() &&
+                            irs::field_limits::valid(entry.synthetic_column);
+    entries.emplace_back(std::move(bound), expr->serialized_expr,
+                         expr->dependent_columns, field_id, is_geojson);
+  }
+  return entries;
+}
+
+using EntryInfoProvider =
+  absl::AnyInvocable<const catalog::InvertedIndexEntryInfo*(irs::field_id)>;
+
+inline EntryInfoProvider MakeEntryInfoProvider(
   const catalog::InvertedIndex& index) {
-  return [snapshot = std::move(snapshot), &index](
-           catalog::Column::Id column_id) -> std::vector<JsonPathSinkConfig> {
-    const auto* col = index.FindColumnInfo(column_id);
-    if (!col) {
-      return {};
-    }
-    std::vector<JsonPathSinkConfig> out;
-    out.reserve(col->json_paths.size());
-    for (const auto& p : col->json_paths) {
-      auto analyzer = index.GetJsonPathTokenizer(snapshot, column_id, p.path);
-      if (!analyzer) {
-        continue;
-      }
-      out.emplace_back(p.path, *std::move(analyzer));
-    }
-    return out;
+  return [&index](irs::field_id field_id) { return index.FindEntry(field_id); };
+}
+
+inline EntryInfoProvider NoEntryInfoProvider() {
+  return [](irs::field_id) -> const catalog::InvertedIndexEntryInfo* {
+    return nullptr;
   };
 }
 
@@ -94,29 +102,32 @@ class SearchSinkInsertBaseImpl : public ColumnSinkWriterImplBase {
  public:
   SearchSinkInsertBaseImpl(irs::IndexWriter::Transaction& trx,
                            TokenizerProvider&& tokenizer_provider,
-                           JsonPathsProvider&& json_paths_provider,
-                           std::span<const catalog::Column::Id> columns);
+                           EntryInfoProvider&& entry_info_provider,
+                           std::span<const catalog::Column::Id> columns,
+                           std::vector<IndexedExpression>&& indexed_exprs = {});
 
   void InitImpl(size_t batch_size);
 
-  void WriteImpl(std::span<const rocksdb::Slice> cell_slices,
-                 std::string_view full_key);
+  void SwitchFieldImpl(irs::field_id field_id, const duckdb::LogicalType& type,
+                       const duckdb::Vector& vec,
+                       std::span<const std::string_view> row_keys,
+                       duckdb::idx_t count);
 
-  bool SwitchColumnImpl(const duckdb::LogicalType& type, bool have_nulls,
-                        catalog::Column::Id column_id);
   void FinishImpl();
 
+  std::span<const IndexedExpression> IndexedExpressionImpl() const noexcept {
+    return _indexed_expressions;
+  }
+
   void AbortImpl() {
+    _column_writers.clear();
     // We don't own the transaction so Abort should be called outside.
     _document.reset();
   }
 
  protected:
   struct Field {
-    std::string_view Name() const noexcept {
-      SDB_ASSERT(!irs::IsNull(name));
-      return name;
-    }
+    irs::field_id Id() const noexcept { return id; }
 
     irs::IndexFeatures GetIndexFeatures() const noexcept {
       return index_features;
@@ -130,12 +141,10 @@ class SearchSinkInsertBaseImpl : public ColumnSinkWriterImplBase {
 
     bool Write(irs::DataOutput& out) const {
       if (store_attr && !irs::IsNull(store_attr->value)) {
-        out.WriteBytes(store_attr->value.data(), store_attr->value.size());
+        out.WriteData(store_attr->value.data(), store_attr->value.size());
       }
       return true;
     }
-
-    void PrepareForVectorValue();
 
     void PrepareForVerbatimStringValue();
     void PrepareForStringValue(catalog::ColumnTokenizer&& column_analyzer);
@@ -153,7 +162,7 @@ class SearchSinkInsertBaseImpl : public ColumnSinkWriterImplBase {
 
     search::AnalyzerImpl::CacheType::ptr analyzer;
     catalog::Tokenizer::TokenizerWrapper string_analyzer;
-    std::string_view name;
+    irs::field_id id{irs::field_limits::invalid()};
     irs::IndexFeatures index_features;
     // For paths that don't receive a StoreAttr from an analyzer
     // (HNSW vector columns, PK). Ignored when store_attr points elsewhere.
@@ -164,109 +173,83 @@ class SearchSinkInsertBaseImpl : public ColumnSinkWriterImplBase {
     const irs::StoreAttr* store_attr = nullptr;
   };
 
-  using Writer = std::function<void(
-    std::string_view full_key, std::span<const rocksdb::Slice> cell_slices)>;
-
-  // Generic writer. Non-null rows (field.store_attr != nullptr) use
-  // NonNullAction; null rows -- nullable_writer_func substitutes _null_field
-  // which has no store_attr and a null-stream analyzer -- always get
-  // Insert<INDEX> so IS NULL queries still find them, even on paths where
-  // NonNullAction is STORE-only (e.g. HNSW). HasStore=false skips the
-  // per-row check and just Inserts<INDEX> -- for paths that never store.
-  template<bool HasStore, irs::Action NonNullAction, typename WriteFunc>
-  Writer MakeWriterImpl(WriteFunc&& write_func);
-
-  // Thin wrappers over MakeWriterImpl:
-  //   MakeIndexWriter      -- INDEX only (no columnstore), cheapest path.
-  //   MakeIndexStoreWriter -- non-null INDEX|STORE, null INDEX.
-  //   MakeStoreWriter      -- non-null STORE, null INDEX (HNSW vectors).
-  template<typename WriteFunc>
-  Writer MakeIndexWriter(WriteFunc&& write_func) {
-    return MakeWriterImpl<false, irs::Action::INDEX>(
-      std::forward<WriteFunc>(write_func));
-  }
-  template<typename WriteFunc>
-  Writer MakeIndexStoreWriter(WriteFunc&& write_func) {
-    return MakeWriterImpl<true, irs::Action::INDEX | irs::Action::STORE>(
-      std::forward<WriteFunc>(write_func));
-  }
-  template<typename WriteFunc>
-  Writer MakeStoreWriter(WriteFunc&& write_func) {
-    return MakeWriterImpl<true, irs::Action::STORE>(
-      std::forward<WriteFunc>(write_func));
-  }
-
-  // Actual value processors. It is set to write executor (see MakeIndexWriter)
-  // as a template. This methods are responsible for extracting value from
-  // rocksdb slices and setting it to Field structure accordingly.
-  static Field& WriteStringValue(std::string_view full_key,
-                                 std::span<const rocksdb::Slice> cell_slices,
-                                 Field& field);
-  static Field& WriteBooleanValue(std::string_view full_key,
-                                  std::span<const rocksdb::Slice> cell_slices,
-                                  Field& field);
-
-  template<typename T>
-  static Field& WriteNumericValue(std::string_view full_key,
-                                  std::span<const rocksdb::Slice> cell_slices,
-                                  Field& field);
-
-  static Field& WriteVectorValue(std::string_view full_key,
-                                 std::span<const rocksdb::Slice> cell_slices,
-                                 Field& field);
-
-  // Setup column writer according to type kind.
-  // Builds actual executor to avoid switch/case on each row whenever possible.
   template<duckdb::LogicalTypeId Kind>
-  void SetupColumnWriter(catalog::Column::Id column_id, bool have_nulls);
+  void SetFieldValueFromVector(Field& field,
+                               const duckdb::UnifiedVectorFormat& fmt,
+                               duckdb::idx_t idx);
 
-  // Setup the writer for a JSON column with one or more configured paths.
-  // Each path becomes a distinct iresearch field named
-  // [8 bytes BE column_id] + "." + key1 + "." + key2 + ... + <MangleString>.
-  void SetupJsonColumnWriter(catalog::Column::Id column_id,
-                             std::vector<JsonPathSinkConfig> paths);
+  void EmitField(Field* field_to_insert, std::string_view full_row_key);
 
-  struct JsonPathField {
-    // Backing storage for each per-type field name; Field::name is a
-    // string_view into the corresponding buffer.
-    std::string string_name;
-    std::string numeric_name;
-    std::string bool_name;
-    std::string null_name;
-    Field string_field;   // user's configured analyzer
-    Field numeric_field;  // built-in NumericTokenizer
-    Field bool_field;     // built-in BooleanTokenizer
-    Field null_field;     // built-in NullTokenizer
-    // JSON Pointer view inside one of the name buffers.
-    std::string_view pointer;
+  template<duckdb::LogicalTypeId Kind>
+  void WriteScalarBatch(std::span<const std::string_view> row_keys,
+                        duckdb::idx_t count, irs::field_id tokenizer_column);
 
-    void Init(catalog::Column::Id column_id, std::span<const std::string> path,
-              catalog::ColumnTokenizer string_analyzer);
+  template<duckdb::LogicalTypeId ChildKind>
+  void WriteListBatch(std::span<const std::string_view> row_keys,
+                      duckdb::idx_t count, duckdb::idx_t array_size);
+
+  bool DispatchScalarBatch(duckdb::LogicalTypeId kind,
+                           std::span<const std::string_view> row_keys,
+                           duckdb::idx_t count, irs::field_id tokenizer_column);
+
+  bool DispatchListBatch(duckdb::LogicalTypeId child_kind,
+                         std::span<const std::string_view> row_keys,
+                         duckdb::idx_t count, duckdb::idx_t array_size);
+
+  void WriteJsonBatch(const duckdb::Vector& vec,
+                      std::span<const std::string_view> row_keys,
+                      duckdb::idx_t count);
+
+  void EmitPkOnlyBatch(std::span<const std::string_view> row_keys,
+                       duckdb::idx_t count);
+
+  void InsertNullValue();
+
+  irs::ColumnWriter* EnsurePerRowBlobWriter(irs::field_id field_id);
+  void MaybeEmitPk(std::string_view full_row_key);
+  void AppendPkBlob(std::string_view row_key);
+  void AppendPerRowBlob(irs::field_id field_id, irs::bytes_view bytes);
+
+  void AppendToColumn(irs::field_id field_id, const duckdb::LogicalType& type,
+                      const duckdb::Vector& vec, duckdb::idx_t count);
+
+  struct JsonExpressionFields {
+    Field string_field;
+    Field numeric_field;
+    Field bool_field;
+    Field null_field;
+    irs::field_id tokenizer_column = irs::field_limits::invalid();
+
+    void InitForExpression(irs::field_id entry_field_id,
+                           const catalog::InvertedIndexEntryInfo* entry,
+                           catalog::ColumnTokenizer string_analyzer);
   };
 
   TokenizerProvider _tokenizer_provider;
-  JsonPathsProvider _json_paths_provider;
-  Field _field;
+  EntryInfoProvider _entry_info_provider;
+  std::vector<IndexedExpression> _indexed_expressions;
   Field _pk_field;
+  Field _field;
   Field _null_field;
-  std::string _name_buffer;
-  std::string _null_name_buffer;
   irs::IndexWriter::Transaction& _trx;
   std::optional<irs::IndexWriter::Document> _document;
 
-  Writer _current_writer;
-  bool _emit_pk{true};
+  containers::FlatHashMap<irs::field_id, irs::ColumnWriter*> _column_writers;
 
-  // State for the currently active JSON column (empty when the column is not
-  // path-indexed). Rebuilt on every SwitchColumn.
-  std::vector<JsonPathField> _json_fields;
+  containers::FlatHashMap<irs::field_id, irs::ColumnWriter*>
+    _per_row_blob_writers;
+  irs::ColumnWriter* _pk_blob_writer = nullptr;
+
+  JsonExpressionFields _json_fields;
   simdjson::ondemand::parser _json_parser;
   std::string _json_buffer;
+
+  duckdb::RecursiveUnifiedVectorFormat _vec_fmt;
 };
 
 class SearchSinkDeleteBaseImpl {
  public:
-  SearchSinkDeleteBaseImpl(irs::IndexWriter::Transaction& trx);
+  explicit SearchSinkDeleteBaseImpl(irs::IndexWriter::Transaction& trx);
 
   void InitImpl(size_t batch_size);
 

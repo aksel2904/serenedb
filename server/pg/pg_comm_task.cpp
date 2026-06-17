@@ -29,7 +29,6 @@
 #include <duckdb/common/case_insensitive_map.hpp>
 #include <duckdb/common/error_data.hpp>
 #include <duckdb/common/types.hpp>
-#include <duckdb/execution/executor.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/client_data.hpp>
 #include <duckdb/main/prepared_statement_data.hpp>
@@ -51,10 +50,9 @@
 #include "basics/application-exit.h"
 #include "basics/assert.h"
 #include "basics/dtoa.h"
-#include "basics/endian.h"
+#include "basics/duckdb_engine.h"
 #include "basics/exceptions.h"
-#include "basics/global_resource_monitor.h"
-#include "basics/logger/logger.h"
+#include "basics/log.h"
 #include "basics/static_strings.h"
 #include "catalog/catalog.h"
 #include "connector/duckdb_client_state.h"
@@ -69,8 +67,6 @@
 #include "pg/sql_exception.h"
 #include "pg/sql_exception_macro.h"
 #include "pg/sql_utils.h"
-#include "query/duckdb_engine.h"
-#include "search/inverted_index_shard.h"
 
 #define SDB_LOG_PGSQL(...) SDB_PRINT_IF(false, __VA_ARGS__)
 
@@ -162,7 +158,7 @@ duckdb::LogicalType ResolveExpectedType(const auto& value_map, uint16_t id) {
 PgSQLCommTaskBase::PgSQLCommTaskBase(rest::GeneralServer& server,
                                      ConnectionInfo info)
   : rest::CommTask(server, std::move(info)),
-    _feature{server.server().getFeature<PostgresFeature>()},
+    _feature{PostgresFeature::instance()},
     _copy_queue{_queue_mutex},
     _send{64, 4096, 4096,
           [this](message::SequenceView data) { this->SendAsync(data); }} {}
@@ -171,7 +167,7 @@ PgSQLCommTaskBase::~PgSQLCommTaskBase() {
   if (_connection_ctx) {
     // Rollback unconditionally: even for auto-commit connections
     // (IsExplicitTransaction() == false), Config::_snapshot may be set and must
-    // be released via Destroy() to avoid unreleased RocksDB snapshots at
+    // be released via Destroy() to avoid leaked transaction state at
     // shutdown.
     std::ignore = _connection_ctx->Rollback();
   }
@@ -299,18 +295,14 @@ void PgSQLCommTaskBase::HandleClientHello(std::string_view packet) {
     ParseClientParameters(packet.substr(8));
     if (UserName().empty()) {
       // user name is mandatory and should always be present
-      SDB_WARN("xxxxx", Logger::REQUESTS,
-               "User name not set. Terminating connection ",
+      SDB_WARN(HTTP, "User name not set. Terminating connection ",
                std::bit_cast<size_t>(this));
       return;
     }
 
     // Pin the catalog snapshot at connection time -- all operations
     // on this connection use the same snapshot until statement/transaction end.
-    auto snapshot = _feature.server()
-                      .getFeature<catalog::CatalogFeature>()
-                      .Global()
-                      .GetCatalogSnapshot();
+    auto snapshot = catalog::GetCatalog().GetCatalogSnapshot();
     auto database = snapshot->GetDatabase(DatabaseName());
     if (!database) {
       return SendError(
@@ -318,7 +310,7 @@ void PgSQLCommTaskBase::HandleClientHello(std::string_view packet) {
         ERRCODE_INVALID_SCHEMA_NAME);
     }
 
-    _duckdb_conn = query::DuckDBEngine::Instance().CreateConnection();
+    _duckdb_conn = sdb::DuckDBEngine::Instance().CreateConnection();
 
     _connection_ctx = std::make_shared<ConnectionContext>(
       *_duckdb_conn->context, UserName(), DatabaseName(), database->GetId(),
@@ -379,8 +371,8 @@ void PgSQLCommTaskBase::HandleClientHello(std::string_view packet) {
 
       _connection_ctx->SetSetting("session_authorization",
                                   std::string{UserName()}, false);
-      _connection_ctx->SetSetting(
-        "is_superuser", _connection_ctx->isSuperuser() ? "on" : "off", false);
+      // serened has no RBAC yet -- every catalog role has rolsuper = true
+      _connection_ctx->SetSetting("is_superuser", "on", false);
 
       // Apply all user settings from startup packet
       for (const auto& user_setting : _client_parameters) {
@@ -435,7 +427,7 @@ void PgSQLCommTaskBase::HandleClientHello(std::string_view packet) {
       memcpy(backend_key_data.data() + 5, &_key, sizeof(_key));
       _send.Write(ToBuffer(backend_key_data), false);
 
-      _send.Write(ToBuffer(kReadyForQuery), true);
+      SendReadyForQuery();
       std::move(cleanup).Cancel();
       _success_packet = true;
     } else if (auth.auth.auth_method == hba::UserAuth::Reject ||
@@ -446,8 +438,7 @@ void PgSQLCommTaskBase::HandleClientHello(std::string_view packet) {
       SendError("NO IMPLEMENTED", ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION);
     }
   } else {
-    SDB_WARN("xxxxx", Logger::REQUESTS, "Unknown packet:", protocol_ver,
-             " connection aborted");
+    SDB_WARN(HTTP, "Unknown packet:", protocol_ver, " connection aborted");
   }
 }
 
@@ -978,7 +969,8 @@ void PgSQLCommTaskBase::BindQuery(std::string_view packet) {
   if (!statement) {
     auto statement_it = _statements.find(statement_name);
     if (statement_it == _statements.end()) {
-      return SendError("Invalid statement name",
+      return SendError(absl::StrCat("prepared statement \"", statement_name,
+                                    "\" does not exist"),
                        ERRCODE_INVALID_SQL_STATEMENT_NAME);
     }
     statement = &statement_it->second;
@@ -1083,25 +1075,6 @@ void PgSQLCommTaskBase::ParseQuery(std::string_view packet) {
   _success_packet = true;
 }
 
-duckdb::unique_ptr<duckdb::PendingQueryResult>
-PgSQLCommTaskBase::PendingQueryEnsured(duckdb::PreparedStatement& prepared,
-                                       duckdb::vector<duckdb::Value>& values,
-                                       bool allow_stream_result) {
-  const auto& props = prepared.GetStatementProperties();
-  const auto db_name = DatabaseName();
-  _connection_ctx->EnsureCatalogSnapshot();
-  if (props.modified_databases.contains(db_name)) {
-    _connection_ctx->EnsureRocksDBTransaction();
-    _connection_ctx->EnsureRocksDBSnapshot();
-  } else if (props.read_databases.contains(db_name)) {
-    if (_connection_ctx->IsExplicitTransaction()) {
-      _connection_ctx->EnsureRocksDBTransaction();
-    }
-    _connection_ctx->EnsureRocksDBSnapshot();
-  }
-  return prepared.PendingQuery(values, allow_stream_result);
-}
-
 void PgSQLCommTaskBase::ExecutePortal(DuckDBPortal& portal) {
   SDB_ASSERT(_pop_packet);
   SDB_ASSERT(portal.stmt);
@@ -1123,6 +1096,57 @@ void PgSQLCommTaskBase::ExecutePortal(DuckDBPortal& portal) {
     state = ProcessQueryResult();
   } while (state == ProcessState::More);
   _pop_packet = state == ProcessState::DonePacket;
+}
+
+namespace {
+
+bool IsCatalogDdl(duckdb::StatementType type) {
+  using duckdb::StatementType;
+  switch (type) {
+    case StatementType::CREATE_STATEMENT:
+    case StatementType::DROP_STATEMENT:
+    case StatementType::ALTER_STATEMENT:
+    case StatementType::ATTACH_STATEMENT:
+    case StatementType::DETACH_STATEMENT:
+      return true;
+    default:
+      return false;
+  }
+}
+
+}  // namespace
+
+duckdb::unique_ptr<duckdb::PendingQueryResult>
+PgSQLCommTaskBase::PendingQueryEnsured(duckdb::PreparedStatement& prepared,
+                                       duckdb::vector<duckdb::Value>& values,
+                                       bool allow_stream_result) {
+  if (_connection_ctx->IsExplicitTransaction() &&
+      IsCatalogDdl(prepared.GetStatementType())) {
+    if (_connection_ctx->GetStrictDDL()) {
+      THROW_SQL_ERROR(
+        ERR_CODE(ERRCODE_ACTIVE_SQL_TRANSACTION),
+        ERR_MSG("DDL statements are not supported inside a transaction "
+                "block: DDL commits immediately and cannot be rolled back "
+                "(sdb_strict_ddl is enabled)"));
+    }
+    _connection_ctx->AddNotice(SQL_ERROR_DATA(
+      ERR_CODE(ERRCODE_ACTIVE_SQL_TRANSACTION),
+      ERR_MSG("DDL is not transactional: the statement commits immediately "
+              "and is not undone by ROLLBACK")));
+  }
+  if (_connection_ctx->IsExplicitTransaction()) {
+    _connection_ctx->RefreshReadCommittedSnapshot();
+  }
+  const auto& props = prepared.GetStatementProperties();
+  const auto db_name = DatabaseName();
+  _connection_ctx->EnsureCatalogSnapshot();
+  if (props.modified_databases.contains(db_name) ||
+      props.read_databases.contains(db_name)) {
+    if (_connection_ctx->IsExplicitTransaction()) {
+      _connection_ctx->MarkQueryInTransaction();
+    }
+  }
+  return prepared.PendingQuery(values, allow_stream_result);
 }
 
 auto PgSQLCommTaskBase::BindStatement(DuckDBStatement& stmt,
@@ -1252,8 +1276,7 @@ auto PgSQLCommTaskBase::ProcessQueryResult() -> ProcessState {
           return ProcessState::DonePacket;
         }
         // Fall through to fetch first chunk
-        break;
-      }
+      } break;
       case duckdb::PendingExecutionResult::RESULT_NOT_READY:
       case duckdb::PendingExecutionResult::NO_TASKS_AVAILABLE:
         // More work needed -- continue polling
@@ -1557,7 +1580,12 @@ void PgSQLCommTaskBase::SendCommandComplete(duckdb::StatementType stmt_type,
       return static_cast<size_t>(ptr - buf);
     });
   } else if (return_type == duckdb::StatementReturnType::QUERY_RESULT) {
-    _send.WriteUncommitted({" ", 1});
+    // INSERT ... RETURNING still reports "INSERT 0 N" in PG.
+    if (tag.effective_type == duckdb::StatementType::INSERT_STATEMENT) {
+      _send.WriteUncommitted({" 0 ", 3});
+    } else {
+      _send.WriteUncommitted({" ", 1});
+    }
     _send.WriteContiguousData(basics::kIntStrMaxLen, [&](auto* data) {
       char* buf = reinterpret_cast<char*>(data);
       char* ptr = absl::numbers_internal::FastIntToBuffer(rows, buf);
@@ -1652,6 +1680,19 @@ void PgSQLCommTaskBase::SendParameterStatus(std::string_view name,
   _send.Commit(false);
 }
 
+char PgSQLCommTaskBase::TransactionStatusIndicator() const noexcept {
+  if (!_connection_ctx || !_connection_ctx->IsExplicitTransaction()) {
+    return 'I';
+  }
+  return _connection_ctx->IsTransactionInvalidated() ? 'E' : 'T';
+}
+
+void PgSQLCommTaskBase::SendReadyForQuery() {
+  std::array<char, kReadyForQuery.size()> msg = kReadyForQuery;
+  msg[5] = TransactionStatusIndicator();
+  _send.Write(ToBuffer(msg), true);
+}
+
 std::string_view PgSQLCommTaskBase::StartPacket() noexcept {
   std::lock_guard lock{_queue_mutex};
   SDB_ASSERT(!_queue.empty());
@@ -1682,7 +1723,7 @@ void PgSQLCommTaskBase::FinishPacket() noexcept try {
 
   if (_current_packet_type == PQ_MSG_QUERY ||
       _current_packet_type == PQ_MSG_SYNC) {
-    _send.Write(ToBuffer(kReadyForQuery), true);
+    SendReadyForQuery();
   }
   std::lock_guard lock{_queue_mutex};
   if (_current_packet_type == PQ_MSG_QUERY ||
@@ -1707,8 +1748,7 @@ void PgSQLCommTaskBase::FinishPacket() noexcept try {
     SetIOTimeoutImpl();
   }
 } catch (...) {
-  SDB_ERROR("xxxxx", Logger::REQUESTS,
-            "<pgsql> connection closed due to exception in finalizing ",
+  SDB_ERROR(HTTP, "<pgsql> connection closed due to exception in finalizing ",
             std::bit_cast<size_t>(this));
   Stop();
 }
@@ -1793,8 +1833,7 @@ PgSQLCommTask<T>::PgSQLCommTask(rest::GeneralServer& server,
 
 template<rest::SocketType T>
 void PgSQLCommTask<T>::Start() {
-  SDB_DEBUG("xxxxx", Logger::REQUESTS, "<pgsql> opened connection ",
-            std::bit_cast<size_t>(this));
+  SDB_DEBUG(HTTP, "<pgsql> opened connection ", std::bit_cast<size_t>(this));
   asio_ns::post(this->_protocol->context.io_context,
                 [self = this->shared_from_this()] {
                   if constexpr (T == rest::SocketType::Ssl) {
@@ -1858,8 +1897,7 @@ bool PgSQLCommTask<T>::ReadCallback(asio_ns::error_code ec) {
         data += datasize;
         if (this->_state.load() == State::ClientHello &&
             _packet.size() > MAX_STARTUP_PACKET_LENGTH) {
-          SDB_DEBUG("xxxxx", Logger::REQUESTS,
-                    "Too long startup packet. Dropping connection ptr",
+          SDB_DEBUG(HTTP, "Too long startup packet. Dropping connection ptr",
                     std::bit_cast<size_t>(this));
           this->Close();
           return false;
@@ -1895,7 +1933,7 @@ bool PgSQLCommTask<T>::ReadCallback(asio_ns::error_code ec) {
           }());
           const auto hello_passed = this->_state.load() != State::ClientHello;
           if (hello_passed && _packet[0] == PQ_MSG_TERMINATE) {
-            SDB_DEBUG("xxxxx", Logger::REQUESTS, "Termination request for ",
+            SDB_DEBUG(HTTP, "Termination request for ",
                       std::bit_cast<size_t>(this));
             this->Stop();
             _packet.clear();
@@ -1913,9 +1951,8 @@ bool PgSQLCommTask<T>::ReadCallback(asio_ns::error_code ec) {
                                  asio_ns::buffer(kYes));
                   auto cb = [this](const asio_ns::error_code& ec) mutable {
                     if (ec) {
-                      SDB_DEBUG("xxxxx", sdb::Logger::COMMUNICATION,
-                                "error during TLS handshake: '", ec.message(),
-                                "'");
+                      SDB_DEBUG(HTTP, "error during TLS handshake: '",
+                                ec.message(), "'");
                       this->Stop();
                       return;
                     }
@@ -1973,11 +2010,9 @@ bool PgSQLCommTask<T>::ReadCallback(asio_ns::error_code ec) {
   } else {
     // got a connection error
     if (ec == asio_ns::error::misc_errors::eof) {
-      SDB_TRACE("xxxxx", Logger::REQUESTS, "Eof with ptr ",
-                std::bit_cast<size_t>(this));
+      SDB_TRACE(HTTP, "Eof with ptr ", std::bit_cast<size_t>(this));
     } else {
-      SDB_DEBUG("xxxxx", Logger::REQUESTS, "Error while reading from socket: '",
-                ec.message(), "'");
+      SDB_DEBUG(HTTP, "Error while reading from socket: '", ec.message(), "'");
       this->Close(ec);
       return false;
     }
@@ -2014,7 +2049,7 @@ void PgSQLCommTask<T>::TimeoutStop() {
   if (!this->_queue.empty() || this->Stopped()) {
     return;
   }
-  SDB_INFO("xxxxx", Logger::REQUESTS, "keep alive timeout, closing stream!");
+  SDB_INFO(HTTP, "keep alive timeout, closing stream!");
   SDB_ASSERT(!this->_current_portal);
   this->_send.Write(ToBuffer(kTimeoutTermination), true);
   CloseImpl({});

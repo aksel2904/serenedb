@@ -51,12 +51,12 @@ endif()
 
 set(IResearch_core_sources
     ./utils/snowball_stemmer.cpp
-    ./analysis/analyzers.cpp
     ./analysis/token_attributes.cpp
     ./analysis/tokenizers.cpp
     ./analysis/stemming_tokenizer.cpp
     ./analysis/stopwords_tokenizer.cpp
     ./analysis/ngram_tokenizer.cpp
+    ./analysis/sparse_ngram_tokenizer.cpp
     ./analysis/pipeline_tokenizer.cpp
     ./analysis/union_tokenizer.cpp
     ./analysis/segmentation_tokenizer.cpp
@@ -76,15 +76,24 @@ set(IResearch_core_sources
     ./analysis/pattern_tokenizer.cpp
     ./analysis/wildcard_analyzer.cpp
     ./error/error.cpp
-    ./formats/column/common.cpp
+    ./formats/column/col_reader.cpp
+    ./formats/column/col_writer.cpp
+    ./formats/column/column_writer.cpp
+    ./formats/column/column_reader.cpp
+    ./formats/column/norm_writer.cpp
+    ./formats/column/norm_column_reader.cpp
+    ./formats/column/merge.cpp
+    ./formats/column/internal/write_context.cpp
+    ./formats/column/read_context.cpp
     ./formats/formats.cpp
     ./formats/format_utils.cpp
     ./formats/posting/skip_list.cpp
-    ./formats/column/sparse_bitmap.cpp
     ./formats/format_block_128.cpp
     ./formats/index/burst_trie.cpp
-    ./formats/column/hnsw_index.cpp
-    ./index/buffered_column.cpp
+    ./formats/index/idx_reader.cpp
+    ./formats/index/idx_writer.cpp
+    ./formats/hnsw/hnsw_reader.cpp
+    ./formats/hnsw/hnsw_writer.cpp
     ./index/directory_reader.cpp
     ./index/directory_reader_impl.cpp
     ./index/field_data.cpp
@@ -102,9 +111,7 @@ set(IResearch_core_sources
     ./search/all_docs_provider.cpp
     ./search/all_filter.cpp
     ./search/all_iterator.cpp
-    ./search/boost_scorer.cpp
     ./search/granular_range_filter.cpp
-    ./search/scorers.cpp
     ./search/scorer.cpp
     ./search/score_function.cpp
     ./search/cost.cpp
@@ -115,7 +122,6 @@ set(IResearch_core_sources
     ./search/nested_filter.cpp
     ./search/terms_filter.cpp
     ./search/prefix_filter.cpp
-    ./search/column_collector.cpp
     ./search/range_filter.cpp
     ./search/phrase_filter.cpp
     ./search/phrase_query.cpp
@@ -136,12 +142,13 @@ set(IResearch_core_sources
     ./search/proxy_filter.cpp
     ./search/tfidf.cpp
     ./search/bm25.cpp
-    ./search/raw_tf.cpp
-    ./search/lm_similarity.cpp
     ./search/lm_jelinek_mercer.cpp
     ./search/lm_dirichlet.cpp
     ./search/indri_dirichlet.cpp
     ./search/dfi.cpp
+    ./search/raw_boost.cpp
+    ./search/raw_tf.cpp
+    ./search/raw_dl.cpp
     ./store/data_input.cpp
     ./store/directory.cpp
     ./store/directory_attributes.cpp
@@ -154,9 +161,6 @@ set(IResearch_core_sources
     ./utils/automaton_utils.cpp
     ./utils/encryption.cpp
     ./utils/ctr_encryption.cpp
-    ./utils/compression.cpp
-    ./utils/delta_compression.cpp
-    ./utils/lz4compression.cpp
     ./utils/directory_utils.cpp
     ./utils/mmap_utils.cpp
     ./utils/index_utils.cpp
@@ -247,7 +251,8 @@ target_link_libraries(
     PUBLIC absl::flat_hash_map
     PUBLIC absl::flat_hash_set
     PUBLIC absl::crc32c
-    PUBLIC vpack
+    PUBLIC serene_base
+    PUBLIC simdjson
     PUBLIC iresearch-ofst
     PUBLIC ${FASTTEXT_LIBRARY_STATIC}
     PUBLIC ${SIMD_LIBRARY_STATIC}
@@ -255,6 +260,7 @@ target_link_libraries(
     PUBLIC re2
     PUBLIC serene_geo
     PUBLIC streamvbyte
+    PUBLIC duckdb_static
     PRIVATE lz4_static
     PRIVATE text
     PRIVATE stemmer-static

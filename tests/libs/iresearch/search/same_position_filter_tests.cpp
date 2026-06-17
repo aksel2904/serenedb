@@ -22,12 +22,44 @@
 ////////////////////////////////////////////////////////////////////////////////
 
 #include "filter_test_case_base.hpp"
+#include "formats/column/test_cs_helpers.hpp"
 #include "iresearch/analysis/token_attributes.hpp"
 #include "iresearch/formats/formats.hpp"
 #include "iresearch/search/same_position_filter.hpp"
 #include "iresearch/search/term_filter.hpp"
 #include "iresearch/store/memory_directory.hpp"
 #include "tests_shared.hpp"
+
+namespace {
+
+// Field ids match `tests::FieldIdFor(<name>)` so the writer (JSON
+// factories route their fields through that helper) and the reader
+// (this file's lookups) agree.
+inline constexpr irs::field_id kIdId = tests::FieldIdFor("_id");
+inline constexpr irs::field_id kPhraseId = tests::FieldIdFor("phrase");
+inline constexpr irs::field_id kAId = tests::FieldIdFor("a");
+inline constexpr irs::field_id kBId = tests::FieldIdFor("b");
+inline constexpr irs::field_id kCId = tests::FieldIdFor("c");
+inline constexpr irs::field_id kSpeedId = tests::FieldIdFor("speed");
+inline constexpr irs::field_id kSpeedCapitalId = tests::FieldIdFor("SPEED");
+inline constexpr irs::field_id kColorId = tests::FieldIdFor("color");
+inline constexpr irs::field_id kNameId = tests::FieldIdFor("name");
+inline constexpr irs::field_id kFieldId = tests::FieldIdFor("field");
+
+void StoreId(irs::IndexWriter::Document& doc, const tests::Document& src) {
+  auto* cs = doc.GetColWriter();
+  if (cs == nullptr) {
+    return;
+  }
+  const auto* field =
+    dynamic_cast<const tests::LongField*>(src.indexed.get_by_id(kIdId));
+  if (field == nullptr) {
+    return;
+  }
+  irs::tests::StoreFieldAt(*cs, kIdId, doc.DocId(), *field);
+}
+
+}  // namespace
 
 class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
  protected:
@@ -39,13 +71,15 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
         [](tests::Document& doc, const std::string& name,
            const tests::JsonDocGenerator::JsonValue& data) {
           if (data.is_string()) {  // field
-            doc.insert(
-              std::make_shared<tests::TextField<std::string>>(name, data.str),
-              true, false);
+            auto field =
+              std::make_shared<tests::TextField<std::string>>(name, data.str);
+            field->id = tests::FieldIdFor(name);
+            doc.insert(std::move(field), true, false);
           } else if (data.is_number()) {  // seq
             const auto value = std::to_string(data.as_number<int64_t>());
-            doc.insert(std::make_shared<tests::StringField>(name, value), false,
-                       true);
+            auto field = std::make_shared<tests::StringField>(name, value);
+            field->id = tests::FieldIdFor(name);
+            doc.insert(std::move(field), false, true);
           }
         });
       add_segment(gen);
@@ -61,71 +95,37 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
     // collector count (no branches)
     {
       irs::BySamePosition filter;
-
-      size_t collect_field_count = 0;
-      size_t collect_term_count = 0;
       size_t finish_count = 0;
 
       tests::sort::CustomSort scorer;
 
-      scorer.collector_collect_field = [&collect_field_count](
-                                         const irs::SubReader&,
-                                         const irs::TermReader&) -> void {
-        ++collect_field_count;
-      };
-      scorer.collector_collect_term =
-        [&collect_term_count](const irs::SubReader&, const irs::TermReader&,
-                              const irs::AttributeProvider&) -> void {
-        ++collect_term_count;
-      };
       scorer.collectors_collect =
         [&finish_count](irs::byte_type*, const irs::FieldCollector*,
                         const irs::TermCollector*) -> void { ++finish_count; };
-      scorer.prepare_field_collector = [&scorer]() -> irs::FieldCollector::ptr {
-        return std::make_unique<tests::sort::CustomSort::FieldCollector>(
-          scorer);
-      };
-      scorer.prepare_term_collector = [&scorer]() -> irs::TermCollector::ptr {
-        return std::make_unique<tests::sort::CustomSort::TermCollector>(scorer);
-      };
 
       auto prepared = filter.prepare({.index = index, .scorer = &scorer});
-      ASSERT_EQ(0, collect_field_count);  // should not be executed
-      ASSERT_EQ(0, collect_term_count);   // should not be executed
-      ASSERT_EQ(0, finish_count);         // no terms optimization
+      ASSERT_EQ(0, finish_count);
     }
 
     // collector count (single term)
     {
       irs::BySamePosition filter;
       filter.mutable_options()->terms.emplace_back(
-        "phrase", irs::ViewCast<irs::byte_type>(std::string_view("quick")));
-
-      size_t collect_field_count = 0;
-      size_t collect_term_count = 0;
+        kPhraseId, irs::ViewCast<irs::byte_type>(std::string_view("quick")));
       size_t finish_count = 0;
+      uint64_t finish_docs_with_field = 0;
+      uint64_t finish_docs_with_term = 0;
 
       tests::sort::CustomSort scorer;
 
-      scorer.collector_collect_field = [&collect_field_count](
-                                         const irs::SubReader&,
-                                         const irs::TermReader&) -> void {
-        ++collect_field_count;
-      };
-      scorer.collector_collect_term =
-        [&collect_term_count](const irs::SubReader&, const irs::TermReader&,
-                              const irs::AttributeProvider&) -> void {
-        ++collect_term_count;
-      };
-      scorer.collectors_collect =
-        [&finish_count](irs::byte_type*, const irs::FieldCollector*,
-                        const irs::TermCollector*) -> void { ++finish_count; };
-      scorer.prepare_field_collector = [&scorer]() -> irs::FieldCollector::ptr {
-        return std::make_unique<tests::sort::CustomSort::FieldCollector>(
-          scorer);
-      };
-      scorer.prepare_term_collector = [&scorer]() -> irs::TermCollector::ptr {
-        return std::make_unique<tests::sort::CustomSort::TermCollector>(scorer);
+      scorer.collectors_collect = [&](irs::byte_type*,
+                                      const irs::FieldCollector* field,
+                                      const irs::TermCollector* term) -> void {
+        ++finish_count;
+        ASSERT_NE(nullptr, field);
+        ASSERT_NE(nullptr, term);
+        finish_docs_with_field += field->docs_with_field;
+        finish_docs_with_term += term->docs_with_term;
       };
 
       auto prepared = filter.prepare({
@@ -133,9 +133,9 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
         .memory = counter,
         .scorer = &scorer,
       });
-      ASSERT_EQ(2, collect_field_count);  // 1 field in 2 segments
-      ASSERT_EQ(2, collect_term_count);   // 1 term in 2 segments
-      ASSERT_EQ(1, finish_count);         // 1 unique term
+      ASSERT_EQ(1, finish_count);
+      ASSERT_GT(finish_docs_with_field, 0u);  // scorer collected field stats
+      ASSERT_GT(finish_docs_with_term, 0u);   // scorer collected term stats
     }
     EXPECT_EQ(counter.current, 0);
     EXPECT_GT(counter.max, 0);
@@ -145,42 +145,29 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
     {
       irs::BySamePosition filter;
       filter.mutable_options()->terms.emplace_back(
-        "phrase", irs::ViewCast<irs::byte_type>(std::string_view("quick")));
+        kPhraseId, irs::ViewCast<irs::byte_type>(std::string_view("quick")));
       filter.mutable_options()->terms.emplace_back(
-        "phrase", irs::ViewCast<irs::byte_type>(std::string_view("brown")));
-
-      size_t collect_field_count = 0;
-      size_t collect_term_count = 0;
+        kPhraseId, irs::ViewCast<irs::byte_type>(std::string_view("brown")));
       size_t finish_count = 0;
+      uint64_t finish_docs_with_field = 0;
+      uint64_t finish_docs_with_term = 0;
 
       tests::sort::CustomSort scorer;
 
-      scorer.collector_collect_field = [&collect_field_count](
-                                         const irs::SubReader&,
-                                         const irs::TermReader&) -> void {
-        ++collect_field_count;
-      };
-      scorer.collector_collect_term =
-        [&collect_term_count](const irs::SubReader&, const irs::TermReader&,
-                              const irs::AttributeProvider&) -> void {
-        ++collect_term_count;
-      };
-      scorer.collectors_collect =
-        [&finish_count](irs::byte_type*, const irs::FieldCollector*,
-                        const irs::TermCollector*) -> void { ++finish_count; };
-      scorer.prepare_field_collector = [&scorer]() -> irs::FieldCollector::ptr {
-        return std::make_unique<tests::sort::CustomSort::FieldCollector>(
-          scorer);
-      };
-      scorer.prepare_term_collector = [&scorer]() -> irs::TermCollector::ptr {
-        return std::make_unique<tests::sort::CustomSort::TermCollector>(scorer);
+      scorer.collectors_collect = [&](irs::byte_type*,
+                                      const irs::FieldCollector* field,
+                                      const irs::TermCollector* term) -> void {
+        ++finish_count;
+        ASSERT_NE(nullptr, field);
+        ASSERT_NE(nullptr, term);
+        finish_docs_with_field += field->docs_with_field;
+        finish_docs_with_term += term->docs_with_term;
       };
 
       auto prepared = filter.prepare({.index = index, .scorer = &scorer});
-      ASSERT_EQ(4, collect_field_count);  // 2 fields (1 per term since treated
-                                          // as a disjunction) in 2 segments
-      ASSERT_EQ(4, collect_term_count);   // 2 term in 2 segments
-      ASSERT_EQ(2, finish_count);         // 2 unique terms
+      ASSERT_EQ(2, finish_count);
+      ASSERT_GT(finish_docs_with_field, 0u);  // scorer collected field stats
+      ASSERT_GT(finish_docs_with_term, 0u);   // scorer collected term stats
     }
   }
 
@@ -193,7 +180,9 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
         typedef tests::TextField<std::string> TextField;
         if (data.is_string()) {
           // a || b || c
-          doc.indexed.push_back(std::make_shared<TextField>(name, data.str));
+          auto f = std::make_shared<TextField>(name, data.str);
+          f->id = tests::FieldIdFor(name);
+          doc.indexed.push_back(std::move(f));
         } else if (data.is_number()) {
           // _id
           const auto l_value = data.as_number<int64_t>();
@@ -202,18 +191,20 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
           doc.insert(std::make_shared<tests::LongField>());
           auto& field = (doc.indexed.end() - 1).as<tests::LongField>();
           field.Name(name);
+          field.id = tests::FieldIdFor(name);
           field.value(l_value);
         }
       });
-    add_segment(gen);
+    add_segment(gen, irs::kOmCreate, irs::tests::DefaultWriterOptions(),
+                &StoreId);
 
     // read segment
-    auto index = open_reader();
+    auto index = open_reader(irs::tests::DefaultReaderOptions());
     ASSERT_EQ(1, index.size());
     auto& segment = *(index.begin());
 
     irs::BytesViewInput in;
-    auto column = segment.column("_id");
+    const auto* column = segment.Column(kIdId);
     ASSERT_NE(nullptr, column);
 
     // empty query
@@ -228,10 +219,10 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
     {
       irs::BySamePosition query;
       query.mutable_options()->terms.emplace_back(
-        "a", irs::ViewCast<irs::byte_type>(std::string_view("100")));
+        kAId, irs::ViewCast<irs::byte_type>(std::string_view("100")));
 
       irs::ByTerm expected_query;
-      *expected_query.mutable_field() = "a";
+      *expected_query.mutable_field_id() = kAId;
       expected_query.mutable_options()->term =
         irs::ViewCast<irs::byte_type>(std::string_view("100"));
 
@@ -255,11 +246,11 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
     {
       irs::BySamePosition q;
       q.mutable_options()->terms.emplace_back(
-        "a", irs::ViewCast<irs::byte_type>(std::string_view("300")));
+        kAId, irs::ViewCast<irs::byte_type>(std::string_view("300")));
       q.mutable_options()->terms.emplace_back(
-        "b", irs::ViewCast<irs::byte_type>(std::string_view("90")));
+        kBId, irs::ViewCast<irs::byte_type>(std::string_view("90")));
       q.mutable_options()->terms.emplace_back(
-        "c", irs::ViewCast<irs::byte_type>(std::string_view("9")));
+        kCId, irs::ViewCast<irs::byte_type>(std::string_view("9")));
       auto prepared = q.prepare({.index = index});
       auto docs = prepared->execute({.segment = segment});
       ASSERT_EQ(irs::doc_limits::invalid(), docs->value());
@@ -271,30 +262,25 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
     {
       irs::BySamePosition q;
       q.mutable_options()->terms.emplace_back(
-        "a", irs::ViewCast<irs::byte_type>(std::string_view("100")));
+        kAId, irs::ViewCast<irs::byte_type>(std::string_view("100")));
       q.mutable_options()->terms.emplace_back(
-        "b", irs::ViewCast<irs::byte_type>(std::string_view("30")));
+        kBId, irs::ViewCast<irs::byte_type>(std::string_view("30")));
       q.mutable_options()->terms.emplace_back(
-        "c", irs::ViewCast<irs::byte_type>(std::string_view("6")));
+        kCId, irs::ViewCast<irs::byte_type>(std::string_view("6")));
 
       auto prepared = q.prepare({.index = index});
 
       // next
       {
-        auto values = column->iterator(irs::ColumnHint::Normal);
-        ASSERT_NE(nullptr, values);
-        auto* actual_value = irs::get<irs::PayAttr>(*values);
-        ASSERT_NE(nullptr, actual_value);
+        irs::tests::BlobPointReader values{segment, *column};
 
         auto docs = prepared->execute({.segment = segment});
         ASSERT_EQ(irs::doc_limits::invalid(), docs->value());
         ASSERT_TRUE(docs->next());
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(6, irs::ReadZV64(in));
         ASSERT_TRUE(docs->next());
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(27, irs::ReadZV64(in));
         ASSERT_FALSE(docs->next());
         ASSERT_EQ(irs::doc_limits::eof(), docs->value());
@@ -302,21 +288,16 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
 
       // seek
       {
-        auto values = column->iterator(irs::ColumnHint::Normal);
-        ASSERT_NE(nullptr, values);
-        auto* actual_value = irs::get<irs::PayAttr>(*values);
-        ASSERT_NE(nullptr, actual_value);
+        irs::tests::BlobPointReader values{segment, *column};
 
         auto docs = prepared->execute({.segment = segment});
         ASSERT_EQ(irs::doc_limits::invalid(), docs->value());
         ASSERT_EQ((irs::doc_limits::min)() + 6,
                   docs->seek((irs::doc_limits::min)()));
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(6, irs::ReadZV64(in));
         ASSERT_EQ((irs::doc_limits::min)() + 27, docs->seek(27));
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(27, irs::ReadZV64(in));
         ASSERT_EQ((irs::doc_limits::min)() + 27,
                   docs->seek(8));  // seek backwards
@@ -331,30 +312,25 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
     {
       irs::BySamePosition q;
       q.mutable_options()->terms.emplace_back(
-        "c", irs::ViewCast<irs::byte_type>(std::string_view("8")));
+        kCId, irs::ViewCast<irs::byte_type>(std::string_view("8")));
       q.mutable_options()->terms.emplace_back(
-        "b", irs::ViewCast<irs::byte_type>(std::string_view("80")));
+        kBId, irs::ViewCast<irs::byte_type>(std::string_view("80")));
       q.mutable_options()->terms.emplace_back(
-        "a", irs::ViewCast<irs::byte_type>(std::string_view("700")));
+        kAId, irs::ViewCast<irs::byte_type>(std::string_view("700")));
 
       auto prepared = q.prepare({.index = index});
 
       // next
       {
-        auto values = column->iterator(irs::ColumnHint::Normal);
-        ASSERT_NE(nullptr, values);
-        auto* actual_value = irs::get<irs::PayAttr>(*values);
-        ASSERT_NE(nullptr, actual_value);
+        irs::tests::BlobPointReader values{segment, *column};
 
         auto docs = prepared->execute({.segment = segment});
         ASSERT_EQ(irs::doc_limits::invalid(), docs->value());
         ASSERT_TRUE(docs->next());
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(14, irs::ReadZV64(in));
         ASSERT_TRUE(docs->next());
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(91, irs::ReadZV64(in));
         ASSERT_FALSE(docs->next());
         ASSERT_EQ(irs::doc_limits::eof(), docs->value());
@@ -362,16 +338,12 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
 
       // seek
       {
-        auto values = column->iterator(irs::ColumnHint::Normal);
-        ASSERT_NE(nullptr, values);
-        auto* actual_value = irs::get<irs::PayAttr>(*values);
-        ASSERT_NE(nullptr, actual_value);
+        irs::tests::BlobPointReader values{segment, *column};
 
         auto docs = prepared->execute({.segment = segment});
         ASSERT_EQ(irs::doc_limits::invalid(), docs->value());
         ASSERT_EQ((irs::doc_limits::min)() + 91, docs->seek(27));
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(91, irs::ReadZV64(in));
         ASSERT_EQ((irs::doc_limits::min)() + 91,
                   docs->seek(8));  // seek backwards
@@ -386,72 +358,56 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
     {
       irs::BySamePosition q;
       q.mutable_options()->terms.emplace_back(
-        "a", irs::ViewCast<irs::byte_type>(std::string_view("700")));
+        kAId, irs::ViewCast<irs::byte_type>(std::string_view("700")));
       q.mutable_options()->terms.emplace_back(
-        "c", irs::ViewCast<irs::byte_type>(std::string_view("7")));
+        kCId, irs::ViewCast<irs::byte_type>(std::string_view("7")));
 
       auto prepared = q.prepare({.index = index});
 
       // next
       {
-        auto values = column->iterator(irs::ColumnHint::Normal);
-        ASSERT_NE(nullptr, values);
-        auto* actual_value = irs::get<irs::PayAttr>(*values);
-        ASSERT_NE(nullptr, actual_value);
+        irs::tests::BlobPointReader values{segment, *column};
 
         auto docs = prepared->execute({.segment = segment});
         ASSERT_EQ(irs::doc_limits::invalid(), docs->value());
         ASSERT_TRUE(docs->next());
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(1, irs::ReadZV64(in));
         ASSERT_TRUE(docs->next());
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(6, irs::ReadZV64(in));
         ASSERT_TRUE(docs->next());
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(11, irs::ReadZV64(in));
         ASSERT_TRUE(docs->next());
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(17, irs::ReadZV64(in));
         ASSERT_TRUE(docs->next());
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(18, irs::ReadZV64(in));
         ASSERT_TRUE(docs->next());
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(23, irs::ReadZV64(in));
         ASSERT_TRUE(docs->next());
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(24, irs::ReadZV64(in));
         ASSERT_TRUE(docs->next());
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(28, irs::ReadZV64(in));
         ASSERT_TRUE(docs->next());
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(38, irs::ReadZV64(in));
         ASSERT_TRUE(docs->next());
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(51, irs::ReadZV64(in));
         ASSERT_TRUE(docs->next());
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(66, irs::ReadZV64(in));
         ASSERT_TRUE(docs->next());
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(79, irs::ReadZV64(in));
         ASSERT_TRUE(docs->next());
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(89, irs::ReadZV64(in));
         ASSERT_FALSE(docs->next());
         ASSERT_EQ(irs::doc_limits::eof(), docs->value());
@@ -459,41 +415,31 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
 
       // seek + next
       {
-        auto values = column->iterator(irs::ColumnHint::Normal);
-        ASSERT_NE(nullptr, values);
-        auto* actual_value = irs::get<irs::PayAttr>(*values);
-        ASSERT_NE(nullptr, actual_value);
+        irs::tests::BlobPointReader values{segment, *column};
 
         auto docs = prepared->execute({.segment = segment});
         ASSERT_EQ(irs::doc_limits::invalid(), docs->value());
         ASSERT_TRUE(docs->next());
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(1, irs::ReadZV64(in));
         ASSERT_EQ((irs::doc_limits::min)() + 28,
                   docs->seek((irs::doc_limits::min)() + 28));
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(28, irs::ReadZV64(in));
         ASSERT_TRUE(docs->next());
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(38, irs::ReadZV64(in));
         ASSERT_EQ((irs::doc_limits::min)() + 51, docs->seek(45));
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(51, irs::ReadZV64(in));
         ASSERT_TRUE(docs->next());
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(66, irs::ReadZV64(in));
         ASSERT_TRUE(docs->next());
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(79, irs::ReadZV64(in));
         ASSERT_TRUE(docs->next());
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
         ASSERT_EQ(89, irs::ReadZV64(in));
         ASSERT_FALSE(docs->next());
         ASSERT_EQ(irs::doc_limits::eof(), docs->value());
@@ -547,7 +493,7 @@ TEST(by_same_position_test, boost) {
     {
       irs::BySamePosition q;
       q.mutable_options()->terms.emplace_back(
-        "field", irs::ViewCast<irs::byte_type>(std::string_view("quick")));
+        kFieldId, irs::ViewCast<irs::byte_type>(std::string_view("quick")));
 
       auto prepared = q.prepare({.index = irs::SubReader::empty()});
       ASSERT_EQ(irs::kNoBoost, prepared->Boost());
@@ -557,9 +503,9 @@ TEST(by_same_position_test, boost) {
     {
       irs::BySamePosition q;
       q.mutable_options()->terms.emplace_back(
-        "field", irs::ViewCast<irs::byte_type>(std::string_view("quick")));
+        kFieldId, irs::ViewCast<irs::byte_type>(std::string_view("quick")));
       q.mutable_options()->terms.emplace_back(
-        "field", irs::ViewCast<irs::byte_type>(std::string_view("brown")));
+        kFieldId, irs::ViewCast<irs::byte_type>(std::string_view("brown")));
 
       auto prepared = q.prepare({.index = irs::SubReader::empty()});
       ASSERT_EQ(irs::kNoBoost, prepared->Boost());
@@ -583,7 +529,7 @@ TEST(by_same_position_test, boost) {
     {
       irs::BySamePosition q;
       q.mutable_options()->terms.emplace_back(
-        "field", irs::ViewCast<irs::byte_type>(std::string_view("quick")));
+        kFieldId, irs::ViewCast<irs::byte_type>(std::string_view("quick")));
       q.boost(boost);
 
       auto prepared = q.prepare({.index = irs::SubReader::empty()});
@@ -594,9 +540,9 @@ TEST(by_same_position_test, boost) {
     {
       irs::BySamePosition q;
       q.mutable_options()->terms.emplace_back(
-        "field", irs::ViewCast<irs::byte_type>(std::string_view("quick")));
+        kFieldId, irs::ViewCast<irs::byte_type>(std::string_view("quick")));
       q.mutable_options()->terms.emplace_back(
-        "field", irs::ViewCast<irs::byte_type>(std::string_view("brown")));
+        kFieldId, irs::ViewCast<irs::byte_type>(std::string_view("brown")));
       q.boost(boost);
 
       auto prepared = q.prepare({.index = irs::SubReader::empty()});
@@ -611,70 +557,71 @@ TEST(by_same_position_test, equal) {
   {
     irs::BySamePosition q0;
     q0.mutable_options()->terms.emplace_back(
-      "speed", irs::ViewCast<irs::byte_type>(std::string_view("quick")));
+      kSpeedId, irs::ViewCast<irs::byte_type>(std::string_view("quick")));
     q0.mutable_options()->terms.emplace_back(
-      "color", irs::ViewCast<irs::byte_type>(std::string_view("brown")));
+      kColorId, irs::ViewCast<irs::byte_type>(std::string_view("brown")));
 
     irs::BySamePosition q1;
     q1.mutable_options()->terms.emplace_back(
-      "speed", irs::ViewCast<irs::byte_type>(std::string_view("quick")));
+      kSpeedId, irs::ViewCast<irs::byte_type>(std::string_view("quick")));
     q1.mutable_options()->terms.emplace_back(
-      "color", irs::ViewCast<irs::byte_type>(std::string_view("brown")));
+      kColorId, irs::ViewCast<irs::byte_type>(std::string_view("brown")));
     ASSERT_EQ(q0, q1);
   }
 
   {
     irs::BySamePosition q0;
     q0.mutable_options()->terms.emplace_back(
-      "speed", irs::ViewCast<irs::byte_type>(std::string_view("quick")));
+      kSpeedId, irs::ViewCast<irs::byte_type>(std::string_view("quick")));
     q0.mutable_options()->terms.emplace_back(
-      "color", irs::ViewCast<irs::byte_type>(std::string_view("brown")));
+      kColorId, irs::ViewCast<irs::byte_type>(std::string_view("brown")));
     q0.mutable_options()->terms.emplace_back(
-      "name", irs::ViewCast<irs::byte_type>(std::string_view("fox")));
+      kNameId, irs::ViewCast<irs::byte_type>(std::string_view("fox")));
 
     irs::BySamePosition q1;
     q1.mutable_options()->terms.emplace_back(
-      "speed", irs::ViewCast<irs::byte_type>(std::string_view("quick")));
+      kSpeedId, irs::ViewCast<irs::byte_type>(std::string_view("quick")));
     q1.mutable_options()->terms.emplace_back(
-      "color", irs::ViewCast<irs::byte_type>(std::string_view("brown")));
+      kColorId, irs::ViewCast<irs::byte_type>(std::string_view("brown")));
     q1.mutable_options()->terms.emplace_back(
-      "name", irs::ViewCast<irs::byte_type>(std::string_view("squirrel")));
+      kNameId, irs::ViewCast<irs::byte_type>(std::string_view("squirrel")));
     ASSERT_NE(q0, q1);
   }
 
   {
     irs::BySamePosition q0;
     q0.mutable_options()->terms.emplace_back(
-      "Speed", irs::ViewCast<irs::byte_type>(std::string_view("quick")));
+      kSpeedCapitalId,
+      irs::ViewCast<irs::byte_type>(std::string_view("quick")));
     q0.mutable_options()->terms.emplace_back(
-      "color", irs::ViewCast<irs::byte_type>(std::string_view("brown")));
+      kColorId, irs::ViewCast<irs::byte_type>(std::string_view("brown")));
     q0.mutable_options()->terms.emplace_back(
-      "name", irs::ViewCast<irs::byte_type>(std::string_view("fox")));
+      kNameId, irs::ViewCast<irs::byte_type>(std::string_view("fox")));
 
     irs::BySamePosition q1;
     q1.mutable_options()->terms.emplace_back(
-      "speed", irs::ViewCast<irs::byte_type>(std::string_view("quick")));
+      kSpeedId, irs::ViewCast<irs::byte_type>(std::string_view("quick")));
     q1.mutable_options()->terms.emplace_back(
-      "color", irs::ViewCast<irs::byte_type>(std::string_view("brown")));
+      kColorId, irs::ViewCast<irs::byte_type>(std::string_view("brown")));
     q1.mutable_options()->terms.emplace_back(
-      "name", irs::ViewCast<irs::byte_type>(std::string_view("fox")));
+      kNameId, irs::ViewCast<irs::byte_type>(std::string_view("fox")));
     ASSERT_NE(q0, q1);
   }
 
   {
     irs::BySamePosition q0;
     q0.mutable_options()->terms.emplace_back(
-      "speed", irs::ViewCast<irs::byte_type>(std::string_view("quick")));
+      kSpeedId, irs::ViewCast<irs::byte_type>(std::string_view("quick")));
     q0.mutable_options()->terms.emplace_back(
-      "color", irs::ViewCast<irs::byte_type>(std::string_view("brown")));
+      kColorId, irs::ViewCast<irs::byte_type>(std::string_view("brown")));
 
     irs::BySamePosition q1;
     q1.mutable_options()->terms.emplace_back(
-      "speed", irs::ViewCast<irs::byte_type>(std::string_view("quick")));
+      kSpeedId, irs::ViewCast<irs::byte_type>(std::string_view("quick")));
     q1.mutable_options()->terms.emplace_back(
-      "color", irs::ViewCast<irs::byte_type>(std::string_view("brown")));
+      kColorId, irs::ViewCast<irs::byte_type>(std::string_view("brown")));
     q1.mutable_options()->terms.emplace_back(
-      "name", irs::ViewCast<irs::byte_type>(std::string_view("fox")));
+      kNameId, irs::ViewCast<irs::byte_type>(std::string_view("fox")));
     ASSERT_NE(q0, q1);
   }
 }

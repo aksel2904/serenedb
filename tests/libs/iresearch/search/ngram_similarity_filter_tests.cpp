@@ -23,28 +23,35 @@
 #include <functional>
 
 #include "filter_test_case_base.hpp"
+#include "formats/column/test_cs_helpers.hpp"
 #include "iresearch/index/field_meta.hpp"
 #include "iresearch/index/index_features.hpp"
 #include "iresearch/index/norm.hpp"
 #include "iresearch/search/bm25.hpp"
+#include "iresearch/search/boolean_filter.hpp"
 #include "iresearch/search/ngram_similarity_filter.hpp"
 #include "iresearch/search/ngram_similarity_query.hpp"
 #include "iresearch/search/score_function.hpp"
 #include "iresearch/search/scorer.hpp"
 #include "iresearch/search/tfidf.hpp"
-#include "iresearch/utils/lz4compression.hpp"
 #include "iresearch/utils/ngram_match_utils.hpp"
 #include "tests_shared.hpp"
 
 namespace tests {
 namespace {
 
-irs::ByNGramSimilarity MakeFilter(const std::string_view& field,
+// Stable field id for the "field" column used by the fixtures throughout the
+// file. Sourced from `tests::FieldIdFor` so the shared JSON factories and
+// these tests agree on the id-per-name.
+[[maybe_unused]] inline constexpr irs::field_id kFieldFieldId =
+  tests::FieldIdFor("field");
+
+irs::ByNGramSimilarity MakeFilter(irs::field_id field_id,
                                   const std::vector<std::string_view>& ngrams,
                                   float_t threshold = 1.f,
                                   bool allow_phrase = true) {
   irs::ByNGramSimilarity filter;
-  *filter.mutable_field() = field;
+  *filter.mutable_field_id() = field_id;
   auto* opts = filter.mutable_options();
   for (auto& ngram : ngrams) {
     opts->ngrams.emplace_back(irs::ViewCast<irs::byte_type>(ngram));
@@ -85,7 +92,7 @@ TEST(ngram_similarity_base_test, ctor) {
   ASSERT_EQ(irs::Type<irs::ByNGramSimilarity>::id(), q.type());
   ASSERT_EQ(irs::ByNGramSimilarityOptions{}, q.options());
   ASSERT_EQ(irs::kNoBoost, q.Boost());
-  ASSERT_EQ("", q.field());
+  ASSERT_EQ(irs::field_limits::invalid(), q.field_id());
 
   static_assert((irs::IndexFeatures::Freq | irs::IndexFeatures::Pos) ==
                 irs::NGramSimilarityQuery::kRequiredFeatures);
@@ -95,28 +102,30 @@ TEST(ngram_similarity_base_test, equal) {
   ASSERT_EQ(irs::ByNGramSimilarity(), irs::ByNGramSimilarity());
 
   {
-    irs::ByNGramSimilarity q0 = MakeFilter("a", {"1", "2"}, 0.5f);
-    irs::ByNGramSimilarity q1 = MakeFilter("a", {"1", "2"}, 0.5f);
+    constexpr irs::field_id kFieldA = 1;
+    constexpr irs::field_id kFieldB = 2;
+    irs::ByNGramSimilarity q0 = MakeFilter(kFieldA, {"1", "2"}, 0.5f);
+    irs::ByNGramSimilarity q1 = MakeFilter(kFieldA, {"1", "2"}, 0.5f);
     ASSERT_EQ(q0, q1);
 
     // different threshold
-    irs::ByNGramSimilarity q2 = MakeFilter("a", {"1", "2"}, 0.25f);
+    irs::ByNGramSimilarity q2 = MakeFilter(kFieldA, {"1", "2"}, 0.25f);
     ASSERT_NE(q0, q2);
 
     // different terms
-    irs::ByNGramSimilarity q3 = MakeFilter("a", {"1", "3"}, 0.5f);
+    irs::ByNGramSimilarity q3 = MakeFilter(kFieldA, {"1", "3"}, 0.5f);
     ASSERT_NE(q0, q3);
 
     // different terms count (less)
-    irs::ByNGramSimilarity q4 = MakeFilter("a", {"1"}, 0.5f);
+    irs::ByNGramSimilarity q4 = MakeFilter(kFieldA, {"1"}, 0.5f);
     ASSERT_NE(q0, q4);
 
     // different terms count (more)
-    irs::ByNGramSimilarity q5 = MakeFilter("a", {"1", "2", "2"}, 0.5f);
+    irs::ByNGramSimilarity q5 = MakeFilter(kFieldA, {"1", "2", "2"}, 0.5f);
     ASSERT_NE(q0, q5);
 
     // different field
-    irs::ByNGramSimilarity q6 = MakeFilter("b", {"1", "2"}, 0.5f);
+    irs::ByNGramSimilarity q6 = MakeFilter(kFieldB, {"1", "2"}, 0.5f);
     ASSERT_NE(q0, q6);
   }
 }
@@ -132,7 +141,7 @@ TEST_P(NGramSimilarityFilterTestCase, boost) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
   ASSERT_EQ(1, rdr.size());
   auto& segment = rdr[0];
 
@@ -155,7 +164,7 @@ TEST_P(NGramSimilarityFilterTestCase, boost) {
 
     // simple disjunction
     {
-      irs::ByNGramSimilarity q = MakeFilter("field", {"1", "2"}, 0.5f);
+      irs::ByNGramSimilarity q = MakeFilter(kFieldFieldId, {"1", "2"}, 0.5f);
 
       auto prepared = q.prepare({
         .index = segment,
@@ -170,7 +179,7 @@ TEST_P(NGramSimilarityFilterTestCase, boost) {
     // multiple terms
     {
       irs::ByNGramSimilarity q =
-        MakeFilter("field", {"1", "2", "3", "4"}, 0.5f);
+        MakeFilter(kFieldFieldId, {"1", "2", "3", "4"}, 0.5f);
 
       auto prepared = q.prepare({
         .index = segment,
@@ -206,7 +215,7 @@ TEST_P(NGramSimilarityFilterTestCase, boost) {
 
     // simple disjunction
     {
-      irs::ByNGramSimilarity q = MakeFilter("field", {"1", "2"}, 0.5f);
+      irs::ByNGramSimilarity q = MakeFilter(kFieldFieldId, {"1", "2"}, 0.5f);
       q.boost(boost);
 
       auto prepared = q.prepare({
@@ -222,7 +231,7 @@ TEST_P(NGramSimilarityFilterTestCase, boost) {
     // multiple terms
     {
       irs::ByNGramSimilarity q =
-        MakeFilter("field", {"1", "2", "3", "4"}, 0.5f);
+        MakeFilter(kFieldFieldId, {"1", "2", "3", "4"}, 0.5f);
       q.boost(boost);
 
       auto prepared = q.prepare({
@@ -248,12 +257,12 @@ TEST_P(NGramSimilarityFilterTestCase, check_matcher_1) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
   MaxMemoryCounter counter;
 
   irs::ByNGramSimilarity filter =
-    MakeFilter("field", {"1", "2", "3", "4"}, 0.5f);
+    MakeFilter(kFieldFieldId, {"1", "2", "3", "4"}, 0.5f);
 
   CustomNGramScorer sort;
   auto prepared = filter.prepare({
@@ -301,12 +310,12 @@ TEST_P(NGramSimilarityFilterTestCase, check_matcher_2) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
   MaxMemoryCounter counter;
 
   irs::ByNGramSimilarity filter =
-    MakeFilter("field", {"1", "2", "3", "4"}, 0.5f);
+    MakeFilter(kFieldFieldId, {"1", "2", "3", "4"}, 0.5f);
 
   CustomNGramScorer sort;
   auto prepared = filter.prepare({
@@ -354,12 +363,12 @@ TEST_P(NGramSimilarityFilterTestCase, check_matcher_3) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
   MaxMemoryCounter counter;
 
   irs::ByNGramSimilarity filter =
-    MakeFilter("field", {"1", "2", "3", "4"}, 0.5f);
+    MakeFilter(kFieldFieldId, {"1", "2", "3", "4"}, 0.5f);
 
   CustomNGramScorer sort;
   auto prepared = filter.prepare({
@@ -407,11 +416,11 @@ TEST_P(NGramSimilarityFilterTestCase, check_matcher_4) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
   MaxMemoryCounter counter;
 
-  irs::ByNGramSimilarity filter = MakeFilter("field", {"1", "1"}, 0.5f);
+  irs::ByNGramSimilarity filter = MakeFilter(kFieldFieldId, {"1", "1"}, 0.5f);
 
   CustomNGramScorer sort;
   auto prepared = filter.prepare({
@@ -461,11 +470,12 @@ TEST_P(NGramSimilarityFilterTestCase, check_matcher_5) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
   MaxMemoryCounter counter;
 
-  irs::ByNGramSimilarity filter = MakeFilter("field", {"1", "2", "1"}, 0.5f);
+  irs::ByNGramSimilarity filter =
+    MakeFilter(kFieldFieldId, {"1", "2", "1"}, 0.5f);
 
   CustomNGramScorer sort;
   auto prepared = filter.prepare({
@@ -512,11 +522,11 @@ TEST_P(NGramSimilarityFilterTestCase, check_matcher_6) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
   MaxMemoryCounter counter;
 
-  irs::ByNGramSimilarity filter = MakeFilter("field", {"1", "1"}, 1.0f);
+  irs::ByNGramSimilarity filter = MakeFilter(kFieldFieldId, {"1", "1"}, 1.0f);
 
   CustomNGramScorer sort;
   auto prepared = filter.prepare({
@@ -565,12 +575,12 @@ TEST_P(NGramSimilarityFilterTestCase, check_matcher_7) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
   MaxMemoryCounter counter;
 
   irs::ByNGramSimilarity filter =
-    MakeFilter("field", {"1", "2", "3", "4"}, 0.5f);
+    MakeFilter(kFieldFieldId, {"1", "2", "3", "4"}, 0.5f);
 
   CustomNGramScorer sort;
   auto prepared = filter.prepare({
@@ -618,12 +628,12 @@ TEST_P(NGramSimilarityFilterTestCase, check_matcher_8) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
   MaxMemoryCounter counter;
 
   irs::ByNGramSimilarity filter =
-    MakeFilter("field", {"1", "5", "6", "2"}, 0.5f);
+    MakeFilter(kFieldFieldId, {"1", "5", "6", "2"}, 0.5f);
 
   CustomNGramScorer sort;
   auto prepared = filter.prepare({
@@ -673,12 +683,12 @@ TEST_P(NGramSimilarityFilterTestCase, check_matcher_9) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
   MaxMemoryCounter counter;
 
   irs::ByNGramSimilarity filter =
-    MakeFilter("field", {"1", "2", "3", "4", "5", "1"}, 0.5f);
+    MakeFilter(kFieldFieldId, {"1", "2", "3", "4", "5", "1"}, 0.5f);
 
   CustomNGramScorer sort;
   auto prepared = filter.prepare({
@@ -725,11 +735,11 @@ TEST_P(NGramSimilarityFilterTestCase, check_matcher_10) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
   MaxMemoryCounter counter;
 
-  irs::ByNGramSimilarity filter = MakeFilter("field", {""}, 0.5f);
+  irs::ByNGramSimilarity filter = MakeFilter(kFieldFieldId, {""}, 0.5f);
 
   CustomNGramScorer sort;
   auto prepared = filter.prepare({
@@ -774,12 +784,12 @@ TEST_P(NGramSimilarityFilterTestCase, no_match_case) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
   MaxMemoryCounter counter;
 
-  irs::ByNGramSimilarity filter =
-    MakeFilter("field", {"ee", "we", "qq", "rr", "ff", "never_match"}, 0.1f);
+  irs::ByNGramSimilarity filter = MakeFilter(
+    kFieldFieldId, {"ee", "we", "qq", "rr", "ff", "never_match"}, 0.1f);
 
   auto prepared = filter.prepare({
     .index = rdr,
@@ -804,12 +814,12 @@ TEST_P(NGramSimilarityFilterTestCase, no_serial_match_case) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
   MaxMemoryCounter counter;
 
   irs::ByNGramSimilarity filter =
-    MakeFilter("field", {"ee", "ss", "pa", "rr"}, 0.5f);
+    MakeFilter(kFieldFieldId, {"ee", "ss", "pa", "rr"}, 0.5f);
 
   auto prepared = filter.prepare({
     .index = rdr,
@@ -833,12 +843,12 @@ TEST_P(NGramSimilarityFilterTestCase, one_match_case) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
   MaxMemoryCounter counter;
 
-  irs::ByNGramSimilarity filter =
-    MakeFilter("field", {"ee", "ss", "qq", "rr", "ff", "never_match"}, 0.1f);
+  irs::ByNGramSimilarity filter = MakeFilter(
+    kFieldFieldId, {"ee", "ss", "qq", "rr", "ff", "never_match"}, 0.1f);
 
   Docs expected{1, 3, 5, 6, 7, 8, 9, 10, 12};
   const size_t expected_size = expected.size();
@@ -872,12 +882,12 @@ TEST_P(NGramSimilarityFilterTestCase, missed_last_test) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
   MaxMemoryCounter counter;
 
-  irs::ByNGramSimilarity filter =
-    MakeFilter("field", {"at", "tl", "la", "as", "ll", "never_match"}, 0.5f);
+  irs::ByNGramSimilarity filter = MakeFilter(
+    kFieldFieldId, {"at", "tl", "la", "as", "ll", "never_match"}, 0.5f);
 
   Docs expected{1, 2, 5, 8, 11, 12, 13};
   const size_t expected_size = expected.size();
@@ -911,12 +921,12 @@ TEST_P(NGramSimilarityFilterTestCase, missed_first_test) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
   MaxMemoryCounter counter;
 
-  irs::ByNGramSimilarity filter =
-    MakeFilter("field", {"never_match", "at", "tl", "la", "as", "ll"}, 0.5f);
+  irs::ByNGramSimilarity filter = MakeFilter(
+    kFieldFieldId, {"never_match", "at", "tl", "la", "as", "ll"}, 0.5f);
 
   Docs expected{1, 2, 5, 8, 11, 12, 13};
   const size_t expected_size = expected.size();
@@ -950,12 +960,12 @@ TEST_P(NGramSimilarityFilterTestCase, not_miss_match_for_tail) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
   MaxMemoryCounter counter;
 
-  irs::ByNGramSimilarity filter =
-    MakeFilter("field", {"at", "tl", "la", "as", "ll", "never_match"}, 0.33f);
+  irs::ByNGramSimilarity filter = MakeFilter(
+    kFieldFieldId, {"at", "tl", "la", "as", "ll", "never_match"}, 0.33f);
 
   Docs expected{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
   const size_t expected_size = expected.size();
@@ -989,12 +999,12 @@ TEST_P(NGramSimilarityFilterTestCase, missed_middle_test) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
   MaxMemoryCounter counter;
 
   irs::ByNGramSimilarity filter =
-    MakeFilter("field", {"at", "never_match", "la", "as", "ll"}, 0.333f);
+    MakeFilter(kFieldFieldId, {"at", "never_match", "la", "as", "ll"}, 0.333f);
 
   Docs expected{1, 2, 3, 4, 5, 6, 7, 8, 11, 12, 13, 14};
   const size_t expected_size = expected.size();
@@ -1029,12 +1039,13 @@ TEST_P(NGramSimilarityFilterTestCase, missed_middle2_test) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
   MaxMemoryCounter counter;
 
-  irs::ByNGramSimilarity filter = MakeFilter(
-    "field", {"at", "never_match", "never_match2", "la", "as", "ll"}, 0.5f);
+  irs::ByNGramSimilarity filter =
+    MakeFilter(kFieldFieldId,
+               {"at", "never_match", "never_match2", "la", "as", "ll"}, 0.5f);
 
   Docs expected{1, 2, 5, 8, 11, 12, 13};
   const size_t expected_size = expected.size();
@@ -1069,13 +1080,13 @@ TEST_P(NGramSimilarityFilterTestCase, missed_middle3_test) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
   MaxMemoryCounter counter;
 
   irs::ByNGramSimilarity filter = MakeFilter(
-    "field", {"at", "never_match", "tl", "never_match2", "la", "as", "ll"},
-    0.28f);
+    kFieldFieldId,
+    {"at", "never_match", "tl", "never_match2", "la", "as", "ll"}, 0.28f);
 
   Docs expected{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14};
   const size_t expected_size = expected.size();
@@ -1140,39 +1151,31 @@ TEST_P(NGramSimilarityFilterTestCase, missed_last_scored_test) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
-  irs::ByNGramSimilarity filter =
-    MakeFilter("field", {"at", "tl", "la", "as", "ll", "never_match"}, 0.5f);
+  irs::ByNGramSimilarity filter = MakeFilter(
+    kFieldFieldId, {"at", "tl", "la", "as", "ll", "never_match"}, 0.5f);
 
   Docs expected{1, 2, 5, 8, 11, 12, 13};
-  size_t collect_field_count = 0;
-  size_t collect_term_count = 0;
   size_t finish_count = 0;
+  uint64_t finish_docs_with_field = 0;
+  uint64_t finish_docs_with_term = 0;
   std::vector<size_t> frequency;
   std::vector<irs::score_t> filter_boost;
 
   irs::Scorer::ptr order{std::make_unique<CustomNGramScorer>()};
   auto& scorer = static_cast<CustomNGramScorer&>(*order);
 
-  scorer.collector_collect_field = [&collect_field_count](
-                                     const irs::SubReader&,
-                                     const irs::TermReader&) -> void {
-    ++collect_field_count;
-  };
-  scorer.collector_collect_term =
-    [&collect_term_count](const irs::SubReader&, const irs::TermReader&,
-                          const irs::AttributeProvider&) -> void {
-    ++collect_term_count;
-  };
-  scorer.collectors_collect =
-    [&finish_count](irs::byte_type*, const irs::FieldCollector*,
-                    const irs::TermCollector*) -> void { ++finish_count; };
-  scorer.prepare_field_collector = [&scorer]() -> irs::FieldCollector::ptr {
-    return std::make_unique<CustomNGramScorer::FieldCollector>(scorer);
-  };
-  scorer.prepare_term_collector = [&scorer]() -> irs::TermCollector::ptr {
-    return std::make_unique<CustomNGramScorer::TermCollector>(scorer);
+  scorer.collectors_collect = [&](irs::byte_type*,
+                                  const irs::FieldCollector* field,
+                                  const irs::TermCollector* term) -> void {
+    ++finish_count;
+    if (field) {
+      finish_docs_with_field += field->docs_with_field;
+    }
+    if (term) {
+      finish_docs_with_term += term->docs_with_term;
+    }
   };
   scorer.prepare_scorer =
     [&frequency,
@@ -1192,9 +1195,9 @@ TEST_P(NGramSimilarityFilterTestCase, missed_last_scored_test) {
     SCOPED_TRACE(testing::Message("i=") << i);
     ASSERT_DOUBLE_EQ(expected_filter_boost[i], filter_boost[i]);
   }
-  ASSERT_EQ(1, collect_field_count);
-  ASSERT_EQ(5, collect_term_count);
-  ASSERT_EQ(collect_field_count + collect_term_count, finish_count);
+  ASSERT_EQ(6, finish_count);
+  ASSERT_GT(finish_docs_with_field, 0u);  // scorer collected field stats
+  ASSERT_GT(finish_docs_with_term, 0u);   // scorer collected term stats
 }
 
 TEST_P(NGramSimilarityFilterTestCase, missed_frequency_test) {
@@ -1204,39 +1207,31 @@ TEST_P(NGramSimilarityFilterTestCase, missed_frequency_test) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
-  irs::ByNGramSimilarity filter =
-    MakeFilter("field", {"never_match", "at", "tl", "la", "as", "ll"}, 0.5f);
+  irs::ByNGramSimilarity filter = MakeFilter(
+    kFieldFieldId, {"never_match", "at", "tl", "la", "as", "ll"}, 0.5f);
 
   Docs expected{1, 2, 5, 8, 11, 12, 13};
-  size_t collect_field_count = 0;
-  size_t collect_term_count = 0;
   size_t finish_count = 0;
+  uint64_t finish_docs_with_field = 0;
+  uint64_t finish_docs_with_term = 0;
   std::vector<size_t> frequency;
   std::vector<irs::score_t> filter_boost;
 
   irs::Scorer::ptr order{std::make_unique<CustomNGramScorer>()};
   auto& scorer = static_cast<CustomNGramScorer&>(*order);
 
-  scorer.collector_collect_field = [&collect_field_count](
-                                     const irs::SubReader&,
-                                     const irs::TermReader&) -> void {
-    ++collect_field_count;
-  };
-  scorer.collector_collect_term =
-    [&collect_term_count](const irs::SubReader&, const irs::TermReader&,
-                          const irs::AttributeProvider&) -> void {
-    ++collect_term_count;
-  };
-  scorer.collectors_collect =
-    [&finish_count](irs::byte_type*, const irs::FieldCollector*,
-                    const irs::TermCollector*) -> void { ++finish_count; };
-  scorer.prepare_field_collector = [&scorer]() -> irs::FieldCollector::ptr {
-    return std::make_unique<CustomNGramScorer::FieldCollector>(scorer);
-  };
-  scorer.prepare_term_collector = [&scorer]() -> irs::TermCollector::ptr {
-    return std::make_unique<CustomNGramScorer::TermCollector>(scorer);
+  scorer.collectors_collect = [&](irs::byte_type*,
+                                  const irs::FieldCollector* field,
+                                  const irs::TermCollector* term) -> void {
+    ++finish_count;
+    if (field) {
+      finish_docs_with_field += field->docs_with_field;
+    }
+    if (term) {
+      finish_docs_with_term += term->docs_with_term;
+    }
   };
   scorer.prepare_scorer =
     [&frequency,
@@ -1256,14 +1251,14 @@ TEST_P(NGramSimilarityFilterTestCase, missed_frequency_test) {
     SCOPED_TRACE(testing::Message("i=") << i);
     ASSERT_DOUBLE_EQ(expected_filter_boost[i], filter_boost[i]);
   }
-  ASSERT_EQ(1, collect_field_count);
-  ASSERT_EQ(5, collect_term_count);
-  ASSERT_EQ(collect_field_count + collect_term_count, finish_count);
+  ASSERT_EQ(6, finish_count);
+  ASSERT_GT(finish_docs_with_field, 0u);  // scorer collected field stats
+  ASSERT_GT(finish_docs_with_term, 0u);   // scorer collected term stats
 }
 
 TEST_P(NGramSimilarityFilterTestCase, missed_first_tfidf_norm_test) {
   {
-    irs::IndexWriterOptions opts;
+    auto opts = irs::tests::DefaultWriterOptions();
 
     tests::JsonDocGenerator gen(resource("ngram_similarity.json"),
                                 &tests::NormalizedStringJsonFieldFactory);
@@ -1271,10 +1266,10 @@ TEST_P(NGramSimilarityFilterTestCase, missed_first_tfidf_norm_test) {
     add_segment(gen, irs::kOmCreate, opts);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
-  irs::ByNGramSimilarity filter =
-    MakeFilter("field", {"never_match", "at", "tl", "la", "as", "ll"}, 0.5f);
+  irs::ByNGramSimilarity filter = MakeFilter(
+    kFieldFieldId, {"never_match", "at", "tl", "la", "as", "ll"}, 0.5f);
 
   Docs expected{11, 12, 8, 13, 5, 1, 2};
 
@@ -1285,7 +1280,7 @@ TEST_P(NGramSimilarityFilterTestCase, missed_first_tfidf_norm_test) {
 
 TEST_P(NGramSimilarityFilterTestCase, all_match_ngram_score_test) {
   {
-    irs::IndexWriterOptions opts;
+    auto opts = irs::tests::DefaultWriterOptions();
 
     tests::JsonDocGenerator gen(resource("ngram_similarity.json"),
                                 &tests::NormalizedStringJsonFieldFactory);
@@ -1293,7 +1288,7 @@ TEST_P(NGramSimilarityFilterTestCase, all_match_ngram_score_test) {
     add_segment(gen, irs::kOmCreate, opts);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
   irs::Scorer::ptr scorers[] = {
     std::make_unique<irs::TFIDF>(false),
@@ -1308,9 +1303,9 @@ TEST_P(NGramSimilarityFilterTestCase, all_match_ngram_score_test) {
   std::vector<irs::doc_id_t> phrase;
   for (auto& scorer : scorers) {
     irs::ByNGramSimilarity ngram_filter =
-      MakeFilter("field", {"at", "tl", "la", "as"}, 1.F, false);
+      MakeFilter(kFieldFieldId, {"at", "tl", "la", "as"}, 1.F, false);
     irs::ByNGramSimilarity phrase_filter =
-      MakeFilter("field", {"at", "tl", "la", "as"}, 1.F, true);
+      MakeFilter(kFieldFieldId, {"at", "tl", "la", "as"}, 1.F, true);
 
     MakeResult(ngram_filter, std::span{&scorer, 1}, rdr, ngram);
     MakeResult(phrase_filter, std::span{&scorer, 1}, rdr, phrase);
@@ -1320,7 +1315,7 @@ TEST_P(NGramSimilarityFilterTestCase, all_match_ngram_score_test) {
 
 TEST_P(NGramSimilarityFilterTestCase, missed_first_tfidf_test) {
   {
-    irs::IndexWriterOptions opts;
+    auto opts = irs::tests::DefaultWriterOptions();
 
     tests::JsonDocGenerator gen(resource("ngram_similarity.json"),
                                 &tests::NormalizedStringJsonFieldFactory);
@@ -1328,10 +1323,10 @@ TEST_P(NGramSimilarityFilterTestCase, missed_first_tfidf_test) {
     add_segment(gen, irs::kOmCreate, opts);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
-  irs::ByNGramSimilarity filter =
-    MakeFilter("field", {"never_match", "at", "tl", "la", "as", "ll"}, 0.5f);
+  irs::ByNGramSimilarity filter = MakeFilter(
+    kFieldFieldId, {"never_match", "at", "tl", "la", "as", "ll"}, 0.5f);
 
   Docs expected{11, 12, 13, 1, 2, 8, 5};
 
@@ -1342,7 +1337,7 @@ TEST_P(NGramSimilarityFilterTestCase, missed_first_tfidf_test) {
 
 TEST_P(NGramSimilarityFilterTestCase, missed_first_bm25_test) {
   {
-    irs::IndexWriterOptions opts;
+    auto opts = irs::tests::DefaultWriterOptions();
 
     tests::JsonDocGenerator gen(resource("ngram_similarity.json"),
                                 &tests::NormalizedStringJsonFieldFactory);
@@ -1350,10 +1345,10 @@ TEST_P(NGramSimilarityFilterTestCase, missed_first_bm25_test) {
     add_segment(gen, irs::kOmCreate, opts);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
-  irs::ByNGramSimilarity filter =
-    MakeFilter("field", {"never_match", "at", "tl", "la", "as", "ll"}, 0.5f);
+  irs::ByNGramSimilarity filter = MakeFilter(
+    kFieldFieldId, {"never_match", "at", "tl", "la", "as", "ll"}, 0.5f);
 
   Docs expected{11, 12, 8, 13, 1, 5, 2};
 
@@ -1364,7 +1359,7 @@ TEST_P(NGramSimilarityFilterTestCase, missed_first_bm25_test) {
 
 TEST_P(NGramSimilarityFilterTestCase, missed_first_bm15_test) {
   {
-    irs::IndexWriterOptions opts;
+    auto opts = irs::tests::DefaultWriterOptions();
 
     tests::JsonDocGenerator gen(resource("ngram_similarity.json"),
                                 &tests::NormalizedStringJsonFieldFactory);
@@ -1372,10 +1367,10 @@ TEST_P(NGramSimilarityFilterTestCase, missed_first_bm15_test) {
     add_segment(gen, irs::kOmCreate, opts);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
-  irs::ByNGramSimilarity filter =
-    MakeFilter("field", {"never_match", "at", "tl", "la", "as", "ll"}, 0.5f);
+  irs::ByNGramSimilarity filter = MakeFilter(
+    kFieldFieldId, {"never_match", "at", "tl", "la", "as", "ll"}, 0.5f);
 
   Docs expected{11, 12, 13, 1, 2, 8, 5};
 
@@ -1391,12 +1386,12 @@ TEST_P(NGramSimilarityFilterTestCase, seek_next) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
   MaxMemoryCounter counter;
 
-  irs::ByNGramSimilarity filter =
-    MakeFilter("field", {"never_match", "at", "tl", "la", "as", "ll"}, 0.5f);
+  irs::ByNGramSimilarity filter = MakeFilter(
+    kFieldFieldId, {"never_match", "at", "tl", "la", "as", "ll"}, 0.5f);
   Docs expected{1, 2, 5, 8, 11, 12, 13};
   auto expected_it = std::begin(expected);
   auto prepared_filter = filter.prepare({
@@ -1437,12 +1432,12 @@ TEST_P(NGramSimilarityFilterTestCase, seek) {
     add_segment(gen);
   }
 
-  auto rdr = open_reader();
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
   MaxMemoryCounter counter;
 
-  irs::ByNGramSimilarity filter =
-    MakeFilter("field", {"never_match", "at", "tl", "la", "as", "ll"}, 0.5f);
+  irs::ByNGramSimilarity filter = MakeFilter(
+    kFieldFieldId, {"never_match", "at", "tl", "la", "as", "ll"}, 0.5f);
   Docs seek_tagrets{2, 5, 8, 13};
   auto seek_it = std::begin(seek_tagrets);
   auto prepared_filter = filter.prepare({
@@ -1472,6 +1467,65 @@ TEST_P(NGramSimilarityFilterTestCase, seek) {
   EXPECT_EQ(counter.current, 0);
   EXPECT_GT(counter.max, 0);
   counter.Reset();
+}
+
+// Regression: NOT(ByNGramSimilarity) used to trip the
+// `target >= value()` assertion in PostingIteratorBase::LazySeek.
+// NGramSimilarityDocIterator's LazySeek bail-out paths returned the
+// advanced position without updating _doc, so when Not::prepare hoists
+// the ngram into the excl side of an AndQuery over All,
+// Exclusion::converge re-read a stale value() and seeded the next
+// LazySeek with a target behind some leaf's position.
+TEST_P(NGramSimilarityFilterTestCase, negation_regression) {
+  {
+    tests::JsonDocGenerator gen(resource("ngram_similarity.json"),
+                                &tests::GenericJsonFieldFactory);
+    add_segment(gen);
+  }
+  auto rdr = open_reader();
+
+  irs::ByNGramSimilarity ngram =
+    MakeFilter(kFieldFieldId, {"at", "tl", "la", "as"}, 0.5f);
+
+  auto collect = [&](const irs::Filter& filter) {
+    std::vector<irs::doc_id_t> out;
+    auto prepared = filter.prepare({.index = rdr});
+    for (const auto& sub : rdr) {
+      auto docs = prepared->execute({.segment = sub});
+      while (docs->next()) {
+        out.push_back(docs->value());
+      }
+    }
+    return out;
+  };
+
+  const auto ngram_hits = collect(ngram);
+  ASSERT_FALSE(ngram_hits.empty());
+
+  irs::Not not_ngram;
+  not_ngram.filter<irs::ByNGramSimilarity>() = ngram;
+  const auto not_hits = collect(not_ngram);
+
+  // Complement must be non-empty and disjoint from the positive hits.
+  ASSERT_FALSE(not_hits.empty());
+  for (auto doc : ngram_hits) {
+    EXPECT_EQ(not_hits.end(), std::find(not_hits.begin(), not_hits.end(), doc));
+  }
+
+  // Drive seek() across positive hits -- mirrors the path that
+  // surfaced the crash from the SQL side via Exclusion::converge.
+  auto prepared = not_ngram.prepare({.index = rdr});
+  for (const auto& sub : rdr) {
+    auto docs = prepared->execute({.segment = sub});
+    for (auto doc : ngram_hits) {
+      const auto target = doc + 1;
+      const auto landed = docs->seek(target);
+      EXPECT_GE(landed, target);
+      if (irs::doc_limits::eof(landed)) {
+        break;
+      }
+    }
+  }
 }
 
 static constexpr auto kTestDirs = tests::GetDirectories<tests::kTypesDefault>();

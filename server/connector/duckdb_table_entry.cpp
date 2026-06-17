@@ -20,6 +20,8 @@
 
 #include "connector/duckdb_table_entry.h"
 
+#include <duckdb/catalog/catalog.hpp>
+#include <duckdb/function/table/table_scan.hpp>
 #include <duckdb/function/table_function.hpp>
 #include <duckdb/planner/constraints/bound_check_constraint.hpp>
 #include <duckdb/planner/expression/bound_columnref_expression.hpp>
@@ -34,6 +36,7 @@
 #include <duckdb/storage/table_storage_info.hpp>
 
 #include "basics/assert.h"
+#include "catalog/store/store.h"
 #include "connector/duckdb_table_function.h"
 #include "pg/errcodes.h"
 #include "pg/sql_exception.h"
@@ -41,6 +44,18 @@
 #include "pg/sql_utils.h"
 
 namespace sdb::connector {
+namespace {
+
+duckdb::virtual_column_map_t StoreScanVirtualColumns(
+  duckdb::ClientContext&, duckdb::optional_ptr<duckdb::FunctionData> data) {
+  auto& bind_data = data->Cast<duckdb::TableScanBindData>();
+  auto cols = bind_data.table.GetVirtualColumns();
+  cols.insert({kColumnIdentifierTableOid,
+               duckdb::TableColumn("tableoid", duckdb::LogicalType::BIGINT)});
+  return cols;
+}
+
+}  // namespace
 
 SereneDBTableEntry& RequireBaseTable(duckdb::TableCatalogEntry& table) {
   // RTTI is unavoidable here: the caller hands us a generic
@@ -69,88 +84,44 @@ duckdb::unique_ptr<duckdb::BaseStatistics> SereneDBTableEntry::GetStatistics(
   return nullptr;
 }
 
+duckdb::TableCatalogEntry& SereneDBTableEntry::ResolveStoreEntry(
+  duckdb::ClientContext& context) const {
+  auto store_name = catalog::StoreTableName(ParentCatalog().GetName(),
+                                            ParentSchema().name, name);
+  return duckdb::Catalog::GetEntry(context, duckdb::CatalogType::TABLE_ENTRY,
+                                   std::string{catalog::kStoreDatabaseName},
+                                   "main", store_name)
+    .Cast<duckdb::TableCatalogEntry>();
+}
+
 duckdb::TableFunction SereneDBTableEntry::GetScanFunction(
   duckdb::ClientContext& context,
   duckdb::unique_ptr<duckdb::FunctionData>& bind_data) {
-  auto data = duckdb::make_uniq<TableScanBindData>();
-  data->table = _sdb_table;
-  for (const auto& col : _sdb_table->Columns()) {
-    if (col.id == catalog::Column::kGeneratedPKId) {
-      continue;  // Skip generated PK -- not stored as a value
+  auto function =
+    ResolveStoreEntry(context).GetScanFunction(context, bind_data);
+  if (bind_data) {
+    if (auto* table_bind =
+          dynamic_cast<duckdb::TableScanBindData*>(bind_data.get())) {
+      table_bind->display_name = name;
     }
-    data->column_ids.push_back(col.id);
-    data->column_types.push_back(col.type);
   }
-  // Always include rowid (PK bytes) as the last column for DELETE/UPDATE
-  data->has_rowid = true;
-  data->table_entry = this;
-  data->entry_kind = ScanEntryKind::BaseTable;
-
-  bind_data = std::move(data);
-  return CreateTableFullscanFunction();
+  // tableoid binds on tables (scoring functions and PG compatibility take
+  // it as an argument); scoring rewrites consume the reference before any
+  // scan would have to materialize it.
+  function.get_virtual_columns = StoreScanVirtualColumns;
+  return function;
 }
 
-void SereneDBTableEntry::BindUpdateConstraints(duckdb::Binder& binder,
-                                               duckdb::LogicalGet& get,
-                                               duckdb::LogicalProjection& proj,
-                                               duckdb::LogicalUpdate& update,
-                                               duckdb::ClientContext& context) {
-  // We deliberately do NOT call
-  // duckdb::TableCatalogEntry::BindUpdateConstraints. The base class also flips
-  // update_is_del_and_insert + projects every physical column when any SET
-  // column is indexed (or is a LIST). For our storage that's pure overhead
-  // (RocksDB does partial per-column updates; SereneDBPhysicalUpdate already
-  // does delete-and-insert at the secondary index level for every UPDATE) AND
-  // it would silently overwrite the gen col recompute below with stale "i=i"
-  // passthroughs.
-  //
-  // TODO: handle update.return_chunk (RETURNING *) when we add support.
+duckdb::Catalog& SereneDBTableEntry::GetStorageCatalog(
+  duckdb::ClientContext& context) {
+  return ResolveStoreEntry(context).ParentCatalog();
+}
 
-  auto user_set = update.columns;
-
-  // CHECK passthroughs -- VerifyUpdateConstraints needs every CHECK input
-  // present in the chunk, otherwise CreateMockChunk skips the check.
-  for (auto& constraint : update.bound_constraints) {
-    if (constraint->type == duckdb::ConstraintType::CHECK) {
-      auto& check = constraint->Cast<duckdb::BoundCheckConstraint>();
-      duckdb::LogicalUpdate::BindExtraColumns(*this, get, proj, update,
-                                              check.bound_columns);
-    }
-  }
-
-  // STORED gen-col recompute. The bound gen expression lives in
-  // update.bound_defaults[phys] (CheckBinder pre-inlined transitive gen->gen
-  // refs at CREATE TABLE time, so its leaves are non-gen physical cols).
-  // We append a BoundConstantExpression(NULL) sentinel here -- the logical
-  // optimizer rejects BoundReferenceExpression on the logical side, so we
-  // can't put the real expression in. PlanUpdate keys off the sentinel and
-  // substitutes the real expression at physical-plan time.
-  const auto& cols = GetColumns();
-  for (auto& gen_col : cols.Physical()) {
-    if (gen_col.Category() != duckdb::TableColumnType::GENERATED_STORED) {
-      continue;
-    }
-    SDB_ASSERT(gen_col.Physical().index < update.bound_defaults.size());
-    auto& bound_gen = *update.bound_defaults[gen_col.Physical().index];
-
-    duckdb::physical_index_set_t deps;
-    duckdb::ExpressionIterator::VisitExpression<
-      duckdb::BoundReferenceExpression>(
-      bound_gen, [&](const duckdb::BoundReferenceExpression& r) {
-        deps.insert(duckdb::PhysicalIndex(r.index));
-      });
-
-    const bool needs_recompute = absl::c_any_of(
-      deps, [&](auto d) { return absl::c_contains(user_set, d); });
-    if (!needs_recompute) {
-      continue;
-    }
-    duckdb::LogicalUpdate::BindExtraColumns(*this, get, proj, update, deps);
-    update.expressions.push_back(
-      duckdb::make_uniq<duckdb::BoundConstantExpression>(
-        duckdb::Value(gen_col.Type())));
-    update.columns.push_back(gen_col.Physical());
-  }
+duckdb::virtual_column_map_t SereneDBTableEntry::GetVirtualColumns() const {
+  auto cols = duckdb::TableCatalogEntry::GetVirtualColumns();
+  cols.insert({kColumnIdentifierTableOid,
+               duckdb::TableColumn("tableoid", duckdb::LogicalType::BIGINT)});
+  return cols;
 }
 
 duckdb::vector<duckdb::column_t> SereneDBTableEntry::BuildRowIdColumns(
@@ -163,7 +134,7 @@ duckdb::vector<duckdb::column_t> SereneDBTableEntry::BuildRowIdColumns(
   containers::FlatHashSet<size_t> needed;
   for (auto pk_id : pk_col_ids) {
     for (size_t i = 0; i < columns.size(); ++i) {
-      if (columns[i].id == pk_id) {
+      if (columns[i].GetId() == pk_id) {
         needed.insert(i);
         break;
       }
@@ -176,7 +147,7 @@ duckdb::vector<duckdb::column_t> SereneDBTableEntry::BuildRowIdColumns(
   // Register as virtual columns in stable order (PK first, then indexed)
   for (auto pk_id : pk_col_ids) {
     for (size_t i = 0; i < columns.size(); ++i) {
-      if (columns[i].id == pk_id) {
+      if (columns[i].GetId() == pk_id) {
         result.push_back(duckdb::VIRTUAL_COLUMN_START + i);
         break;
       }
@@ -190,7 +161,7 @@ duckdb::vector<duckdb::column_t> SereneDBTableEntry::BuildRowIdColumns(
     bool is_pk = false;
     for (auto pk_id : pk_col_ids) {
       for (size_t i = 0; i < columns.size(); ++i) {
-        if (columns[i].id == pk_id && i == idx) {
+        if (columns[i].GetId() == pk_id && i == idx) {
           is_pk = true;
           break;
         }
@@ -204,7 +175,9 @@ duckdb::vector<duckdb::column_t> SereneDBTableEntry::BuildRowIdColumns(
     }
   }
 
-  result.push_back(duckdb::COLUMN_IDENTIFIER_ROW_ID);
+  if (pk_col_ids.empty()) {
+    result.push_back(kColumnIdentifierGeneratedPk);
+  }
   return result;
 }
 
@@ -217,9 +190,10 @@ duckdb::virtual_column_map_t SereneDBTableEntry::BuildVirtualColumns(
   // PK columns
   for (auto pk_id : pk_col_ids) {
     for (size_t i = 0; i < columns.size(); ++i) {
-      if (columns[i].id == pk_id) {
+      if (columns[i].GetId() == pk_id) {
         result.insert({duckdb::VIRTUAL_COLUMN_START + i,
-                       duckdb::TableColumn(columns[i].name, columns[i].type)});
+                       duckdb::TableColumn(std::string{columns[i].GetName()},
+                                           columns[i].type)});
         break;
       }
     }
@@ -230,7 +204,8 @@ duckdb::virtual_column_map_t SereneDBTableEntry::BuildVirtualColumns(
     auto virt_id = duckdb::VIRTUAL_COLUMN_START + idx;
     if (!result.contains(virt_id)) {
       result.insert(
-        {virt_id, duckdb::TableColumn(columns[idx].name, columns[idx].type)});
+        {virt_id, duckdb::TableColumn(std::string{columns[idx].GetName()},
+                                      columns[idx].type)});
     }
   }
 
@@ -238,9 +213,19 @@ duckdb::virtual_column_map_t SereneDBTableEntry::BuildVirtualColumns(
   result.insert({kColumnIdentifierTableOid,
                  duckdb::TableColumn("tableoid", duckdb::LogicalType::BIGINT)});
 
-  // Standard rowid
-  result.insert({duckdb::COLUMN_IDENTIFIER_ROW_ID,
-                 duckdb::TableColumn("rowid", duckdb::LogicalType::ROW_TYPE)});
+  // COLUMN_IDENTIFIER_EMPTY: the "no data needed" placeholder DuckDB's
+  // LogicalGet::GetAnyColumn picks for queries like COUNT(*) that have
+  // no real column dependency.
+  result.insert({duckdb::COLUMN_IDENTIFIER_EMPTY,
+                 duckdb::TableColumn("", duckdb::LogicalType::BOOLEAN)});
+
+  // Generated-PK virtual column: only declared on tables without an
+  // explicit PK.
+  if (pk_col_ids.empty()) {
+    result.insert(
+      {kColumnIdentifierGeneratedPk,
+       duckdb::TableColumn("rowid", duckdb::LogicalType::ROW_TYPE)});
+  }
   return result;
 }
 
@@ -259,7 +244,7 @@ duckdb::TableStorageInfo SereneDBTableEntry::BuildStorageInfo(
     const auto& columns = table.Columns();
     for (auto pk_id : pk_col_ids) {
       for (size_t i = 0; i < columns.size(); ++i) {
-        if (columns[i].id == pk_id) {
+        if (columns[i].GetId() == pk_id) {
           idx_info.column_set.insert(i);
           break;
         }
@@ -271,18 +256,12 @@ duckdb::TableStorageInfo SereneDBTableEntry::BuildStorageInfo(
   return info;
 }
 
-duckdb::vector<duckdb::column_t> SereneDBTableEntry::GetRowIdColumns() const {
-  return BuildRowIdColumns(*_sdb_table, _indexed_col_indices);
-}
-
-duckdb::virtual_column_map_t SereneDBTableEntry::GetVirtualColumns() const {
-  return BuildVirtualColumns(*_sdb_table, _indexed_col_indices);
-}
-
 duckdb::column_t SereneDBTableEntry::VirtualToPKColumnIndex(
   duckdb::column_t virtual_id) {
+  // Virtual PK column ids live in
+  // [VIRTUAL_COLUMN_START, kColumnIdentifierGeneratedPk):
   if (virtual_id >= duckdb::VIRTUAL_COLUMN_START &&
-      virtual_id < duckdb::COLUMN_IDENTIFIER_ROW_ID) {
+      virtual_id < kColumnIdentifierGeneratedPk) {
     return virtual_id - duckdb::VIRTUAL_COLUMN_START;
   }
   return duckdb::DConstants::INVALID_INDEX;

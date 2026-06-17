@@ -21,11 +21,8 @@
 #include <absl/container/flat_hash_map.h>
 #include <absl/strings/str_cat.h>
 #include <unicode/locid.h>
-#include <vpack/builder.h>
-#include <vpack/value.h>
-#include <vpack/value_type.h>
 
-#include <iresearch/analysis/analyzers.hpp>
+#include <iresearch/analysis/analyzer.hpp>
 #include <iresearch/analysis/classification_tokenizer.hpp>
 #include <iresearch/analysis/collation_tokenizer.hpp>
 #include <iresearch/analysis/delimited_tokenizer.hpp>
@@ -48,6 +45,7 @@
 #include <utility>
 
 #include "basics/assert.h"
+#include "basics/string_utils.h"
 #include "catalog/catalog.h"
 #include "catalog/search_analyzer_impl.h"
 #include "catalog/tokenizer.h"
@@ -57,6 +55,7 @@
 #include "pg/connection_context.h"
 #include "pg/errcodes.h"
 #include "pg/sql_exception_macro.h"
+#include "pg/sql_utils.h"
 
 namespace sdb::connector {
 namespace {
@@ -99,14 +98,12 @@ void DropTSDictionaryPragma(duckdb::ClientContext& context,
   const auto missing_ok = args[1].GetValue<bool>();
 
   auto& conn_ctx = GetSereneDBContext(context);
-  auto& catalog_feature =
-    SerenedServer::Instance().getFeature<catalog::CatalogFeature>();
-  auto& catalog = catalog_feature.Global();
+  auto& catalog = catalog::GetCatalog();
 
   auto name = pg::ParseObjectName(dict_name, StaticStrings::kPublic);
 
-  auto r =
-    catalog.DropTokenizer(conn_ctx.GetDatabase(), name.schema, name.relation);
+  auto r = catalog.DropTokenizer(conn_ctx.GetDatabase(), name.schema,
+                                 name.relation, false);
 
   std::string_view object_name = "text search dictionary";
   if (r.is(ERROR_SERVER_OBJECT_TYPE_MISMATCH)) {
@@ -132,6 +129,15 @@ void DropTSDictionaryPragma(duckdb::ClientContext& context,
                                               "\" does not exist, skipping")));
     r = {};
   }
+  // Cascade RESTRICT: catalog packs PG DETAIL lines into errorMessage.
+  if (r.is(ERROR_BAD_PARAMETER)) {
+    THROW_SQL_ERROR(
+      ERR_CODE(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
+      ERR_MSG("cannot drop ", object_name, " ", name.relation,
+              " because other objects depend on it"),
+      ERR_DETAIL(std::move(r).errorMessage()),
+      ERR_HINT("Use DROP ... CASCADE to drop the dependent objects too."));
+  }
   SDB_IF_FAILURE("crash_on_drop") { SDB_IMMEDIATE_ABORT(); }
   if (!r.ok()) {
     SDB_THROW(std::move(r));
@@ -146,11 +152,14 @@ void RegisterTokenizerPragma(duckdb::DatabaseInstance& db) {
   auto create_pragma = duckdb::PragmaFunction::PragmaCall(
     "create_text_search_dictionary", CreateTSDictionaryPragma,
     {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BOOLEAN});
+  // Tokenizer-specific kwargs are validated by CreateTSDictionaryPragma itself.
+  create_pragma.accept_arbitrary_named_parameters = true;
   loader.RegisterFunction(create_pragma);
 
   auto drop_pragma = duckdb::PragmaFunction::PragmaCall(
     "drop_text_search_dictionary", DropTSDictionaryPragma,
     {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BOOLEAN});
+  drop_pragma.accept_arbitrary_named_parameters = true;
   loader.RegisterFunction(drop_pragma);
 }
 

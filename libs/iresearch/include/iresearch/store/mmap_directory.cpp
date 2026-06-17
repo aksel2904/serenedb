@@ -50,7 +50,7 @@ inline int GetPosixMadvice(IOAdvice advice) {
   }
 
   SDB_ERROR(
-    "xxxxx", sdb::Logger::IRESEARCH,
+    IRESEARCH,
     absl::StrCat("madvice '", static_cast<uint32_t>(advice),
                  "' is not valid (RANDOM|SEQUENTIAL), fallback to NORMAL"));
 
@@ -70,7 +70,7 @@ std::shared_ptr<MMapHandle> OpenHandle(const path_char_t* file, IOAdvice advice,
   }
 
   if (!handle->open(file)) {
-    SDB_ERROR("xxxxx", sdb::Logger::IRESEARCH,
+    SDB_ERROR(IRESEARCH,
               absl::StrCat("Failed to open mmapped input file, path: ",
                            file_utils::ToStr(file)));
     return nullptr;
@@ -83,7 +83,7 @@ std::shared_ptr<MMapHandle> OpenHandle(const path_char_t* file, IOAdvice advice,
   const int padvice = GetPosixMadvice(advice);
 
   if (IR_MADVICE_NORMAL != padvice && !handle->advise(padvice)) {
-    SDB_ERROR("xxxxx", sdb::Logger::IRESEARCH,
+    SDB_ERROR(IRESEARCH,
               absl::StrCat("Failed to madvise input file, path: ",
                            file_utils::ToStr(file), ", error ", errno));
   }
@@ -193,55 +193,6 @@ IndexInput::ptr MMapDirectory::open(std::string_view name,
   try {
     return std::make_unique<MMapIndexInput>(std::move(handle));
   } catch (...) {
-  }
-
-  return nullptr;
-}
-
-bool CachingMMapDirectory::length(uint64_t& result,
-                                  std::string_view name) const noexcept {
-  if (_cache.Visit(name, [&](const auto& cached) noexcept {
-        result = cached->size();
-        return true;
-      })) {
-    return true;
-  }
-
-  return MMapDirectory::length(result, name);
-}
-
-IndexInput::ptr CachingMMapDirectory::open(std::string_view name,
-                                           IOAdvice advice) const noexcept {
-  if (bool(advice & (IOAdvice::READONCE | IOAdvice::DirectRead))) {
-    return MMapDirectory::open(name, advice);
-  }
-
-  auto make_stream = [](auto&& handle) noexcept -> IndexInput::ptr {
-    SDB_ASSERT(handle);
-
-    try {
-      return std::make_unique<MMapIndexInput>(std::move(handle));
-    } catch (...) {
-    }
-
-    return nullptr;
-  };
-
-  std::shared_ptr<mmap_utils::MMapHandle> handle;
-
-  if (_cache.Visit(name, [&](const auto& cached) noexcept {
-        handle = cached;
-        return handle != nullptr;
-      })) {
-    return make_stream(std::move(handle));
-  }
-
-  handle =
-    OpenHandle(path(), name, advice, *ResourceManager().file_descriptors);
-  if (handle) {
-    _cache.Put(name, [&]() noexcept { return handle; });
-
-    return make_stream(std::move(handle));
   }
 
   return nullptr;

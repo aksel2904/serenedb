@@ -27,7 +27,6 @@
 #include <bit>
 #include <memory>
 
-#include "iresearch/store/caching_directory.hpp"
 #include "iresearch/store/directory.hpp"
 #include "iresearch/store/directory_attributes.hpp"
 #include "iresearch/utils/ctr_encryption.hpp"
@@ -236,6 +235,6 @@ class DirectoryTestCaseBase
 namespace irs {
 
 template<>
-struct Type<tests::Rot13Encryption> : Type<Encryption> {};
+struct Type<::tests::Rot13Encryption> : Type<Encryption> {};
 
 }  // namespace irs

@@ -20,10 +20,23 @@
 
 #pragma once
 
+#include <iresearch/types.hpp>
+#include <iresearch/utils/type_limits.hpp>
+
+#include "basics/containers/flat_hash_set.h"
 #include "catalog/table_options.h"
-#include "rocksdb/slice.h"
 
 namespace sdb::connector {
+
+struct ColumnDescriptor {
+  catalog::Column::Id id;
+  duckdb::LogicalType type;
+};
+
+struct ExpressionDescriptor {
+  duckdb::LogicalType type;
+  irs::field_id field_id = irs::field_limits::invalid();
+};
 
 // Base implementation of column centric index writers
 class ColumnSinkWriterImplBase {
@@ -33,7 +46,6 @@ class ColumnSinkWriterImplBase {
     for (auto c : columns) {
       _columns.insert(c);
     }
-    SDB_ASSERT(!_columns.empty());
   }
 
   bool IsIndexed(catalog::Column::Id column_id) const noexcept {

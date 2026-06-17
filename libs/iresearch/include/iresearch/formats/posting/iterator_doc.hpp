@@ -203,7 +203,6 @@ doc_id_t PostingIteratorBase<IteratorTraits>::seek(doc_id_t target) {
 template<typename IteratorTraits>
 doc_id_t PostingIteratorBase<IteratorTraits>::LazySeek(doc_id_t target) {
   if constexpr (IteratorTraits::Position()) {
-    SDB_ASSERT(target >= value());
     return seek(target);
   } else {
     if (target <= _doc) [[unlikely]] {
@@ -511,8 +510,7 @@ void PostingIteratorImpl<IteratorTraits, FieldTraits, HasWand,
       this->_doc_in = doc_in->Reopen();  // Reopen thread-safe stream
 
       if (!this->_doc_in) {
-        SDB_ERROR("xxxxx", sdb::Logger::IRESEARCH,
-                  "Failed to reopen document input");
+        SDB_ERROR(IRESEARCH, "Failed to reopen document input");
         throw IoError("failed to reopen document input");
       }
     }
@@ -639,7 +637,7 @@ PostingIteratorImpl<IteratorTraits, FieldTraits, HasWand, InputType>::FillBlock(
                   base, data, words, std::end(this->_docs) - tail, tail);
               }
             } else if (bitset) {
-              const uint32_t mask_words = (max - min) >> 6;
+              const uint32_t mask_words = (max - min + 63) >> 6;
               const auto offset = base >= min ? base - min : min - base;
               const uint32_t word_offset = offset >> 6;
               const uint32_t bit_offset = offset % BitsRequired<uint64_t>();
@@ -808,8 +806,7 @@ bool PostingIteratorImpl<IteratorTraits, FieldTraits, HasWand,
   std::unique_ptr<InputType> skip_in_ptr{
     sdb::basics::downCast<InputType>(this->_doc_in->Dup().release())};
   if (!skip_in_ptr) [[unlikely]] {
-    SDB_ERROR("xxxxx", sdb::Logger::IRESEARCH,
-              "Failed to duplicate document input");
+    SDB_ERROR(IRESEARCH, "Failed to duplicate document input");
     throw IoError("Failed to duplicate document input");
   }
   auto& skip_in = *skip_in_ptr;

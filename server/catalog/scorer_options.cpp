@@ -44,7 +44,7 @@ namespace sdb::catalog {
 namespace {
 
 const duckdb::Value* TryGetConstantValue(const duckdb::Expression& expr) {
-  if (expr.expression_class != duckdb::ExpressionClass::BOUND_CONSTANT) {
+  if (expr.GetExpressionClass() != duckdb::ExpressionClass::BOUND_CONSTANT) {
     return nullptr;
   }
   return &expr.Cast<duckdb::BoundConstantExpression>().value;
@@ -60,8 +60,6 @@ std::string ScorerOptions::ToString() const {
       } else if constexpr (std::is_same_v<P, Tfidf>) {
         return absl::StrCat(
           "tfidf(with_norms=", p.with_norms ? "true" : "false", ")");
-      } else if constexpr (std::is_same_v<P, RawTf>) {
-        return "raw_tf()";
       } else if constexpr (std::is_same_v<P, LmJm>) {
         return absl::StrCat("lm_jm(lambda=", p.lambda, ")");
       } else if constexpr (std::is_same_v<P, LmDirichlet>) {
@@ -71,6 +69,12 @@ std::string ScorerOptions::ToString() const {
       } else if constexpr (std::is_same_v<P, Dfi>) {
         return absl::StrCat("dfi(measure=", magic_enum::enum_name(p.measure),
                             ")");
+      } else if constexpr (std::is_same_v<P, RawBoost>) {
+        return "raw_boost()";
+      } else if constexpr (std::is_same_v<P, RawTf>) {
+        return "raw_tf()";
+      } else if constexpr (std::is_same_v<P, RawDL>) {
+        return "raw_dl()";
       }
     },
     params);
@@ -79,33 +83,7 @@ std::string ScorerOptions::ToString() const {
 std::unique_ptr<irs::Scorer> MakeScorer(const ScorerOptions& spec) {
   return std::visit(
     []<typename P>(const P& p) -> std::unique_ptr<irs::Scorer> {
-      if constexpr (std::is_same_v<P, ScorerOptions::Bm25>) {
-        return std::make_unique<irs::BM25>(p.k1, p.b);
-      } else if constexpr (std::is_same_v<P, ScorerOptions::Tfidf>) {
-        return std::make_unique<irs::TFIDF>(p.with_norms);
-      } else if constexpr (std::is_same_v<P, ScorerOptions::RawTf>) {
-        return std::make_unique<irs::RawTF>();
-      } else if constexpr (std::is_same_v<P, ScorerOptions::LmJm>) {
-        return std::make_unique<irs::LMJelinekMercer>(p.lambda);
-      } else if constexpr (std::is_same_v<P, ScorerOptions::LmDirichlet>) {
-        return std::make_unique<irs::LMDirichlet>(p.mu);
-      } else if constexpr (std::is_same_v<P, ScorerOptions::IndriDirichlet>) {
-        return std::make_unique<irs::IndriDirichlet>(p.mu);
-      } else if constexpr (std::is_same_v<P, ScorerOptions::Dfi>) {
-        irs::DFIMeasure m{};
-        switch (p.measure) {
-          case ScorerOptions::DfiMeasure::Standardized:
-            m = irs::DFIMeasure::Standardized;
-            break;
-          case ScorerOptions::DfiMeasure::Saturated:
-            m = irs::DFIMeasure::Saturated;
-            break;
-          case ScorerOptions::DfiMeasure::ChiSquared:
-            m = irs::DFIMeasure::ChiSquared;
-            break;
-        }
-        return std::make_unique<irs::DFI>(m);
-      }
+      return P::Owner::Make(p);
     },
     spec.params);
 }
@@ -115,7 +93,7 @@ std::optional<ScorerOptions> ExtractScorerFromBound(
   using S = ScorerOptions;
   S scorer;
 
-  if (name == S::Bm25::kName) {
+  if (name == S::Bm25::Owner::type_name()) {
     S::Bm25 p;
     if (func.children.size() == 3) {
       auto* k1v = TryGetConstantValue(*func.children[1]);
@@ -127,7 +105,7 @@ std::optional<ScorerOptions> ExtractScorerFromBound(
       p.b = static_cast<float>(bv->GetValue<double>());
     }
     scorer.params = p;
-  } else if (name == S::Tfidf::kName) {
+  } else if (name == S::Tfidf::Owner::type_name()) {
     S::Tfidf p;
     if (func.children.size() == 2) {
       auto* cv = TryGetConstantValue(*func.children[1]);
@@ -137,9 +115,7 @@ std::optional<ScorerOptions> ExtractScorerFromBound(
       p.with_norms = cv->GetValue<bool>();
     }
     scorer.params = p;
-  } else if (name == S::RawTf::kName) {
-    scorer.params = S::RawTf{};
-  } else if (name == S::LmJm::kName) {
+  } else if (name == S::LmJm::Owner::type_name()) {
     S::LmJm p;
     if (func.children.size() == 2) {
       auto* lv = TryGetConstantValue(*func.children[1]);
@@ -154,7 +130,7 @@ std::optional<ScorerOptions> ExtractScorerFromBound(
       }
     }
     scorer.params = p;
-  } else if (name == S::LmDirichlet::kName) {
+  } else if (name == S::LmDirichlet::Owner::type_name()) {
     S::LmDirichlet p;
     if (func.children.size() == 2) {
       auto* mv = TryGetConstantValue(*func.children[1]);
@@ -170,7 +146,7 @@ std::optional<ScorerOptions> ExtractScorerFromBound(
       }
     }
     scorer.params = p;
-  } else if (name == S::IndriDirichlet::kName) {
+  } else if (name == S::IndriDirichlet::Owner::type_name()) {
     S::IndriDirichlet p;
     if (func.children.size() == 2) {
       auto* mv = TryGetConstantValue(*func.children[1]);
@@ -187,7 +163,7 @@ std::optional<ScorerOptions> ExtractScorerFromBound(
       }
     }
     scorer.params = p;
-  } else if (name == S::Dfi::kName) {
+  } else if (name == S::Dfi::Owner::type_name()) {
     S::Dfi p;
     if (func.children.size() == 2) {
       auto* mv = TryGetConstantValue(*func.children[1]);
@@ -208,12 +184,18 @@ std::optional<ScorerOptions> ExtractScorerFromBound(
       p.measure = *parsed;
     }
     scorer.params = p;
+  } else if (name == S::RawBoost::Owner::type_name()) {
+    scorer.params = S::RawBoost{};
+  } else if (name == S::RawTf::Owner::type_name()) {
+    scorer.params = S::RawTf{};
+  } else if (name == S::RawDL::Owner::type_name()) {
+    scorer.params = S::RawDL{};
   } else {
     THROW_SQL_ERROR(
       ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
       ERR_MSG("Unknown scorer '", name, "'"),
-      ERR_HINT("Expected one of: bm25, tfidf, raw_tf, lm_jm, lm_dirichlet, "
-               "indri_dirichlet, dfi"));
+      ERR_HINT("Expected one of: bm25, tfidf, lm_jm, lm_dirichlet, "
+               "indri_dirichlet, dfi, raw_boost, raw_tf, raw_dl"));
   }
   return scorer;
 }
@@ -251,7 +233,8 @@ ScorerOptions ParseScorerExpression(duckdb::ClientContext& context,
   auto binder = Binder::CreateBinder(context);
   ConstantBinder cb(*binder, context, "optimize_top_k");
   auto bound = cb.Bind(fn_expr);
-  if (!bound || bound->expression_class != ExpressionClass::BOUND_FUNCTION) {
+  if (!bound ||
+      bound->GetExpressionClass() != ExpressionClass::BOUND_FUNCTION) {
     THROW_SQL_ERROR(
       ERR_CODE(ERRCODE_SYNTAX_ERROR),
       ERR_MSG("'optimize_top_k' did not bind to a scorer function: '", input,
@@ -260,7 +243,7 @@ ScorerOptions ParseScorerExpression(duckdb::ClientContext& context,
 
   auto& bound_fn = bound->Cast<BoundFunctionExpression>();
   for (auto& child : bound_fn.children) {
-    if (child->expression_class != ExpressionClass::BOUND_CONSTANT &&
+    if (child->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT &&
         child->IsFoldable()) {
       auto val = ExpressionExecutor::EvaluateScalar(context, *child);
       child = make_uniq<BoundConstantExpression>(std::move(val));

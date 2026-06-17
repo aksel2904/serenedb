@@ -49,7 +49,7 @@ class MockTermReader final : public irs::BasicTermReader {
     return irs::memory::to_managed<irs::TermIterator>(_it);
   }
   const irs::FieldMeta& meta() const { return _meta; }
-  std::string_view name() const final { return meta().name; }
+  irs::field_id id() const final { return meta().id; }
   irs::FieldProperties properties() const final { return meta(); }
   irs::bytes_view min() const final { return _min_term; }
   irs::bytes_view max() const final { return _max_term; }
@@ -172,9 +172,6 @@ class FormatTestCase : public IndexTestBase {
     FormatTestCase::Position _pos;
   };
 
-  irs::ColumnInfo lz4_column_info() const noexcept;
-  irs::ColumnInfo none_column_info() const noexcept;
-
   bool supports_encryption() const noexcept { return true; }
 
   bool supports_columnstore_headers() const noexcept { return true; }
@@ -240,6 +237,6 @@ namespace irs {
 
 // use base irs::position type for ancestors
 template<>
-struct Type<tests::FormatTestCase::Position> : Type<irs::PosAttr> {};
+struct Type<::tests::FormatTestCase::Position> : Type<irs::PosAttr> {};
 
 }  // namespace irs

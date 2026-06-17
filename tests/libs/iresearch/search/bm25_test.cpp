@@ -21,6 +21,7 @@
 /// @author Vasiliy Nabatchikov
 ////////////////////////////////////////////////////////////////////////////////
 
+#include "formats/column/test_cs_helpers.hpp"
 #include "index/index_tests.hpp"
 #include "iresearch/index/index_features.hpp"
 #include "iresearch/index/norm.hpp"
@@ -33,15 +34,46 @@
 #include "iresearch/search/prefix_filter.hpp"
 #include "iresearch/search/range_filter.hpp"
 #include "iresearch/search/scorer.hpp"
-#include "iresearch/search/scorers.hpp"
 #include "iresearch/search/term_filter.hpp"
+#include "iresearch/store/store_utils.hpp"
 #include "iresearch/utils/bytes_output.hpp"
-#include "iresearch/utils/lz4compression.hpp"
 #include "tests_shared.hpp"
 
 namespace {
 
 using namespace tests;
+
+// Stable per-name field ids, sourced from `tests::FieldIdFor` so the
+// canonical JSON factories and these tests agree on the id-per-name.
+[[maybe_unused]] inline constexpr irs::field_id kSeq = tests::FieldIdFor("seq");
+[[maybe_unused]] inline constexpr irs::field_id kName =
+  tests::FieldIdFor("name");
+[[maybe_unused]] inline constexpr irs::field_id kField =
+  tests::FieldIdFor("field");
+[[maybe_unused]] inline constexpr irs::field_id kPhraseAnl =
+  tests::FieldIdFor("phrase_anl");
+[[maybe_unused]] inline constexpr irs::field_id kPrefix =
+  tests::FieldIdFor("prefix");
+
+auto StoreSeq() {
+  return [](irs::IndexWriter::Document& doc, const tests::Document& src) {
+    const auto* seq =
+      dynamic_cast<const tests::StringField*>(src.stored.get_by_id(kSeq));
+    if (seq) {
+      irs::tests::StoreFieldAt(*doc.GetColWriter(), kSeq, doc.DocId(), *seq);
+    }
+  };
+}
+
+auto StoreName() {
+  return [](irs::IndexWriter::Document& doc, const tests::Document& src) {
+    const auto* name =
+      dynamic_cast<const tests::StringField*>(src.stored.get_by_id(kName));
+    if (name) {
+      irs::tests::StoreFieldAt(*doc.GetColWriter(), kName, doc.DocId(), *name);
+    }
+  };
+}
 
 /////////////////
 // Freq | Term //
@@ -68,37 +100,39 @@ using namespace tests;
 
 class Bm25TestCase : public IndexTestBase {
  protected:
-  void TestQueryNorms(irs::FeatureWriterFactory handler);
+  void TestQueryNorms();
 };
 
-void Bm25TestCase::TestQueryNorms(irs::FeatureWriterFactory handler) {
+void Bm25TestCase::TestQueryNorms() {
   {
     tests::JsonDocGenerator gen(
       resource("simple_sequential_order.json"),
       [](tests::Document& doc, const std::string& name,
          const tests::JsonDocGenerator::JsonValue& data) {
         if (data.is_string()) {  // field
-          doc.insert(std::make_shared<StringField>(name, data.str,
-                                                   irs::IndexFeatures::Norm),
-                     true, false);
+          auto field = std::make_shared<StringField>(name, data.str,
+                                                     irs::IndexFeatures::Norm);
+          field->id = tests::FieldIdFor(name);
+          doc.insert(std::move(field), true, false);
         } else if (data.is_number()) {  // seq
           const auto value = std::to_string(data.as_number<int64_t>());
-          doc.insert(std::make_shared<StringField>(name, value,
-                                                   irs::IndexFeatures::Norm),
-                     false, true);
+          auto field = std::make_shared<StringField>(name, value,
+                                                     irs::IndexFeatures::Norm);
+          field->id = tests::FieldIdFor(name);
+          doc.insert(std::move(field), false, true);
         }
       });
 
-    irs::IndexWriterOptions opts;
-
-    add_segment(gen, irs::kOmCreate, opts);
+    add_segment(gen, irs::kOmCreate, irs::tests::DefaultWriterOptions(),
+                StoreSeq());
   }
 
   auto scorer = irs::BM25{irs::BM25::K(), irs::BM25::B(), true};
 
-  auto reader = irs::DirectoryReader(dir(), codec());
+  auto reader =
+    irs::DirectoryReader(dir(), codec(), irs::tests::DefaultReaderOptions());
   auto& segment = *(reader.begin());
-  const auto* column = segment.column("seq");
+  const auto* column = segment.Column(kSeq);
   ASSERT_NE(nullptr, column);
 
   MaxMemoryCounter counter;
@@ -106,13 +140,10 @@ void Bm25TestCase::TestQueryNorms(irs::FeatureWriterFactory handler) {
 
   // by_range multiple
   {
-    auto values = column->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, values);
-    auto* actual_value = irs::get<irs::PayAttr>(*values);
-    ASSERT_NE(nullptr, actual_value);
+    irs::tests::BlobPointReader values{segment, *column};
 
     irs::ByRange filter;
-    *filter.mutable_field() = "field";
+    *filter.mutable_field_id() = kField;
     filter.mutable_options()->range.min =
       irs::ViewCast<irs::byte_type>(std::string_view("6"));
     filter.mutable_options()->range.min_type = irs::BoundType::Exclusive;
@@ -147,8 +178,7 @@ void Bm25TestCase::TestQueryNorms(irs::FeatureWriterFactory handler) {
       docs->FetchScoreArgs(0);
       irs::score_t score_value{};
       score.Score(&score_value, 1);
-      ASSERT_EQ(docs->value(), values->seek(docs->value()));
-      in.reset(actual_value->value);
+      in.reset(values.Get(docs->value()));
 
       auto str_seq = irs::ReadString<std::string>(in);
       auto seq = strtoull(str_seq.c_str(), nullptr, 10);
@@ -168,13 +198,10 @@ void Bm25TestCase::TestQueryNorms(irs::FeatureWriterFactory handler) {
 
   // by_range multiple (3 values)
   {
-    auto values = column->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, values);
-    auto* actual_value = irs::get<irs::PayAttr>(*values);
-    ASSERT_NE(nullptr, actual_value);
+    irs::tests::BlobPointReader values{segment, *column};
 
     irs::ByRange filter;
-    *filter.mutable_field() = "field";
+    *filter.mutable_field_id() = kField;
     filter.mutable_options()->range.min =
       irs::ViewCast<irs::byte_type>(std::string_view("6"));
     filter.mutable_options()->range.min_type = irs::BoundType::Inclusive;
@@ -208,8 +235,7 @@ void Bm25TestCase::TestQueryNorms(irs::FeatureWriterFactory handler) {
       docs->FetchScoreArgs(0);
       irs::score_t score_value{};
       score.Score(&score_value, 1);
-      ASSERT_EQ(docs->value(), values->seek(docs->value()));
-      in.reset(actual_value->value);
+      in.reset(values.Get(docs->value()));
 
       auto str_seq = irs::ReadString<std::string>(in);
       auto seq = strtoull(str_seq.c_str(), nullptr, 10);
@@ -233,16 +259,14 @@ TEST_P(Bm25TestCase, consts) {
 }
 
 TEST_P(Bm25TestCase, test_load) {
-  auto scorer = irs::scorers::Get(
-    "bm25", irs::Type<irs::text_format::Json>::get(), std::string_view{});
+  auto scorer = irs::BM25::Make(irs::BM25::Options{});
   ASSERT_NE(nullptr, scorer);
 }
 
 TEST_P(Bm25TestCase, make_from_array) {
   // default args
   {
-    auto scorer = irs::scorers::Get(
-      "bm25", irs::Type<irs::text_format::Json>::get(), std::string_view{});
+    auto scorer = irs::BM25::Make(irs::BM25::Options{});
     ASSERT_NE(nullptr, scorer);
     ASSERT_EQ(irs::Type<irs::BM25>::id(), scorer->type());
     auto& bm25 = dynamic_cast<irs::BM25&>(*scorer);
@@ -251,47 +275,9 @@ TEST_P(Bm25TestCase, make_from_array) {
     ASSERT_EQ(irs::BM25::BOOST_AS_SCORE(), bm25.use_boost_as_score());
   }
 
-  // default args
+  // custom `k` and `b`
   {
-    auto scorer =
-      irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(), "[]");
-    ASSERT_EQ(nullptr, scorer);
-  }
-
-  // `k` argument
-  {
-    auto scorer = irs::scorers::Get(
-      "bm25", irs::Type<irs::text_format::Json>::get(), "[ 1.5 ]");
-    ASSERT_EQ(nullptr, scorer);
-  }
-
-  // invalid `k` argument
-  ASSERT_EQ(nullptr,
-            irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(),
-                              "[ \"1.5\" ]"));
-  ASSERT_EQ(nullptr,
-            irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(),
-                              "[ \"abc\" ]"));
-  ASSERT_EQ(nullptr,
-            irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(),
-                              "[ null]"));
-  ASSERT_EQ(nullptr,
-            irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(),
-                              "[ true ]"));
-  ASSERT_EQ(nullptr,
-            irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(),
-                              "[ false ]"));
-  ASSERT_EQ(nullptr,
-            irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(),
-                              "[ {} ]"));
-  ASSERT_EQ(nullptr,
-            irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(),
-                              "[ [] ]"));
-
-  // `b` argument
-  {
-    auto scorer = irs::scorers::Get(
-      "bm25", irs::Type<irs::text_format::Json>::get(), "[ 1.5, 1.7 ]");
+    auto scorer = irs::BM25::Make(irs::BM25::Options{.k1 = 1.5f, .b = 1.7f});
     ASSERT_NE(nullptr, scorer);
     ASSERT_EQ(irs::Type<irs::BM25>::id(), scorer->type());
     auto& bm25 = dynamic_cast<irs::BM25&>(*scorer);
@@ -299,53 +285,20 @@ TEST_P(Bm25TestCase, make_from_array) {
     ASSERT_EQ(1.7f, bm25.b());
     ASSERT_EQ(irs::BM25::BOOST_AS_SCORE(), bm25.use_boost_as_score());
   }
-
-  // invalid `b` argument
-  ASSERT_EQ(nullptr,
-            irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(),
-                              "[ 1.5, \"1.7\" ]"));
-  ASSERT_EQ(nullptr,
-            irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(),
-                              "[ 1.5, \"abc\" ]"));
-  ASSERT_EQ(nullptr,
-            irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(),
-                              "[ 1.5, null]"));
-  ASSERT_EQ(nullptr,
-            irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(),
-                              "[ 1.5, true ]"));
-  ASSERT_EQ(nullptr,
-            irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(),
-                              "[ 1.5, false ]"));
-  ASSERT_EQ(nullptr,
-            irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(),
-                              "[ 1.5, {} ]"));
-  ASSERT_EQ(nullptr,
-            irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(),
-                              "[ 1.5, [] ]"));
 }
 
 TEST_P(Bm25TestCase, test_normalize_features) {
   // default norms
   {
-    auto scorer = irs::scorers::Get(
-      "bm25", irs::Type<irs::text_format::Json>::get(), std::string_view{});
+    auto scorer = irs::BM25::Make(irs::BM25::Options{});
     ASSERT_NE(nullptr, scorer);
     ASSERT_EQ(irs::IndexFeatures::Freq | irs::IndexFeatures::Norm,
               scorer->GetIndexFeatures());
   }
 
-  // without norms (bm15)
+  // without norms (bm15) -- b = 0 selects the BM15 codepath.
   {
-    auto scorer = irs::scorers::Get(
-      "bm25", irs::Type<irs::text_format::Json>::get(), "{\"b\": 0.0}");
-    ASSERT_NE(nullptr, scorer);
-    ASSERT_EQ(irs::IndexFeatures::Freq, scorer->GetIndexFeatures());
-  }
-
-  // without norms (bm15), integer argument
-  {
-    auto scorer = irs::scorers::Get(
-      "bm25", irs::Type<irs::text_format::Json>::get(), "{\"b\": 0}");
+    auto scorer = irs::BM25::Make(irs::BM25::Options{.b = 0.0f});
     ASSERT_NE(nullptr, scorer);
     ASSERT_EQ(irs::IndexFeatures::Freq, scorer->GetIndexFeatures());
   }
@@ -367,11 +320,15 @@ TEST_P(Bm25TestCase, test_phrase) {
 
       if (data.is_string()) {
         // analyzed field
-        doc.indexed.push_back(std::make_shared<TextField>(
-          std::string(name.c_str()) + "_anl", data.str));
+        const auto anl_name = std::string(name.c_str()) + "_anl";
+        auto analyzed = std::make_shared<TextField>(anl_name, data.str);
+        analyzed->id = tests::FieldIdFor(anl_name);
+        doc.indexed.push_back(std::move(analyzed));
 
         // not analyzed field
-        doc.insert(std::make_shared<StringField>(name, data.str));
+        auto field = std::make_shared<StringField>(name, data.str);
+        field->id = tests::FieldIdFor(name);
+        doc.insert(std::move(field));
       }
     };
 
@@ -379,14 +336,14 @@ TEST_P(Bm25TestCase, test_phrase) {
   {
     tests::JsonDocGenerator gen(resource("phrase_sequential.json"),
                                 analyzed_json_field_factory);
-    add_segment(gen);
+    add_segment(gen, irs::kOmCreate, irs::tests::DefaultWriterOptions(),
+                StoreName());
   }
 
-  auto impl = irs::scorers::Get(
-    "bm25", irs::Type<irs::text_format::Json>::get(), "{ \"b\" : 0 }");
+  auto impl = irs::BM25::Make(irs::BM25::Options{.b = 0.0f});
 
   // read segment
-  auto index = open_reader();
+  auto index = open_reader(irs::tests::DefaultReaderOptions());
   ASSERT_EQ(1, index->size());
   auto& segment = *(index.begin());
 
@@ -396,7 +353,7 @@ TEST_P(Bm25TestCase, test_phrase) {
   // "jumps high" with order
   {
     irs::ByPhrase filter;
-    *filter.mutable_field() = "phrase_anl";
+    *filter.mutable_field_id() = kPhraseAnl;
     filter.mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("jumps"));
     filter.mutable_options()->push_back<irs::ByTermOptions>().term =
@@ -427,22 +384,18 @@ TEST_P(Bm25TestCase, test_phrase) {
       .segment = &segment,
     });
 
-    auto column = segment.column("name");
+    const auto* column = segment.Column(kName);
     ASSERT_NE(nullptr, column);
-    auto values = column->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, values);
-    auto* actual_value = irs::get<irs::PayAttr>(*values);
-    ASSERT_NE(nullptr, actual_value);
+    irs::tests::BlobPointReader values{segment, *column};
 
     while (docs->next()) {
       fetcher.Fetch(docs->value());
       docs->FetchScoreArgs(0);
       irs::score_t score_value{};
       score.Score(&score_value, 1);
-      ASSERT_EQ(docs->value(), values->seek(docs->value()));
-
-      sorted.emplace(score_value,
-                     irs::ToString<std::string>(actual_value->value.data()));
+      irs::BytesViewInput in;
+      in.reset(values.Get(docs->value()));
+      sorted.emplace(score_value, irs::ReadString<std::string>(in));
     }
 
     ASSERT_EQ(kExpected.size(), sorted.size());
@@ -459,14 +412,14 @@ TEST_P(Bm25TestCase, test_phrase) {
   // "cookies ca* p_e bisKuit meringue|marshmallows" with order
   {
     irs::ByPhrase filter;
-    *filter.mutable_field() = "phrase_anl";
+    *filter.mutable_field_id() = kPhraseAnl;
     auto& phrase = *filter.mutable_options();
     phrase.push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("cookies"));
     phrase.push_back<irs::ByPrefixOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("ca"));
-    phrase.push_back<irs::ByWildcardOptions>().term =
-      irs::ViewCast<irs::byte_type>(std::string_view("p_e"));
+    phrase.push_back<irs::ByWildcardOptions>() = irs::ByWildcardOptions{
+      irs::ViewCast<irs::byte_type>(std::string_view("p_e"))};
     auto& lt = phrase.push_back<irs::ByEditDistanceOptions>();
     lt.max_distance = 1;
     lt.term = irs::ViewCast<irs::byte_type>(std::string_view("biscuit"));
@@ -502,22 +455,18 @@ TEST_P(Bm25TestCase, test_phrase) {
       .segment = &segment,
     });
 
-    auto column = segment.column("name");
+    const auto* column = segment.Column(kName);
     ASSERT_NE(nullptr, column);
-    auto values = column->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, values);
-    auto* actual_value = irs::get<irs::PayAttr>(*values);
-    ASSERT_NE(nullptr, actual_value);
+    irs::tests::BlobPointReader values{segment, *column};
 
     while (docs->next()) {
       fetcher.Fetch(docs->value());
       docs->FetchScoreArgs(0);
       irs::score_t score_value{};
       score.Score(&score_value, 1);
-      ASSERT_EQ(docs->value(), values->seek(docs->value()));
-
-      sorted.emplace(score_value,
-                     irs::ToString<std::string>(actual_value->value.data()));
+      irs::BytesViewInput in;
+      in.reset(values.Get(docs->value()));
+      sorted.emplace(score_value, irs::ReadString<std::string>(in));
     }
 
     ASSERT_EQ(kExpected.size(), sorted.size());
@@ -539,21 +488,26 @@ TEST_P(Bm25TestCase, test_query) {
       [](tests::Document& doc, const std::string& name,
          const tests::JsonDocGenerator::JsonValue& data) {
         if (data.is_string()) {  // field
-          doc.insert(std::make_shared<StringField>(name, data.str), true,
-                     false);
+          auto field = std::make_shared<StringField>(name, data.str);
+          field->id = tests::FieldIdFor(name);
+          doc.insert(std::move(field), true, false);
         } else if (data.is_number()) {  // seq
           const auto value = std::to_string(data.as_number<int64_t>());
-          doc.insert(std::make_shared<StringField>(name, value), false, true);
+          auto field = std::make_shared<StringField>(name, value);
+          field->id = tests::FieldIdFor(name);
+          doc.insert(std::move(field), false, true);
         }
       });
-    add_segment(gen);
+    add_segment(gen, irs::kOmCreate, irs::tests::DefaultWriterOptions(),
+                StoreSeq());
   }
 
   irs::BM25 scorer{irs::BM25::K(), irs::BM25::B(), true};
 
-  auto reader = irs::DirectoryReader(dir(), codec());
+  auto reader =
+    irs::DirectoryReader(dir(), codec(), irs::tests::DefaultReaderOptions());
   auto& segment = *(reader.begin());
-  const auto* column = segment.column("seq");
+  const auto* column = segment.Column(kSeq);
   ASSERT_NE(nullptr, column);
 
   MaxMemoryCounter counter;
@@ -561,13 +515,10 @@ TEST_P(Bm25TestCase, test_query) {
 
   // by_term
   {
-    auto values = column->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, values);
-    auto* actual_value = irs::get<irs::PayAttr>(*values);
-    ASSERT_NE(nullptr, actual_value);
+    irs::tests::BlobPointReader values{segment, *column};
 
     irs::ByTerm filter;
-    *filter.mutable_field() = "field";
+    *filter.mutable_field_id() = kField;
     filter.mutable_options()->term =
       irs::ViewCast<irs::byte_type>(std::string_view("7"));
 
@@ -596,8 +547,7 @@ TEST_P(Bm25TestCase, test_query) {
 
       irs::score_t score_value{};
       score.Score(&score_value, 1);
-      ASSERT_EQ(docs->value(), values->seek(docs->value()));
-      in.reset(actual_value->value);
+      in.reset(values.Get(docs->value()));
 
       auto str_seq = irs::ReadString<std::string>(in);
       auto seq = strtoull(str_seq.c_str(), nullptr, 10);
@@ -617,35 +567,42 @@ TEST_P(Bm25TestCase, test_query) {
 
   // by term multi-segment, same term (same score for all docs)
   {
-    auto values = column->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, values);
-    auto* actual_value = irs::get<irs::PayAttr>(*values);
-    ASSERT_NE(nullptr, actual_value);
+    irs::tests::BlobPointReader values{segment, *column};
 
     tests::JsonDocGenerator gen(
       resource("simple_sequential_order.json"),
       [](tests::Document& doc, const std::string& name,
          const JsonDocGenerator::JsonValue& data) {
         if (data.is_string()) {  // field
-          doc.insert(std::make_shared<StringField>(name, data.str), true,
-                     false);
+          auto field = std::make_shared<StringField>(name, data.str);
+          field->id = tests::FieldIdFor(name);
+          doc.insert(std::move(field), true, false);
         } else if (data.is_number()) {  // seq
           const auto value = std::to_string(data.as_number<int64_t>());
-          doc.insert(std::make_shared<StringField>(name, value), false, true);
+          auto field = std::make_shared<StringField>(name, value);
+          field->id = tests::FieldIdFor(name);
+          doc.insert(std::move(field), false, true);
         }
       });
-    auto writer = open_writer(irs::kOmCreate);
+    auto writer =
+      open_writer(irs::kOmCreate, irs::tests::DefaultWriterOptions());
+    auto store_seq = StoreSeq();
     const Document* doc;
 
     // add first segment (even 'seq')
     {
       gen.reset();
       while ((doc = gen.next())) {
-        ASSERT_TRUE(Insert(*writer, doc->indexed.begin(), doc->indexed.end(),
-                           doc->stored.begin(), doc->stored.end()));
+        auto ctx = writer->GetBatch();
+        {
+          auto d = ctx.Insert();
+          ASSERT_TRUE(d.Insert(doc->indexed.begin(), doc->indexed.end()));
+          store_seq(d, *doc);
+        }
+        ctx.Commit();
         gen.next();  // skip 1 doc
       }
-      writer->Commit();
+      writer->RefreshCommit();
       AssertSnapshotEquality(*writer);
     }
 
@@ -654,17 +611,23 @@ TEST_P(Bm25TestCase, test_query) {
       gen.reset();
       gen.next();  // skip 1 doc
       while ((doc = gen.next())) {
-        ASSERT_TRUE(Insert(*writer, doc->indexed.begin(), doc->indexed.end(),
-                           doc->stored.begin(), doc->stored.end()));
+        auto ctx = writer->GetBatch();
+        {
+          auto d = ctx.Insert();
+          ASSERT_TRUE(d.Insert(doc->indexed.begin(), doc->indexed.end()));
+          store_seq(d, *doc);
+        }
+        ctx.Commit();
         gen.next();  // skip 1 doc
       }
-      writer->Commit();
+      writer->RefreshCommit();
       AssertSnapshotEquality(*writer);
     }
 
-    auto reader = irs::DirectoryReader(dir(), codec());
+    auto reader =
+      irs::DirectoryReader(dir(), codec(), irs::tests::DefaultReaderOptions());
     irs::ByTerm filter;
-    *filter.mutable_field() = "field";
+    *filter.mutable_field_id() = kField;
     filter.mutable_options()->term =
       irs::ViewCast<irs::byte_type>(std::string_view("6"));
 
@@ -684,12 +647,9 @@ TEST_P(Bm25TestCase, test_query) {
     irs::ColumnArgsFetcher fetcher;
     for (auto& segment : reader) {
       fetcher.Clear();
-      const auto* column = segment.column("seq");
+      const auto* column = segment.Column(kSeq);
       ASSERT_NE(nullptr, column);
-      auto values = column->iterator(irs::ColumnHint::Normal);
-      ASSERT_NE(nullptr, values);
-      auto* actual_value = irs::get<irs::PayAttr>(*values);
-      ASSERT_NE(nullptr, actual_value);
+      irs::tests::BlobPointReader values{segment, *column};
       auto docs = prepared_filter->execute({
         .segment = segment,
         .scorer = &scorer,
@@ -705,8 +665,7 @@ TEST_P(Bm25TestCase, test_query) {
         docs->FetchScoreArgs(0);
         irs::score_t score_value{};
         score.Score(&score_value, 1);
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
 
         auto str_seq = irs::ReadString<std::string>(in);
         auto seq = strtoull(str_seq.c_str(), nullptr, 10);
@@ -728,35 +687,42 @@ TEST_P(Bm25TestCase, test_query) {
   // by_term disjunction multi-segment, different terms (same score for all
   // docs)
   {
-    auto values = column->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, values);
-    auto* actual_value = irs::get<irs::PayAttr>(*values);
-    ASSERT_NE(nullptr, actual_value);
+    irs::tests::BlobPointReader values{segment, *column};
 
     tests::JsonDocGenerator gen(
       resource("simple_sequential_order.json"),
       [](tests::Document& doc, const std::string& name,
          const JsonDocGenerator::JsonValue& data) {
         if (data.is_string()) {  // field
-          doc.insert(std::make_shared<StringField>(name, data.str), true,
-                     false);
+          auto field = std::make_shared<StringField>(name, data.str);
+          field->id = tests::FieldIdFor(name);
+          doc.insert(std::move(field), true, false);
         } else if (data.is_number()) {  // seq
           const auto value = std::to_string(data.as_number<int64_t>());
-          doc.insert(std::make_shared<StringField>(name, value), false, true);
+          auto field = std::make_shared<StringField>(name, value);
+          field->id = tests::FieldIdFor(name);
+          doc.insert(std::move(field), false, true);
         }
       });
-    auto writer = open_writer(irs::kOmCreate);
+    auto writer =
+      open_writer(irs::kOmCreate, irs::tests::DefaultWriterOptions());
+    auto store_seq = StoreSeq();
     const Document* doc;
 
     // add first segment (even 'seq')
     {
       gen.reset();
       while ((doc = gen.next())) {
-        ASSERT_TRUE(Insert(*writer, doc->indexed.begin(), doc->indexed.end(),
-                           doc->stored.begin(), doc->stored.end()));
+        auto ctx = writer->GetBatch();
+        {
+          auto d = ctx.Insert();
+          ASSERT_TRUE(d.Insert(doc->indexed.begin(), doc->indexed.end()));
+          store_seq(d, *doc);
+        }
+        ctx.Commit();
         gen.next();  // skip 1 doc
       }
-      writer->Commit();
+      writer->RefreshCommit();
       AssertSnapshotEquality(*writer);
     }
 
@@ -765,27 +731,33 @@ TEST_P(Bm25TestCase, test_query) {
       gen.reset();
       gen.next();  // skip 1 doc
       while ((doc = gen.next())) {
-        ASSERT_TRUE(Insert(*writer, doc->indexed.begin(), doc->indexed.end(),
-                           doc->stored.begin(), doc->stored.end()));
+        auto ctx = writer->GetBatch();
+        {
+          auto d = ctx.Insert();
+          ASSERT_TRUE(d.Insert(doc->indexed.begin(), doc->indexed.end()));
+          store_seq(d, *doc);
+        }
+        ctx.Commit();
         gen.next();  // skip 1 doc
       }
-      writer->Commit();
+      writer->RefreshCommit();
       AssertSnapshotEquality(*writer);
     }
 
-    auto reader = irs::DirectoryReader(dir(), codec());
+    auto reader =
+      irs::DirectoryReader(dir(), codec(), irs::tests::DefaultReaderOptions());
     irs::Or filter;
     {
       // doc 0, 2, 5
       auto& sub = filter.add<irs::ByTerm>();
-      *sub.mutable_field() = "field";
+      *sub.mutable_field_id() = kField;
       sub.mutable_options()->term =
         irs::ViewCast<irs::byte_type>(std::string_view("6"));
     }
     {
       // doc 3, 7
       auto& sub = filter.add<irs::ByTerm>();
-      *sub.mutable_field() = "field";
+      *sub.mutable_field_id() = kField;
       sub.mutable_options()->term =
         irs::ViewCast<irs::byte_type>(std::string_view("8"));
     }
@@ -805,12 +777,9 @@ TEST_P(Bm25TestCase, test_query) {
 
     for (auto& segment : reader) {
       fetcher.Clear();
-      const auto* column = segment.column("seq");
+      const auto* column = segment.Column(kSeq);
       ASSERT_NE(nullptr, column);
-      auto values = column->iterator(irs::ColumnHint::Normal);
-      ASSERT_NE(nullptr, values);
-      auto* actual_value = irs::get<irs::PayAttr>(*values);
-      ASSERT_NE(nullptr, actual_value);
+      irs::tests::BlobPointReader values{segment, *column};
       auto docs = prepared_filter->execute({
         .segment = segment,
         .scorer = &scorer,
@@ -826,8 +795,7 @@ TEST_P(Bm25TestCase, test_query) {
         docs->FetchScoreArgs(0);
         irs::score_t score_value{};
         score.Score(&score_value, 1);
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
 
         auto str_seq = irs::ReadString<std::string>(in);
         auto seq = strtoull(str_seq.c_str(), nullptr, 10);
@@ -848,35 +816,42 @@ TEST_P(Bm25TestCase, test_query) {
 
   // by_prefix empty multi-segment, different terms (same score for all docs)
   {
-    auto values = column->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, values);
-    auto* actual_value = irs::get<irs::PayAttr>(*values);
-    ASSERT_NE(nullptr, actual_value);
+    irs::tests::BlobPointReader values{segment, *column};
 
     tests::JsonDocGenerator gen(
       resource("simple_sequential.json"),
       [](tests::Document& doc, const std::string& name,
          const JsonDocGenerator::JsonValue& data) {
         if (data.is_string()) {  // field
-          doc.insert(std::make_shared<StringField>(name, data.str), true,
-                     false);
+          auto field = std::make_shared<StringField>(name, data.str);
+          field->id = tests::FieldIdFor(name);
+          doc.insert(std::move(field), true, false);
         } else if (data.is_number()) {  // seq
           const auto value = std::to_string(data.as_number<int64_t>());
-          doc.insert(std::make_shared<StringField>(name, value), false, true);
+          auto field = std::make_shared<StringField>(name, value);
+          field->id = tests::FieldIdFor(name);
+          doc.insert(std::move(field), false, true);
         }
       });
-    auto writer = open_writer(irs::kOmCreate);
+    auto writer =
+      open_writer(irs::kOmCreate, irs::tests::DefaultWriterOptions());
+    auto store_seq = StoreSeq();
     const Document* doc;
 
     // add first segment (even 'seq')
     {
       gen.reset();
       while ((doc = gen.next())) {
-        ASSERT_TRUE(Insert(*writer, doc->indexed.begin(), doc->indexed.end(),
-                           doc->stored.begin(), doc->stored.end()));
+        auto ctx = writer->GetBatch();
+        {
+          auto d = ctx.Insert();
+          ASSERT_TRUE(d.Insert(doc->indexed.begin(), doc->indexed.end()));
+          store_seq(d, *doc);
+        }
+        ctx.Commit();
         gen.next();  // skip 1 doc
       }
-      writer->Commit();
+      writer->RefreshCommit();
       AssertSnapshotEquality(*writer);
     }
 
@@ -885,17 +860,23 @@ TEST_P(Bm25TestCase, test_query) {
       gen.reset();
       gen.next();  // skip 1 doc
       while ((doc = gen.next())) {
-        ASSERT_TRUE(Insert(*writer, doc->indexed.begin(), doc->indexed.end(),
-                           doc->stored.begin(), doc->stored.end()));
+        auto ctx = writer->GetBatch();
+        {
+          auto d = ctx.Insert();
+          ASSERT_TRUE(d.Insert(doc->indexed.begin(), doc->indexed.end()));
+          store_seq(d, *doc);
+        }
+        ctx.Commit();
         gen.next();  // skip 1 doc
       }
-      writer->Commit();
+      writer->RefreshCommit();
       AssertSnapshotEquality(*writer);
     }
 
-    auto reader = irs::DirectoryReader(dir(), codec());
+    auto reader =
+      irs::DirectoryReader(dir(), codec(), irs::tests::DefaultReaderOptions());
     irs::ByPrefix filter;
-    *filter.mutable_field() = "prefix";
+    *filter.mutable_field_id() = kPrefix;
     filter.mutable_options()->term =
       irs::ViewCast<irs::byte_type>(std::string_view(""));
 
@@ -917,12 +898,9 @@ TEST_P(Bm25TestCase, test_query) {
     irs::ColumnArgsFetcher fetcher;
     for (auto& segment : reader) {
       fetcher.Clear();
-      const auto* column = segment.column("seq");
+      const auto* column = segment.Column(kSeq);
       ASSERT_NE(nullptr, column);
-      auto values = column->iterator(irs::ColumnHint::Normal);
-      ASSERT_NE(nullptr, values);
-      auto* actual_value = irs::get<irs::PayAttr>(*values);
-      ASSERT_NE(nullptr, actual_value);
+      irs::tests::BlobPointReader values{segment, *column};
       auto docs = prepared_filter->execute({
         .segment = segment,
         .scorer = &scorer,
@@ -938,8 +916,7 @@ TEST_P(Bm25TestCase, test_query) {
         docs->FetchScoreArgs(0);
         irs::score_t score_value{};
         score.Score(&score_value, 1);
-        ASSERT_EQ(docs->value(), values->seek(docs->value()));
-        in.reset(actual_value->value);
+        in.reset(values.Get(docs->value()));
 
         auto str_seq = irs::ReadString<std::string>(in);
         auto seq = strtoull(str_seq.c_str(), nullptr, 10);
@@ -960,13 +937,10 @@ TEST_P(Bm25TestCase, test_query) {
 
   // by_range single
   {
-    auto values = column->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, values);
-    auto* actual_value = irs::get<irs::PayAttr>(*values);
-    ASSERT_NE(nullptr, actual_value);
+    irs::tests::BlobPointReader values{segment, *column};
 
     irs::ByRange filter;
-    *filter.mutable_field() = "field";
+    *filter.mutable_field_id() = kField;
     filter.mutable_options()->range.min =
       irs::ViewCast<irs::byte_type>(std::string_view("6"));
     filter.mutable_options()->range.min_type = irs::BoundType::Exclusive;
@@ -998,8 +972,7 @@ TEST_P(Bm25TestCase, test_query) {
       docs->FetchScoreArgs(0);
       irs::score_t score_value{};
       score.Score(&score_value, 1);
-      ASSERT_EQ(docs->value(), values->seek(docs->value()));
-      in.reset(actual_value->value);
+      in.reset(values.Get(docs->value()));
 
       auto str_seq = irs::ReadString<std::string>(in);
       auto seq = strtoull(str_seq.c_str(), nullptr, 10);
@@ -1020,13 +993,10 @@ TEST_P(Bm25TestCase, test_query) {
   // by_range single + scored_terms_limit(0)
   // by_range single + scored_terms_limit(1)
   for (size_t limit = 0; limit != 2; ++limit) {
-    auto values = column->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, values);
-    auto* actual_value = irs::get<irs::PayAttr>(*values);
-    ASSERT_NE(nullptr, actual_value);
+    irs::tests::BlobPointReader values{segment, *column};
 
     irs::ByRange filter;
-    *filter.mutable_field() = "field";
+    *filter.mutable_field_id() = kField;
     filter.mutable_options()->range.min =
       irs::ViewCast<irs::byte_type>(std::string_view("8"));
     filter.mutable_options()->range.min_type = irs::BoundType::Inclusive;
@@ -1059,8 +1029,7 @@ TEST_P(Bm25TestCase, test_query) {
       docs->FetchScoreArgs(0);
       irs::score_t score_value{};
       score.Score(&score_value, 1);
-      ASSERT_EQ(docs->value(), values->seek(docs->value()));
-      in.reset(actual_value->value);
+      in.reset(values.Get(docs->value()));
 
       auto str_seq = irs::ReadString<std::string>(in);
       auto seq = strtoull(str_seq.c_str(), nullptr, 10);
@@ -1080,13 +1049,10 @@ TEST_P(Bm25TestCase, test_query) {
 
   // by_range multiple
   {
-    auto values = column->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, values);
-    auto* actual_value = irs::get<irs::PayAttr>(*values);
-    ASSERT_NE(nullptr, actual_value);
+    irs::tests::BlobPointReader values{segment, *column};
 
     irs::ByRange filter;
-    *filter.mutable_field() = "field";
+    *filter.mutable_field_id() = kField;
     filter.mutable_options()->range.min =
       irs::ViewCast<irs::byte_type>(std::string_view("6"));
     filter.mutable_options()->range.min_type = irs::BoundType::Exclusive;
@@ -1118,8 +1084,7 @@ TEST_P(Bm25TestCase, test_query) {
       docs->FetchScoreArgs(0);
       irs::score_t score_value{};
       score.Score(&score_value, 1);
-      ASSERT_EQ(docs->value(), values->seek(docs->value()));
-      in.reset(actual_value->value);
+      in.reset(values.Get(docs->value()));
 
       auto str_seq = irs::ReadString<std::string>(in);
       auto seq = strtoull(str_seq.c_str(), nullptr, 10);
@@ -1139,13 +1104,10 @@ TEST_P(Bm25TestCase, test_query) {
 
   // by_range multiple (3 values)
   {
-    auto values = column->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, values);
-    auto* actual_value = irs::get<irs::PayAttr>(*values);
-    ASSERT_NE(nullptr, actual_value);
+    irs::tests::BlobPointReader values{segment, *column};
 
     irs::ByRange filter;
-    *filter.mutable_field() = "field";
+    *filter.mutable_field_id() = kField;
     filter.mutable_options()->range.min =
       irs::ViewCast<irs::byte_type>(std::string_view("6"));
     filter.mutable_options()->range.min_type = irs::BoundType::Inclusive;
@@ -1178,8 +1140,7 @@ TEST_P(Bm25TestCase, test_query) {
       docs->FetchScoreArgs(0);
       irs::score_t score_value{};
       score.Score(&score_value, 1);
-      ASSERT_EQ(docs->value(), values->seek(docs->value()));
-      in.reset(actual_value->value);
+      in.reset(values.Get(docs->value()));
 
       auto str_seq = irs::ReadString<std::string>(in);
       auto seq = strtoull(str_seq.c_str(), nullptr, 10);
@@ -1199,13 +1160,10 @@ TEST_P(Bm25TestCase, test_query) {
 
   // by phrase
   {
-    auto values = column->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, values);
-    auto* actual_value = irs::get<irs::PayAttr>(*values);
-    ASSERT_NE(nullptr, actual_value);
+    irs::tests::BlobPointReader values{segment, *column};
 
     irs::ByPhrase filter;
-    *filter.mutable_field() = "field";
+    *filter.mutable_field_id() = kField;
     filter.mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("7"));
 
@@ -1238,8 +1196,7 @@ TEST_P(Bm25TestCase, test_query) {
       docs->FetchScoreArgs(0);
       irs::score_t score_value{};
       score.Score(&score_value, 1);
-      ASSERT_EQ(docs->value(), values->seek(docs->value()));
-      in.reset(actual_value->value);
+      in.reset(values.Get(docs->value()));
 
       auto str_seq = irs::ReadString<std::string>(in);
       auto seq = strtoull(str_seq.c_str(), nullptr, 10);
@@ -1260,10 +1217,7 @@ TEST_P(Bm25TestCase, test_query) {
 
   // all
   {
-    auto values = column->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, values);
-    auto* actual_value = irs::get<irs::PayAttr>(*values);
-    ASSERT_NE(nullptr, actual_value);
+    irs::tests::BlobPointReader values{segment, *column};
 
     irs::All filter;
     filter.boost(1.5f);
@@ -1289,7 +1243,7 @@ TEST_P(Bm25TestCase, test_query) {
       ASSERT_EQ(doc, docs->value());
       irs::score_t score_value{};
       score.Score(&score_value, 1);
-      ASSERT_EQ(docs->value(), values->seek(docs->value()));
+      ASSERT_FALSE(values.IsNull(docs->value()));
       ++doc;
       ASSERT_EQ(1.5f, score_value);
     }
@@ -1301,10 +1255,7 @@ TEST_P(Bm25TestCase, test_query) {
 
   // all
   {
-    auto values = column->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, values);
-    auto* actual_value = irs::get<irs::PayAttr>(*values);
-    ASSERT_NE(nullptr, actual_value);
+    irs::tests::BlobPointReader values{segment, *column};
 
     irs::All filter;
     filter.boost(0.f);
@@ -1332,7 +1283,7 @@ TEST_P(Bm25TestCase, test_query) {
       docs->FetchScoreArgs(0);
       irs::score_t score_value{};
       score.Score(&score_value, 1);
-      ASSERT_EQ(docs->value(), values->seek(docs->value()));
+      ASSERT_FALSE(values.IsNull(docs->value()));
       ++doc;
       ASSERT_EQ(0.f, score_value);
     }
@@ -1344,14 +1295,10 @@ TEST_P(Bm25TestCase, test_query) {
 
   // column existence
   {
-    auto values = column->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, values);
-    auto* actual_value = irs::get<irs::PayAttr>(*values);
-    ASSERT_NE(nullptr, actual_value);
+    irs::tests::BlobPointReader values{segment, *column};
 
     irs::ByColumnExistence filter;
-    *filter.mutable_field() = "seq";
-    filter.mutable_options()->acceptor = {};
+    *filter.mutable_id() = kSeq;
 
     auto prepared_filter = filter.prepare({
       .index = reader,
@@ -1377,7 +1324,7 @@ TEST_P(Bm25TestCase, test_query) {
       docs->FetchScoreArgs(0);
       irs::score_t score_value{};
       score.Score(&score_value, 1);
-      ASSERT_EQ(docs->value(), values->seek(docs->value()));
+      ASSERT_FALSE(values.IsNull(docs->value()));
       ++doc;
       ASSERT_EQ(0.f, score_value);
     }
@@ -1389,14 +1336,10 @@ TEST_P(Bm25TestCase, test_query) {
 
   // column existence
   {
-    auto values = column->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, values);
-    auto* actual_value = irs::get<irs::PayAttr>(*values);
-    ASSERT_NE(nullptr, actual_value);
+    irs::tests::BlobPointReader values{segment, *column};
 
     irs::ByColumnExistence filter;
-    *filter.mutable_field() = "seq";
-    filter.mutable_options()->acceptor = {};
+    *filter.mutable_id() = kSeq;
     filter.boost(0.f);
 
     auto prepared_filter = filter.prepare({
@@ -1424,7 +1367,7 @@ TEST_P(Bm25TestCase, test_query) {
       irs::score_t score_value{};
       score.Score(&score_value, 1);
 
-      ASSERT_EQ(docs->value(), values->seek(docs->value()));
+      ASSERT_FALSE(values.IsNull(docs->value()));
       ++doc;
       ASSERT_EQ(0.f, score_value);
     }
@@ -1435,141 +1378,10 @@ TEST_P(Bm25TestCase, test_query) {
   counter.Reset();
 }
 
-TEST_P(Bm25TestCase, test_collector_serialization) {
-  // initialize test data
-  {
-    tests::JsonDocGenerator gen(resource("simple_sequential.json"),
-                                &tests::PayloadedJsonFieldFactory);
-    auto writer = open_writer(irs::kOmCreate);
-    const Document* doc;
-
-    while ((doc = gen.next())) {
-      ASSERT_TRUE(Insert(*writer, doc->indexed.begin(), doc->indexed.end(),
-                         doc->stored.begin(), doc->stored.end()));
-    }
-
-    writer->Commit();
-    AssertSnapshotEquality(*writer);
-  }
-
-  auto reader = irs::DirectoryReader(dir(), codec());
-  ASSERT_EQ(1, reader.size());
-  auto* field = reader[0].field("name");
-  ASSERT_NE(nullptr, field);
-  auto term = field->iterator(irs::SeekMode::NORMAL);
-  ASSERT_NE(nullptr, term);
-  ASSERT_TRUE(term->next());
-  term->read();  // fill TermMeta
-  irs::bstring fcollector_out;
-  irs::bstring tcollector_out;
-
-  // default init (field_collector)
-  {
-    irs::BM25 sort;
-    auto collector = sort.PrepareFieldCollector();
-    ASSERT_NE(nullptr, collector);
-    irs::StrOutput out0;
-    collector->write(out0);
-    collector->collect(reader[0], *field);
-    irs::StrOutput out1;
-    collector->write(out1);
-    fcollector_out = out1.out;
-    ASSERT_TRUE(out0.out.size() != out1.out.size() ||
-                0 != std::memcmp(&out0.out[0], &out1.out[0], out0.out.size()));
-
-    // identical to default
-    collector = sort.PrepareFieldCollector();
-    collector->collect(out0.out);
-    irs::StrOutput out2;
-    collector->write(out2);
-    ASSERT_TRUE(out0.out.size() == out2.out.size() &&
-                0 == std::memcmp(&out0.out[0], &out2.out[0], out0.out.size()));
-
-    // identical to modified
-    collector = sort.PrepareFieldCollector();
-    collector->collect(out1.out);
-    irs::StrOutput out3;
-    collector->write(out3);
-    ASSERT_TRUE(out1.out.size() == out3.out.size() &&
-                0 == std::memcmp(&out1.out[0], &out3.out[0], out1.out.size()));
-  }
-
-  // default init (term_collector)
-  {
-    irs::BM25 sort;
-    auto collector = sort.PrepareTermCollector();
-    ASSERT_NE(nullptr, collector);
-    irs::StrOutput out0;
-    collector->write(out0);
-    collector->collect(reader[0], *field, *term);
-    irs::StrOutput out1;
-    collector->write(out1);
-    tcollector_out = out1.out;
-    ASSERT_TRUE(out0.out.size() != out1.out.size() ||
-                0 != std::memcmp(&out0.out[0], &out1.out[0], out0.out.size()));
-
-    // identical to default
-    collector = sort.PrepareTermCollector();
-    collector->collect(out0.out);
-    irs::StrOutput out2;
-    collector->write(out2);
-    ASSERT_TRUE(out0.out.size() == out2.out.size() &&
-                0 == std::memcmp(&out0.out[0], &out2.out[0], out0.out.size()));
-
-    // identical to modified
-    collector = sort.PrepareTermCollector();
-    collector->collect(out1.out);
-    irs::StrOutput out3;
-    collector->write(out3);
-    ASSERT_TRUE(out1.out.size() == out3.out.size() &&
-                0 == std::memcmp(&out1.out[0], &out3.out[0], out1.out.size()));
-  }
-
-  // serialized too short (field_collector)
-  {
-    irs::BM25 sort;
-    auto collector = sort.PrepareFieldCollector();
-    ASSERT_NE(nullptr, collector);
-    ASSERT_THROW(collector->collect(irs::bytes_view(&fcollector_out[0],
-                                                    fcollector_out.size() - 1)),
-                 irs::IoError);
-  }
-
-  // serialized too short (term_collector)
-  {
-    irs::BM25 sort;
-    auto collector = sort.PrepareTermCollector();
-    ASSERT_NE(nullptr, collector);
-    ASSERT_THROW(collector->collect(irs::bytes_view(&tcollector_out[0],
-                                                    tcollector_out.size() - 1)),
-                 irs::IoError);
-  }
-
-  // serialized too long (field_collector)
-  {
-    irs::BM25 sort;
-    auto collector = sort.PrepareFieldCollector();
-    ASSERT_NE(nullptr, collector);
-    auto out = fcollector_out;
-    out.append(1, 42);
-    ASSERT_THROW(collector->collect(out), irs::IoError);
-  }
-
-  // serialized too long (term_collector)
-  {
-    irs::BM25 sort;
-    auto collector = sort.PrepareTermCollector();
-    auto out = tcollector_out;
-    out.append(1, 42);
-    ASSERT_THROW(collector->collect(out), irs::IoError);
-  }
-}
-
 TEST_P(Bm25TestCase, test_make) {
   // default values
   {
-    auto scorer = irs::scorers::Get(
-      "bm25", irs::Type<irs::text_format::Json>::get(), std::string_view{});
+    auto scorer = irs::BM25::Make(irs::BM25::Options{});
     ASSERT_NE(nullptr, scorer);
     auto& scr = dynamic_cast<irs::BM25&>(*scorer);
     ASSERT_EQ(0.75f, scr.b());
@@ -1581,8 +1393,7 @@ TEST_P(Bm25TestCase, test_make) {
   // custom values
   {
     auto scorer =
-      irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(),
-                        "{\"b\": 123.456, \"k\": 78.9 }");
+      irs::BM25::Make(irs::BM25::Options{.k1 = 78.9f, .b = 123.456f});
     ASSERT_NE(nullptr, scorer);
     auto& scr = dynamic_cast<irs::BM25&>(*scorer);
     ASSERT_EQ(123.456f, scr.b());
@@ -1591,24 +1402,9 @@ TEST_P(Bm25TestCase, test_make) {
     ASSERT_FALSE(scr.IsBM15());
   }
 
-  // custom values (integer argument)
+  // bm11 -- b = 1 selects the BM11 codepath.
   {
-    auto scorer =
-      irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(),
-                        "{\"b\": 123.456, \"k\": 78 }");
-    ASSERT_NE(nullptr, scorer);
-    auto& scr = dynamic_cast<irs::BM25&>(*scorer);
-    ASSERT_EQ(123.456f, scr.b());
-    ASSERT_EQ(78.0f, scr.k());
-    ASSERT_FALSE(scr.IsBM11());
-    ASSERT_FALSE(scr.IsBM15());
-  }
-
-  // bm11
-  {
-    auto scorer =
-      irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(),
-                        "{\"b\": 1.0, \"k\": 78.9 }");
+    auto scorer = irs::BM25::Make(irs::BM25::Options{.k1 = 78.9f, .b = 1.0f});
     ASSERT_NE(nullptr, scorer);
     auto& scr = dynamic_cast<irs::BM25&>(*scorer);
     ASSERT_EQ(1.f, scr.b());
@@ -1617,66 +1413,15 @@ TEST_P(Bm25TestCase, test_make) {
     ASSERT_FALSE(scr.IsBM15());
   }
 
-  // bm11 (integer argument)
+  // bm15 -- b = 0 selects the BM15 codepath.
   {
-    auto scorer =
-      irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(),
-                        "{\"b\": 1, \"k\": 78.9 }");
-    ASSERT_NE(nullptr, scorer);
-    auto& scr = dynamic_cast<irs::BM25&>(*scorer);
-    ASSERT_EQ(1.f, scr.b());
-    ASSERT_EQ(78.9f, scr.k());
-    ASSERT_TRUE(scr.IsBM11());
-    ASSERT_FALSE(scr.IsBM15());
-  }
-
-  // bm15
-  {
-    auto scorer =
-      irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(),
-                        "{\"b\": 0.0, \"k\": 78.9 }");
+    auto scorer = irs::BM25::Make(irs::BM25::Options{.k1 = 78.9f, .b = 0.0f});
     ASSERT_NE(nullptr, scorer);
     auto& scr = dynamic_cast<irs::BM25&>(*scorer);
     ASSERT_EQ(0.f, scr.b());
     ASSERT_EQ(78.9f, scr.k());
     ASSERT_FALSE(scr.IsBM11());
     ASSERT_TRUE(scr.IsBM15());
-  }
-
-  // bm15 (integer argument)
-  {
-    auto scorer =
-      irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(),
-                        "{\"b\": 0, \"k\": 78.9 }");
-    ASSERT_NE(nullptr, scorer);
-    auto& scr = dynamic_cast<irs::BM25&>(*scorer);
-    ASSERT_EQ(0.f, scr.b());
-    ASSERT_EQ(78.9f, scr.k());
-    ASSERT_FALSE(scr.IsBM11());
-    ASSERT_TRUE(scr.IsBM15());
-  }
-
-  // invalid args
-  {
-    auto scorer = irs::scorers::Get(
-      "bm25", irs::Type<irs::text_format::Json>::get(), "\"12345");
-    ASSERT_EQ(nullptr, scorer);
-  }
-
-  // invalid values (b)
-  {
-    auto scorer =
-      irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(),
-                        "{\"b\": false, \"k\": 78.9}");
-    ASSERT_EQ(nullptr, scorer);
-  }
-
-  // invalid values (k)
-  {
-    auto scorer =
-      irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(),
-                        "{\"b\": 123.456, \"k\": true}");
-    ASSERT_EQ(nullptr, scorer);
   }
 }
 
@@ -1687,24 +1432,29 @@ TEST_P(Bm25TestCase, test_order) {
       [](tests::Document& doc, const std::string& name,
          const tests::JsonDocGenerator::JsonValue& data) {
         if (data.is_string()) {  // field
-          doc.insert(std::make_shared<StringField>(name, data.str), true,
-                     false);
+          auto field = std::make_shared<StringField>(name, data.str);
+          field->id = tests::FieldIdFor(name);
+          doc.insert(std::move(field), true, false);
         } else if (data.is_number()) {  // seq
           const auto value = std::to_string(data.as_number<int64_t>());
-          doc.insert(std::make_shared<StringField>(name, value), false, true);
+          auto field = std::make_shared<StringField>(name, value);
+          field->id = tests::FieldIdFor(name);
+          doc.insert(std::move(field), false, true);
         }
       });
-    add_segment(gen);
+    add_segment(gen, irs::kOmCreate, irs::tests::DefaultWriterOptions(),
+                StoreSeq());
   }
 
-  auto reader = irs::DirectoryReader(dir(), codec());
+  auto reader =
+    irs::DirectoryReader(dir(), codec(), irs::tests::DefaultReaderOptions());
   auto& segment = *(reader.begin());
 
   MaxMemoryCounter counter;
   irs::ColumnArgsFetcher fetcher;
 
   irs::ByTerm query;
-  *query.mutable_field() = "field";
+  *query.mutable_field_id() = kField;
 
   irs::BM25 sort25;
   irs::BM25 sort15{irs::BM25::K(), 0.f};
@@ -1713,14 +1463,11 @@ TEST_P(Bm25TestCase, test_order) {
   for (irs::score_t boost : {0.f, 0.5f, irs::kNoBoost}) {
     for (auto& sort : {sort25, sort15, sort11, sort1}) {
       uint64_t seq = 0;
-      const auto* column = segment.column("seq");
+      const auto* column = segment.Column(kSeq);
       ASSERT_NE(nullptr, column);
 
       {
-        auto values = column->iterator(irs::ColumnHint::Normal);
-        ASSERT_NE(nullptr, values);
-        auto* actual_value = irs::get<irs::PayAttr>(*values);
-        ASSERT_NE(nullptr, actual_value);
+        irs::tests::BlobPointReader values{segment, *column};
 
         query.mutable_options()->term =
           irs::ViewCast<irs::byte_type>(std::string_view("7"));
@@ -1751,8 +1498,7 @@ TEST_P(Bm25TestCase, test_order) {
           irs::score_t score_value{};
           score.Score(&score_value, 1);
 
-          ASSERT_EQ(docs->value(), values->seek(docs->value()));
-          in.reset(actual_value->value);
+          in.reset(values.Get(docs->value()));
 
           auto str_seq = irs::ReadString<std::string>(in);
           seq = strtoull(str_seq.c_str(), nullptr, 10);
@@ -1774,9 +1520,7 @@ TEST_P(Bm25TestCase, test_order) {
 
 static constexpr auto kTestDirs = tests::GetDirectories<tests::kTypesDefault>();
 
-TEST_P(Bm25TestCase, test_query_norms) {
-  TestQueryNorms(&irs::Norm::MakeWriter);
-}
+TEST_P(Bm25TestCase, test_query_norms) { TestQueryNorms(); }
 
 INSTANTIATE_TEST_SUITE_P(bm25_test, Bm25TestCase,
                          ::testing::Combine(::testing::ValuesIn(kTestDirs),

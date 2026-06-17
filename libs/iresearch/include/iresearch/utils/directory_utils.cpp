@@ -23,7 +23,7 @@
 
 #include "iresearch/utils/directory_utils.hpp"
 
-#include "basics/logger/logger.h"
+#include "basics/log.h"
 #include "iresearch/formats/formats.hpp"
 #include "iresearch/index/index_meta.hpp"
 #include "iresearch/store/directory_attributes.hpp"
@@ -77,6 +77,14 @@ IndexOutput::ptr TrackingDirectory::create(std::string_view name) noexcept try {
   return nullptr;
 } catch (...) {
   return nullptr;
+}
+
+bool TrackingDirectory::remove(std::string_view name) noexcept {
+  if (!_impl.remove(name)) {
+    return false;
+  }
+  _files.erase(name);
+  return true;
 }
 
 bool TrackingDirectory::rename(std::string_view src,

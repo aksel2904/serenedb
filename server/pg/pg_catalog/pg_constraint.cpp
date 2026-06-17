@@ -60,7 +60,7 @@ catalog::MaterializedData SystemTableSnapshot<PgConstraint>::GetTableData() {
         conkey.reserve(pk_columns.size());
         for (auto pk_id : pk_columns) {
           for (size_t i = 0; i < columns.size(); ++i) {
-            if (columns[i].id == pk_id) {
+            if (columns[i].GetId() == pk_id) {
               conkey.push_back(static_cast<int16_t>(i + 1));
               break;
             }
@@ -97,10 +97,10 @@ catalog::MaterializedData SystemTableSnapshot<PgConstraint>::GetTableData() {
 
       // Check constraints
       for (const auto& check : table->CheckConstraints()) {
-        conname_storage.push_back(check.name);
+        conname_storage.emplace_back(check.GetName());
         conkey_storage.emplace_back();
         values.push_back({
-          .oid = check.id.id(),
+          .oid = check.GetId().id(),
           .conname = conname_storage.back(),
           .connamespace = schema->GetId().id(),
           .contype = PgConstraint::Contype::Check,

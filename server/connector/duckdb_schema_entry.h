@@ -22,11 +22,17 @@
 
 #include <duckdb.hpp>
 #include <duckdb/catalog/catalog_entry/schema_catalog_entry.hpp>
+#include <duckdb/common/case_insensitive_map.hpp>
+#include <duckdb/parser/parsed_expression.hpp>
 
 #include "catalog/identifiers/object_id.h"
+#include "catalog/table_options.h"
 
 namespace sdb::connector {
 
+// Reads SereneDB-specific column-mode keys from a CREATE TABLE WITH-clause
+// options map and applies the corresponding flags to `columns`.
+// Throws on unknown column names or unsupported value shapes.
 class SereneDBSchemaEntry final : public duckdb::SchemaCatalogEntry {
  public:
   using SchemaCatalogEntry::SchemaCatalogEntry;

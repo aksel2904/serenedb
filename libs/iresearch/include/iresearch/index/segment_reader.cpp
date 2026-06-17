@@ -31,16 +31,24 @@ uint64_t SegmentReader::CountMappedMemory() const {
   return _impl->CountMappedMemory();
 }
 
-FieldIterator::ptr SegmentReader::fields() const { return _impl->fields(); }
-
-const irs::ColumnReader* SegmentReader::sort() const { return _impl->sort(); }
-
-const irs::ColumnReader* SegmentReader::column(std::string_view name) const {
-  return _impl->column(name);
+std::span<const field_id> SegmentReader::field_ids() const {
+  return _impl->field_ids();
 }
 
-const irs::ColumnReader* SegmentReader::column(field_id field) const {
-  return _impl->column(field);
+NormReader::ptr SegmentReader::norms(field_id field) const {
+  return _impl->norms(field);
+}
+
+const ColumnReader* SegmentReader::Column(field_id field) const {
+  return _impl->Column(field);
+}
+
+const HnswReader* SegmentReader::HNSW(field_id field) const {
+  return _impl->HNSW(field);
+}
+
+const ColReader* SegmentReader::GetColReader() const {
+  return _impl ? _impl->GetColReader() : nullptr;
 }
 
 // FIXME find a better way to mask documents
@@ -48,15 +56,13 @@ DocIterator::ptr SegmentReader::mask(DocIterator::ptr&& it) const {
   return _impl->mask(std::move(it));
 }
 
-const TermReader* SegmentReader::field(std::string_view name) const {
-  return _impl->field(name);
+const TermReader* SegmentReader::field(field_id id) const {
+  return _impl->field(id);
 }
 
 DocIterator::ptr SegmentReader::docs_iterator() const {
   return _impl->docs_iterator();
 }
-
-ColumnIterator::ptr SegmentReader::columns() const { return _impl->columns(); }
 
 const SegmentInfo& SegmentReader::Meta() const { return _impl->Meta(); }
 

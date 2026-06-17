@@ -24,19 +24,11 @@
 #include <duckdb/main/client_context_state.hpp>
 #include <memory>
 
+#include "pg/progress_tracker.h"
+
 namespace sdb {
 
 class ConnectionContext;
-}
-
-namespace sdb::message {
-
-class Buffer;
-}
-
-namespace sdb::pg {
-
-class CopyMessagesQueue;
 }
 
 namespace sdb::connector {
@@ -47,6 +39,11 @@ inline constexpr const char* kSereneDBClientStateKey = "serenedb";
 // ConnectionContext (which holds config, transactions, catalog snapshots).
 // Accessible from any DuckDB function/operator via:
 //   context.registered_state->Get<SereneDBClientState>(kSereneDBClientStateKey)
+// The ConnectionContext whose transaction is currently committing on this
+// thread (between TransactionPreCommit and TransactionCommit/Rollback);
+// nullptr outside a commit (e.g. WAL replay).
+ConnectionContext* CurrentCommittingContext() noexcept;
+
 class SereneDBClientState final : public duckdb::ClientContextState {
  public:
   // Creates a SereneDBClientState, registers it in the ClientContext, and wires
@@ -60,29 +57,36 @@ class SereneDBClientState final : public duckdb::ClientContextState {
 
   ConnectionContext& GetConnectionContext() const { return *_connection_ctx; }
 
-  // Set by PG layer before query execution.
-  // Read by SereneDBCopyFileSystem to bridge PG protocol into DuckDB I/O.
-  pg::CopyMessagesQueue* copy_queue = nullptr;
-  message::Buffer* send_buffer = nullptr;
+  std::unique_ptr<pg::ProgressReporter> progress;
 
-  // Buffer for COPY FROM STDIN data. DuckDB opens /dev/stdin multiple
-  // times (for sniffing and reading). Data read on first opens is saved
-  // here and replayed on the final open.
+  // COPY FROM STDIN state shared across handles within a single query.
+  // DuckDB may open /dev/stdin more than once (CSV sniff then real read);
+  // the buffer captures what the first open drains so later opens replay
+  // it, and the done flag short-circuits reads after CopyDone.
   std::shared_ptr<std::string> copy_stdin_buffer;
   int copy_stdin_open_count = 0;
+  bool copy_stdin_done = false;
 
-  // Transaction lifecycle callbacks.
-  // Pre-* hooks run while the DuckDB transaction is still active; use them
-  // for work that needs ActiveTransaction (catalog lookups, set_local).
   void TransactionPreCommit(duckdb::MetaTransaction& transaction,
                             duckdb::ClientContext& context) final;
+
+  void TransactionPreCheckpoint(duckdb::AttachedDatabase& db,
+                                duckdb::ClientContext& context) final;
+
   void TransactionPreRollback(
     duckdb::MetaTransaction& transaction, duckdb::ClientContext& context,
     duckdb::optional_ptr<duckdb::ErrorData> error) final;
+
   void TransactionCommit(duckdb::MetaTransaction& transaction,
                          duckdb::ClientContext& context) final;
+
   void TransactionRollback(duckdb::MetaTransaction& transaction,
                            duckdb::ClientContext& context) final;
+
+  duckdb::RebindQueryInfo OnExecutePrepared(
+    duckdb::ClientContext& context, duckdb::PreparedStatementCallbackInfo& info,
+    duckdb::RebindQueryInfo current_rebind) final;
+
   void QueryEnd(duckdb::ClientContext& context) final;
 
  private:

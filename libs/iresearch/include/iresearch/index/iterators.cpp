@@ -25,7 +25,6 @@
 #include "basics/misc.hpp"
 #include "basics/singleton.hpp"
 #include "iresearch/analysis/token_attributes.hpp"
-#include "iresearch/formats/empty_term_reader.hpp"
 #include "iresearch/index/field_meta.hpp"
 #include "iresearch/search/column_collector.hpp"
 #include "iresearch/search/cost.hpp"
@@ -92,55 +91,6 @@ struct EmptySeekTermIterator : SeekTermIterator {
 
 EmptySeekTermIterator gEmptySeekIterator;
 
-// Represents a reader with no terms
-const EmptyTermReader kEmptyTermReader{0};
-
-// Represents a reader with no fields
-struct EmptyFieldIterator : FieldIterator {
-  const TermReader& value() const noexcept final { return kEmptyTermReader; }
-
-  bool seek(std::string_view /*target*/) noexcept final { return false; }
-
-  bool next() noexcept final { return false; }
-};
-
-EmptyFieldIterator gEmptyFieldIterator;
-
-struct EmptyColumnReader final : ColumnReader {
-  field_id id() const noexcept final { return field_limits::invalid(); }
-
-  // Returns optional column name.
-  std::string_view name() const noexcept final { return {}; }
-
-  // Returns column header.
-  bytes_view payload() const noexcept final { return {}; }
-
-  // Returns the corresponding column iterator.
-  // If the column implementation supports document payloads then it
-  // can be accessed via the 'payload' attribute.
-  ResettableDocIterator::ptr iterator(
-    ColumnHint /*hint*/) const noexcept final {
-    return ResettableDocIterator::empty();
-  }
-
-  doc_id_t size() const noexcept final { return 0; }
-};
-
-const EmptyColumnReader kEmptyColumnReader;
-
-// Represents a reader with no columns
-struct EmptyColumnIterator : ColumnIterator {
-  const ColumnReader& value() const noexcept final {
-    return kEmptyColumnReader;
-  }
-
-  bool seek(std::string_view /*name*/) final { return false; }
-
-  bool next() final { return false; }
-};
-
-EmptyColumnIterator gEmptyColumnIterator;
-
 }  // namespace
 
 TermIterator::ptr TermIterator::empty() noexcept {
@@ -157,14 +107,6 @@ DocIterator::ptr DocIterator::empty() noexcept {
 
 ResettableDocIterator::ptr ResettableDocIterator::empty() noexcept {
   return memory::to_managed<ResettableDocIterator>(gEmptyDocIterator);
-}
-
-FieldIterator::ptr FieldIterator::empty() noexcept {
-  return memory::to_managed<FieldIterator>(gEmptyFieldIterator);
-}
-
-ColumnIterator::ptr ColumnIterator::empty() noexcept {
-  return memory::to_managed<ColumnIterator>(gEmptyColumnIterator);
 }
 
 }  // namespace irs

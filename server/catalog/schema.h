@@ -21,22 +21,25 @@
 #pragma once
 
 #include "catalog/object.h"
+#include "catalog/persistence/schema.h"
 
+namespace duckdb {
+
+class Serializer;
+class Deserializer;
+
+}  // namespace duckdb
 namespace sdb::catalog {
 
-struct SchemaOptions {
-  ObjectId owner_id;
-  ObjectId id;
-  std::string name;
-};
+using persistence::SchemaOptions;
 
-class Schema : public DatabaseObject {
+class Schema : public Object {
  public:
   Schema(ObjectId database_id, SchemaOptions options);
 
-  static std::shared_ptr<Schema> ReadInternal(vpack::Slice slice,
-                                              ReadContext ctx);
-  void WriteInternal(vpack::Builder&) const final;
+  static std::shared_ptr<Schema> Deserialize(duckdb::Deserializer& src,
+                                             ReadContext ctx);
+  void Serialize(duckdb::Serializer& sink) const final;
   std::shared_ptr<Object> Clone() const final;
 };
 

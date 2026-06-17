@@ -23,11 +23,16 @@
 #pragma once
 
 #include "basics/memory.hpp"
-#include "iresearch/formats/column/hnsw_index.hpp"
 #include "iresearch/formats/column/norm_reader.hpp"
+#include "iresearch/formats/hnsw/hnsw_writer.hpp"
 #include "iresearch/formats/seek_cookie.hpp"
-#include "iresearch/index/column_finalizer.hpp"
 #include "iresearch/index/column_info.hpp"
+
+namespace duckdb {
+
+class DatabaseInstance;
+}
+#include "iresearch/formats/index/idx_reader.hpp"
 #include "iresearch/index/field_meta.hpp"
 #include "iresearch/index/index_features.hpp"
 #include "iresearch/index/index_meta.hpp"
@@ -49,6 +54,7 @@ struct SegmentMeta;
 struct FieldMeta;
 struct FlushState;
 struct ReaderState;
+struct NormProvider;
 class IndexOutput;
 class DataInput;
 class IndexInput;
@@ -60,12 +66,16 @@ using DocMap = ManagedVector<doc_id_t>;
 using DocMapView = std::span<const doc_id_t>;
 
 struct SegmentWriterOptions {
-  const ColumnInfoProvider& column_info;
   const IndexFeatures scorers_features;
   ScorerPtr scorer = nullptr;
   const Comparer* const comparator{};
   // TODO(mbkkt) Remove it from here? We could use directory
   IResourceManager& resource_manager{IResourceManager::gNoop};
+  // Enables the typed .col on the segment. Lifetime of `*db` must
+  // extend at least until SegmentWriter::flush() returns.
+  duckdb::DatabaseInstance* db = nullptr;
+  const ColumnOptionsProvider* column_options = nullptr;
+  const NormColumnOptionsProvider* norm_column_options = nullptr;
 };
 
 // Represents metadata associated with the term
@@ -106,7 +116,7 @@ struct PostingsWriter {
 struct BasicTermReader : public AttributeProvider {
   virtual TermIterator::ptr iterator() const = 0;
 
-  virtual std::string_view name() const = 0;
+  virtual field_id id() const = 0;
 
   virtual FieldProperties properties() const = 0;
 
@@ -115,15 +125,6 @@ struct BasicTermReader : public AttributeProvider {
 
   // Returns the most significant term
   virtual bytes_view(max)() const = 0;
-};
-
-struct FieldWriter {
-  using ptr = std::unique_ptr<FieldWriter>;
-
-  virtual ~FieldWriter() = default;
-  virtual void prepare(const FlushState& state) = 0;
-  virtual void write(const BasicTermReader& reader) = 0;
-  virtual void end() = 0;
 };
 
 struct IteratorFieldOptions : WandContext {
@@ -215,7 +216,7 @@ struct TermReader : public AttributeProvider {
 
   // Returns an intersection of a specified automaton and term reader.
   virtual SeekTermIterator::ptr iterator(
-    automaton_table_matcher& matcher) const = 0;
+    const automaton_table_matcher& matcher) const = 0;
 
   // Evaluates a union of all docs denoted by cookies supplied via a
   // speciified 'provider'. Each doc is represented by a bit in a
@@ -253,130 +254,6 @@ struct TermReader : public AttributeProvider {
 
   // Returns true if scorer denoted by the is supported by the field.
   virtual bool has_scorer(uint8_t index) const = 0;
-};
-
-struct FieldReader {
-  using ptr = std::shared_ptr<FieldReader>;
-
-  virtual ~FieldReader() = default;
-
-  virtual uint64_t CountMappedMemory() const = 0;
-
-  virtual void prepare(const ReaderState& stat) = 0;
-
-  virtual const TermReader* field(std::string_view field) const = 0;
-  virtual FieldIterator::ptr iterator() const = 0;
-  virtual size_t size() const = 0;
-};
-
-struct ColumnOutput : DataOutput {
-  // Resets stream to previous persisted state
-  virtual void Reset() = 0;
-  // NOTE: doc_limits::invalid() < doc && doc < doc_limits::eof()
-  virtual void Prepare(doc_id_t doc) = 0;
-
-#ifdef SDB_GTEST
-  ColumnOutput& operator()(doc_id_t doc) {
-    Prepare(doc);
-    return *this;
-  }
-#endif
-};
-
-struct ColumnstoreWriter {
-  using ptr = std::unique_ptr<ColumnstoreWriter>;
-
-  // Finalizer can be used to assign name and payload to a column.
-  // Returned `std::string_view` must be valid during `commit(...)`.
-
-  struct ColumnT {
-    field_id id;
-    ColumnOutput& out;
-  };
-
-  virtual ~ColumnstoreWriter() = default;
-
-  virtual void prepare(Directory& dir, const SegmentMeta& meta) = 0;
-  virtual ColumnT push_column(const ColumnInfo& info,
-                              ColumnFinalizer header_writer) = 0;
-  virtual void rollback() noexcept = 0;
-
-  // Return was anything actually flushed.
-  virtual bool commit(const FlushState& state) = 0;
-};
-
-enum class ColumnHint : uint32_t {
-  // Nothing special
-  Normal = 0,
-  // Open iterator for conosolidation
-  Consolidation = 1,
-  // Reading payload isn't necessary
-  Mask = 2,
-  // Allow accessing prev document
-  PrevDoc = 4
-};
-
-ENABLE_BITMASK_ENUM(ColumnHint);
-
-struct ColumnReader : public memory::Managed {
-  // Returns column id.
-  virtual field_id id() const = 0;
-
-  // Returns optional column name.
-  virtual std::string_view name() const = 0;
-
-  // Returns column header.
-  virtual bytes_view payload() const = 0;
-
-  // FIXME(gnusi): implement mode
-  //  Returns the corresponding column iterator.
-  //  If the column implementation supports document payloads then it
-  //  can be accessed via the 'payload' attribute.
-  virtual ResettableDocIterator::ptr iterator(ColumnHint hint) const = 0;
-  virtual NormReader::ptr norms() const {
-    SDB_ASSERT(false);
-    return {};
-  }
-
-  // Returns total number of columns.
-  virtual doc_id_t size() const = 0;
-
-  virtual void Search(HNSWSearchContext& context) const {
-    SDB_THROW(sdb::ERROR_INTERNAL,
-              "Search not implemented for this column type");
-  }
-
-  virtual void RangeSearch(HNSWRangeSearchContext& context) const {
-    SDB_THROW(sdb::ERROR_INTERNAL,
-              "RangeSearch not implemented for this column type");
-  }
-};
-
-struct ColumnstoreReader {
-  using ptr = std::unique_ptr<ColumnstoreReader>;
-
-  using column_visitor_f = std::function<bool(const ColumnReader&)>;
-
-  struct Options {
-    // allows to select "cached" columns
-    column_visitor_f warmup_column;
-  };
-
-  virtual ~ColumnstoreReader() = default;
-
-  virtual uint64_t CountMappedMemory() const = 0;
-
-  // Returns true if conlumnstore is present in a segment, false - otherwise.
-  // May throw `io_error` or `index_error`.
-  virtual bool prepare(const Directory& dir, const SegmentMeta& meta,
-                       const Options& opts = Options{}) = 0;
-
-  virtual bool visit(const column_visitor_f& visitor) const = 0;
-
-  virtual const ColumnReader* column(field_id field) const = 0;
-
-  // Returns total number of columns.
-  virtual size_t size() const = 0;
 };
 
 struct SegmentMetaWriter : memory::Managed {
@@ -427,17 +304,8 @@ class Format {
   virtual SegmentMetaWriter::ptr get_segment_meta_writer() const = 0;
   virtual SegmentMetaReader::ptr get_segment_meta_reader() const = 0;
 
-  virtual FieldWriter::ptr get_field_writer(
-    bool consolidation, IResourceManager& resource_manager) const = 0;
-  virtual FieldReader::ptr get_field_reader(
-    IResourceManager& resource_manager) const = 0;
-
-  virtual ColumnstoreWriter::ptr get_columnstore_writer(
-    bool consolidation, IResourceManager& resource_manager) const = 0;
-  virtual ColumnstoreReader::ptr get_columnstore_reader() const = 0;
-
-  virtual PostingsWriter::ptr get_postings_writer(bool consolidation,
-                                                  IResourceManager&) const = 0;
+  virtual PostingsWriter::ptr get_postings_writer(
+    bool compaction, IResourceManager& resource_manager) const = 0;
   virtual PostingsReader::ptr get_postings_reader() const = 0;
 
   virtual TypeInfo::type_id type() const noexcept = 0;
@@ -445,12 +313,13 @@ class Format {
 
 struct FlushState {
   Directory* const dir{};
-  const DocMap* docmap{};
-  const ColumnProvider* columns{};
+  // In-flight norm reader source (SegmentWriter during initial flush,
+  // null during merge). Posting writers consult it to read per-doc norms
+  // for Wand metadata while the segment is still being written.
+  const NormProvider* norms{};
   const std::string_view name;  // segment name
   ScorerPtr scorer = nullptr;
   const size_t doc_count;
-  // Accumulated segment index features
   IndexFeatures index_features{IndexFeatures::None};
 };
 
@@ -458,6 +327,7 @@ struct ReaderState {
   const Directory* dir;
   const SegmentMeta* meta;
   ScorerPtr scorer = nullptr;
+  IdxReader* idx = nullptr;
 };
 
 void FormatBlock128Init();

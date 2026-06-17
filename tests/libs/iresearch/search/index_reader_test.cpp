@@ -21,6 +21,8 @@
 /// @author Vasiliy Nabatchikov
 ////////////////////////////////////////////////////////////////////////////////
 
+#include "basics/duckdb_engine.h"
+#include "formats/column/test_cs_helpers.hpp"
 #include "index/doc_generator.hpp"
 #include "index/index_tests.hpp"
 #include "iresearch/formats/formats.hpp"
@@ -33,6 +35,33 @@
 
 using namespace std::chrono_literals;
 
+namespace {
+
+// Stable per-name field ids, sourced from `tests::FieldIdFor` so the
+// canonical JSON factories and these tests agree on the id-per-name.
+[[maybe_unused]] inline constexpr irs::field_id kName =
+  tests::FieldIdFor("name");
+[[maybe_unused]] inline constexpr irs::field_id kSeq = tests::FieldIdFor("seq");
+[[maybe_unused]] inline constexpr irs::field_id kSame =
+  tests::FieldIdFor("same");
+[[maybe_unused]] inline constexpr irs::field_id kDuplicated =
+  tests::FieldIdFor("duplicated");
+[[maybe_unused]] inline constexpr irs::field_id kPrefix =
+  tests::FieldIdFor("prefix");
+[[maybe_unused]] inline constexpr irs::field_id kValue =
+  tests::FieldIdFor("value");
+
+auto StoreName() {
+  return [](irs::IndexWriter::Document& doc, const tests::Document& src) {
+    const auto* name =
+      dynamic_cast<const tests::StringField*>(src.stored.get_by_id(kName));
+    if (name) {
+      irs::tests::StoreFieldAt(*doc.GetColWriter(), kName, doc.DocId(), *name);
+    }
+  };
+}
+
+}  // namespace
 namespace {
 
 irs::Format* gCodec0;
@@ -63,11 +92,13 @@ TEST(directory_reader_test, open_empty_index) {
 
   // Create empty index
   {
-    auto writer = irs::IndexWriter::Make(dir, codec, irs::kOmCreate);
-    ASSERT_TRUE(writer->Commit());
+    auto writer = irs::IndexWriter::Make(dir, codec, irs::kOmCreate,
+                                         irs::tests::DefaultWriterOptions());
+    ASSERT_TRUE(writer->RefreshCommit());
   }
 
-  auto rdr = irs::DirectoryReader(dir, codec);
+  auto rdr =
+    irs::DirectoryReader(dir, codec, irs::tests::DefaultReaderOptions());
   ASSERT_FALSE(!rdr);
   ASSERT_EQ(0, rdr.docs_count());
   ASSERT_EQ(0, rdr.live_docs_count());
@@ -105,22 +136,8 @@ TEST(directory_reader_test, open_newest_index) {
     irs::SegmentMetaReader::ptr get_segment_meta_reader() const final {
       return nullptr;
     }
-    irs::FieldWriter::ptr get_field_writer(bool,
-                                           irs::IResourceManager&) const final {
-      return nullptr;
-    }
-    irs::FieldReader::ptr get_field_reader(irs::IResourceManager&) const final {
-      return nullptr;
-    }
-    irs::ColumnstoreWriter::ptr get_columnstore_writer(
-      bool, irs::IResourceManager&) const final {
-      return nullptr;
-    }
-    irs::ColumnstoreReader::ptr get_columnstore_reader() const final {
-      return nullptr;
-    }
     irs::PostingsWriter::ptr get_postings_writer(
-      bool consolidation, irs::IResourceManager&) const final {
+      bool compaction, irs::IResourceManager&) const final {
       return nullptr;
     }
     irs::PostingsReader::ptr get_postings_reader() const final {
@@ -189,7 +206,9 @@ TEST(directory_reader_test, open) {
     [](tests::Document& doc, const std::string& name,
        const tests::JsonDocGenerator::JsonValue& data) {
       if (tests::JsonDocGenerator::ValueType::STRING == data.vt) {
-        doc.insert(std::make_shared<tests::StringField>(name, data.str));
+        auto field = std::make_shared<tests::StringField>(name, data.str);
+        field->id = tests::FieldIdForRuntime(name);
+        doc.insert(std::move(field));
       }
     });
 
@@ -210,44 +229,112 @@ TEST(directory_reader_test, open) {
   // create index
   {
     // open writer
-    auto writer = irs::IndexWriter::Make(dir, codec_ptr, irs::kOmCreate);
+    auto writer = irs::IndexWriter::Make(dir, codec_ptr, irs::kOmCreate,
+                                         irs::tests::DefaultWriterOptions());
 
     // add first segment
-    ASSERT_TRUE(Insert(*writer, doc1->indexed.begin(), doc1->indexed.end(),
-                       doc1->stored.begin(), doc1->stored.end()));
-    ASSERT_TRUE(Insert(*writer, doc2->indexed.begin(), doc2->indexed.end(),
-                       doc2->stored.begin(), doc2->stored.end()));
-    ASSERT_TRUE(Insert(*writer, doc3->indexed.begin(), doc3->indexed.end(),
-                       doc3->stored.begin(), doc3->stored.end()));
-    writer->Commit();
-    tests::AssertSnapshotEquality(writer->GetSnapshot(),
-                                  irs::DirectoryReader(dir, codec_ptr));
+    {
+      auto ctx = writer->GetBatch();
+      {
+        auto d = ctx.Insert();
+        ASSERT_TRUE(d.Insert(doc1->indexed.begin(), doc1->indexed.end()));
+        StoreName()(d, *doc1);
+      }
+      ctx.Commit();
+    }
+    {
+      auto ctx = writer->GetBatch();
+      {
+        auto d = ctx.Insert();
+        ASSERT_TRUE(d.Insert(doc2->indexed.begin(), doc2->indexed.end()));
+        StoreName()(d, *doc2);
+      }
+      ctx.Commit();
+    }
+    {
+      auto ctx = writer->GetBatch();
+      {
+        auto d = ctx.Insert();
+        ASSERT_TRUE(d.Insert(doc3->indexed.begin(), doc3->indexed.end()));
+        StoreName()(d, *doc3);
+      }
+      ctx.Commit();
+    }
+    writer->RefreshCommit();
+    tests::AssertSnapshotEquality(
+      writer->GetSnapshot(),
+      irs::DirectoryReader(dir, codec_ptr, irs::tests::DefaultReaderOptions()));
 
     // add second segment
-    ASSERT_TRUE(Insert(*writer, doc4->indexed.begin(), doc4->indexed.end(),
-                       doc4->stored.begin(), doc4->stored.end()));
-    ASSERT_TRUE(Insert(*writer, doc5->indexed.begin(), doc5->indexed.end(),
-                       doc5->stored.begin(), doc5->stored.end()));
-    ASSERT_TRUE(Insert(*writer, doc6->indexed.begin(), doc6->indexed.end(),
-                       doc6->stored.begin(), doc6->stored.end()));
-    ASSERT_TRUE(Insert(*writer, doc7->indexed.begin(), doc7->indexed.end(),
-                       doc7->stored.begin(), doc7->stored.end()));
-    writer->Commit();
-    tests::AssertSnapshotEquality(writer->GetSnapshot(),
-                                  irs::DirectoryReader(dir, codec_ptr));
+    {
+      auto ctx = writer->GetBatch();
+      {
+        auto d = ctx.Insert();
+        ASSERT_TRUE(d.Insert(doc4->indexed.begin(), doc4->indexed.end()));
+        StoreName()(d, *doc4);
+      }
+      ctx.Commit();
+    }
+    {
+      auto ctx = writer->GetBatch();
+      {
+        auto d = ctx.Insert();
+        ASSERT_TRUE(d.Insert(doc5->indexed.begin(), doc5->indexed.end()));
+        StoreName()(d, *doc5);
+      }
+      ctx.Commit();
+    }
+    {
+      auto ctx = writer->GetBatch();
+      {
+        auto d = ctx.Insert();
+        ASSERT_TRUE(d.Insert(doc6->indexed.begin(), doc6->indexed.end()));
+        StoreName()(d, *doc6);
+      }
+      ctx.Commit();
+    }
+    {
+      auto ctx = writer->GetBatch();
+      {
+        auto d = ctx.Insert();
+        ASSERT_TRUE(d.Insert(doc7->indexed.begin(), doc7->indexed.end()));
+        StoreName()(d, *doc7);
+      }
+      ctx.Commit();
+    }
+    writer->RefreshCommit();
+    tests::AssertSnapshotEquality(
+      writer->GetSnapshot(),
+      irs::DirectoryReader(dir, codec_ptr, irs::tests::DefaultReaderOptions()));
 
     // add third segment
-    ASSERT_TRUE(Insert(*writer, doc8->indexed.begin(), doc8->indexed.end(),
-                       doc8->stored.begin(), doc8->stored.end()));
-    ASSERT_TRUE(Insert(*writer, doc9->indexed.begin(), doc9->indexed.end(),
-                       doc9->stored.begin(), doc9->stored.end()));
-    writer->Commit();
-    tests::AssertSnapshotEquality(writer->GetSnapshot(),
-                                  irs::DirectoryReader(dir, codec_ptr));
+    {
+      auto ctx = writer->GetBatch();
+      {
+        auto d = ctx.Insert();
+        ASSERT_TRUE(d.Insert(doc8->indexed.begin(), doc8->indexed.end()));
+        StoreName()(d, *doc8);
+      }
+      ctx.Commit();
+    }
+    {
+      auto ctx = writer->GetBatch();
+      {
+        auto d = ctx.Insert();
+        ASSERT_TRUE(d.Insert(doc9->indexed.begin(), doc9->indexed.end()));
+        StoreName()(d, *doc9);
+      }
+      ctx.Commit();
+    }
+    writer->RefreshCommit();
+    tests::AssertSnapshotEquality(
+      writer->GetSnapshot(),
+      irs::DirectoryReader(dir, codec_ptr, irs::tests::DefaultReaderOptions()));
   }
 
   // open reader
-  auto rdr = irs::DirectoryReader(dir, codec_ptr);
+  auto rdr =
+    irs::DirectoryReader(dir, codec_ptr, irs::tests::DefaultReaderOptions());
   ASSERT_FALSE(!rdr);
   ASSERT_EQ(9, rdr.docs_count());
   ASSERT_EQ(9, rdr.live_docs_count());
@@ -265,26 +352,17 @@ TEST(directory_reader_test, open) {
     ASSERT_EQ(3, sub->docs_count());
     ASSERT_EQ(3, sub->live_docs_count());
 
-    const auto* column = sub->column("name");
+    const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
-    auto values = column->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, values);
-    auto* actual_value = irs::get<irs::PayAttr>(*values);
-    ASSERT_NE(nullptr, actual_value);
+    irs::tests::BlobPointReader values{*sub, *column};
 
     // read documents
-    ASSERT_EQ(1, values->seek(1));
-    ASSERT_EQ("A", irs::ToString<std::string_view>(
-                     actual_value->value.data()));  // 'name' value in doc1
-    ASSERT_EQ(2, values->seek(2));
-    ASSERT_EQ("B", irs::ToString<std::string_view>(
-                     actual_value->value.data()));  // 'name' value in doc2
-    ASSERT_EQ(3, values->seek(3));
-    ASSERT_EQ("C", irs::ToString<std::string_view>(
-                     actual_value->value.data()));  // 'name' value in doc3
+    ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(values, 1));
+    ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(values, 2));
+    ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(values, 3));
 
     // read invalid document
-    ASSERT_TRUE(irs::doc_limits::eof(values->seek(4)));
+    ASSERT_TRUE(values.IsNull(4));
   }
 
   // second segment
@@ -295,29 +373,18 @@ TEST(directory_reader_test, open) {
     ASSERT_EQ(4, sub->docs_count());
     ASSERT_EQ(4, sub->live_docs_count());
 
-    const auto* column = sub->column("name");
+    const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
-    auto values = column->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, values);
-    auto* actual_value = irs::get<irs::PayAttr>(*values);
-    ASSERT_NE(nullptr, actual_value);
+    irs::tests::BlobPointReader values{*sub, *column};
 
     // read documents
-    ASSERT_EQ(1, values->seek(1));
-    ASSERT_EQ("D", irs::ToString<std::string_view>(
-                     actual_value->value.data()));  // 'name' value in doc4
-    ASSERT_EQ(2, values->seek(2));
-    ASSERT_EQ("E", irs::ToString<std::string_view>(
-                     actual_value->value.data()));  // 'name' value in doc5
-    ASSERT_EQ(3, values->seek(3));
-    ASSERT_EQ("F", irs::ToString<std::string_view>(
-                     actual_value->value.data()));  // 'name' value in doc6
-    ASSERT_EQ(4, values->seek(4));
-    ASSERT_EQ("G", irs::ToString<std::string_view>(
-                     actual_value->value.data()));  // 'name' value in doc7
+    ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(values, 1));
+    ASSERT_EQ("E", irs::tests::ReadStoredStr<std::string_view>(values, 2));
+    ASSERT_EQ("F", irs::tests::ReadStoredStr<std::string_view>(values, 3));
+    ASSERT_EQ("G", irs::tests::ReadStoredStr<std::string_view>(values, 4));
 
     // read invalid document
-    ASSERT_TRUE(irs::doc_limits::eof(values->seek(5)));
+    ASSERT_TRUE(values.IsNull(5));
   }
 
   // third segment
@@ -328,23 +395,16 @@ TEST(directory_reader_test, open) {
     ASSERT_EQ(2, sub->docs_count());
     ASSERT_EQ(2, sub->live_docs_count());
 
-    const auto* column = sub->column("name");
+    const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
-    auto values = column->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, values);
-    auto* actual_value = irs::get<irs::PayAttr>(*values);
-    ASSERT_NE(nullptr, actual_value);
+    irs::tests::BlobPointReader values{*sub, *column};
 
     // read documents
-    ASSERT_EQ(1, values->seek(1));
-    ASSERT_EQ("H", irs::ToString<std::string_view>(
-                     actual_value->value.data()));  // 'name' value in doc8
-    ASSERT_EQ(2, values->seek(2));
-    ASSERT_EQ("I", irs::ToString<std::string_view>(
-                     actual_value->value.data()));  // 'name' value in doc9
+    ASSERT_EQ("H", irs::tests::ReadStoredStr<std::string_view>(values, 1));
+    ASSERT_EQ("I", irs::tests::ReadStoredStr<std::string_view>(values, 2));
 
     // read invalid document
-    ASSERT_TRUE(irs::doc_limits::eof(values->seek(3)));
+    ASSERT_TRUE(values.IsNull(3));
   }
 
   ++sub;
@@ -371,7 +431,6 @@ TEST(segment_reader_test, segment_reader_has) {
     reader->read(dir, meta);
 
     ASSERT_EQ(expected, meta);
-    ASSERT_FALSE(meta.column_store);
     ASSERT_FALSE(irs::HasRemovals(meta));
   }
 
@@ -382,7 +441,6 @@ TEST(segment_reader_test, segment_reader_has) {
     auto reader = codec->get_segment_meta_reader();
     irs::SegmentMeta expected;
 
-    expected.column_store = true;
     writer->write(dir, filename, expected);
 
     irs::SegmentMeta meta;
@@ -390,7 +448,6 @@ TEST(segment_reader_test, segment_reader_has) {
     reader->read(dir, meta, filename);
 
     ASSERT_EQ(expected, meta);
-    ASSERT_TRUE(meta.column_store);
     ASSERT_FALSE(irs::HasRemovals(meta));
   }
 
@@ -417,7 +474,6 @@ TEST(segment_reader_test, segment_reader_has) {
     reader->read(dir, meta, filename);
 
     ASSERT_EQ(expected, meta);
-    ASSERT_FALSE(meta.column_store);
     ASSERT_TRUE(irs::HasRemovals(meta));
   }
 
@@ -430,7 +486,6 @@ TEST(segment_reader_test, segment_reader_has) {
 
     expected.docs_count = 43;
     expected.live_docs_count = 42;
-    expected.column_store = true;
     expected.version = 1;
     expected.docs_mask = [&] {
       auto docs_mask =
@@ -444,7 +499,6 @@ TEST(segment_reader_test, segment_reader_has) {
     reader->read(dir, meta, filename);
 
     ASSERT_EQ(expected, meta);
-    ASSERT_TRUE(meta.column_store);
     ASSERT_TRUE(irs::HasRemovals(meta));
   }
 }
@@ -460,9 +514,12 @@ TEST(segment_reader_test, open_invalid_segment) {
     meta.codec = codec_ptr;
     meta.name = "invalid_segment_name";
 
-    ASSERT_THROW(
-      irs::SegmentReaderImpl::Open(dir, meta, irs::IndexReaderOptions{}),
-      irs::IoError);
+    auto rdr = irs::SegmentReaderImpl::Open(
+      dir, meta,
+      irs::IndexReaderOptions{.db =
+                                &::sdb::DuckDBEngine::Instance().instance()});
+    ASSERT_NE(nullptr, rdr);
+    ASSERT_EQ(0, rdr->docs_count());
   }
 }
 
@@ -481,20 +538,56 @@ TEST(segment_reader_test, open) {
   irs::DirectoryReader writer_snapshot;
   {
     // open writer
-    auto writer = irs::IndexWriter::Make(dir, codec_ptr, irs::kOmCreate);
+    auto writer = irs::IndexWriter::Make(dir, codec_ptr, irs::kOmCreate,
+                                         irs::tests::DefaultWriterOptions());
 
     // add first segment
-    ASSERT_TRUE(Insert(*writer, doc1->indexed.begin(), doc1->indexed.end(),
-                       doc1->stored.begin(), doc1->stored.end()));
-    ASSERT_TRUE(Insert(*writer, doc2->indexed.begin(), doc2->indexed.end(),
-                       doc2->stored.begin(), doc2->stored.end()));
-    ASSERT_TRUE(Insert(*writer, doc3->indexed.begin(), doc3->indexed.end(),
-                       doc3->stored.begin(), doc3->stored.end()));
-    ASSERT_TRUE(Insert(*writer, doc4->indexed.begin(), doc4->indexed.end(),
-                       doc4->stored.begin(), doc4->stored.end()));
-    ASSERT_TRUE(Insert(*writer, doc5->indexed.begin(), doc5->indexed.end(),
-                       doc5->stored.begin(), doc5->stored.end()));
-    writer->Commit();
+    {
+      auto ctx = writer->GetBatch();
+      {
+        auto d = ctx.Insert();
+        ASSERT_TRUE(d.Insert(doc1->indexed.begin(), doc1->indexed.end()));
+        StoreName()(d, *doc1);
+      }
+      ctx.Commit();
+    }
+    {
+      auto ctx = writer->GetBatch();
+      {
+        auto d = ctx.Insert();
+        ASSERT_TRUE(d.Insert(doc2->indexed.begin(), doc2->indexed.end()));
+        StoreName()(d, *doc2);
+      }
+      ctx.Commit();
+    }
+    {
+      auto ctx = writer->GetBatch();
+      {
+        auto d = ctx.Insert();
+        ASSERT_TRUE(d.Insert(doc3->indexed.begin(), doc3->indexed.end()));
+        StoreName()(d, *doc3);
+      }
+      ctx.Commit();
+    }
+    {
+      auto ctx = writer->GetBatch();
+      {
+        auto d = ctx.Insert();
+        ASSERT_TRUE(d.Insert(doc4->indexed.begin(), doc4->indexed.end()));
+        StoreName()(d, *doc4);
+      }
+      ctx.Commit();
+    }
+    {
+      auto ctx = writer->GetBatch();
+      {
+        auto d = ctx.Insert();
+        ASSERT_TRUE(d.Insert(doc5->indexed.begin(), doc5->indexed.end()));
+        StoreName()(d, *doc5);
+      }
+      ctx.Commit();
+    }
+    writer->RefreshCommit();
     writer_snapshot = writer->GetSnapshot();
   }
 
@@ -502,46 +595,31 @@ TEST(segment_reader_test, open) {
   {
     irs::SegmentMeta meta;
     meta.codec = codec_ptr;
-    meta.column_store = true;
     meta.docs_count = 5;
     meta.live_docs_count = 5;
     meta.name = "_1";
     meta.version = 42;
 
-    auto rdr =
-      irs::SegmentReaderImpl::Open(dir, meta, irs::IndexReaderOptions{});
+    auto rdr = irs::SegmentReaderImpl::Open(dir, meta,
+                                            irs::tests::DefaultReaderOptions());
     ASSERT_FALSE(!rdr);
     ASSERT_EQ(1, rdr->size());
     ASSERT_EQ(meta.docs_count, rdr->docs_count());
     ASSERT_EQ(meta.live_docs_count, rdr->live_docs_count());
 
     auto& segment = *rdr->begin();
-    const auto* column = segment.column("name");
+    const auto* column = segment.Column(kName);
     ASSERT_NE(nullptr, column);
-    auto values = column->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, values);
-    auto* actual_value = irs::get<irs::PayAttr>(*values);
-    ASSERT_NE(nullptr, actual_value);
+    irs::tests::BlobPointReader values{segment, *column};
 
     // read documents
-    ASSERT_EQ(1, values->seek(1));
-    ASSERT_EQ("A", irs::ToString<std::string_view>(
-                     actual_value->value.data()));  // 'name' value in doc1
-    ASSERT_EQ(2, values->seek(2));
-    ASSERT_EQ("B", irs::ToString<std::string_view>(
-                     actual_value->value.data()));  // 'name' value in doc2
-    ASSERT_EQ(3, values->seek(3));
-    ASSERT_EQ("C", irs::ToString<std::string_view>(
-                     actual_value->value.data()));  // 'name' value in doc3
-    ASSERT_EQ(4, values->seek(4));
-    ASSERT_EQ("D", irs::ToString<std::string_view>(
-                     actual_value->value.data()));  // 'name' value in doc4
-    ASSERT_EQ(5, values->seek(5));
-    ASSERT_EQ("E", irs::ToString<std::string_view>(
-                     actual_value->value.data()));  // 'name' value in doc5
+    ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(values, 1));
+    ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(values, 2));
+    ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(values, 3));
+    ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(values, 4));
+    ASSERT_EQ("E", irs::tests::ReadStoredStr<std::string_view>(values, 5));
 
-    ASSERT_TRUE(
-      irs::doc_limits::eof(values->seek(6)));  // read invalid document
+    ASSERT_TRUE(values.IsNull(6));  // read invalid document
 
     // check iterators
     {
@@ -552,22 +630,12 @@ TEST(segment_reader_test, open) {
       ASSERT_EQ(rdr->end(), it);
     }
 
-    // check field names
+    // check field ids
     {
-      auto it = rdr->fields();
-      ASSERT_TRUE(it->next());
-      ASSERT_EQ("duplicated", it->value().meta().name);
-      ASSERT_TRUE(it->next());
-      ASSERT_EQ("name", it->value().meta().name);
-      ASSERT_TRUE(it->next());
-      ASSERT_EQ("prefix", it->value().meta().name);
-      ASSERT_TRUE(it->next());
-      ASSERT_EQ("same", it->value().meta().name);
-      ASSERT_TRUE(it->next());
-      ASSERT_EQ("seq", it->value().meta().name);
-      ASSERT_TRUE(it->next());
-      ASSERT_EQ("value", it->value().meta().name);
-      ASSERT_FALSE(it->next());
+      auto ids = rdr->field_ids();
+      ASSERT_EQ(6, ids.size());
+      // Ids are sorted ascending; doc-generator assigns ids via the fixture,
+      // not by name. Without a real catalog we only check the count here.
     }
 
     // check live docs
@@ -590,22 +658,17 @@ TEST(segment_reader_test, open) {
     // check field metadata
     {
       {
-        auto it = rdr->fields();
-        size_t size = 0;
-        while (it->next()) {
-          ++size;
-        }
-        ASSERT_EQ(6, size);
+        ASSERT_EQ(6, rdr->field_ids().size());
       }
 
       // check field
       {
-        const std::string_view name = "name";
-        auto field = rdr->field(name);
-        ASSERT_EQ(name, field->meta().name);
+        constexpr irs::field_id id = kName;
+        auto field = rdr->field(id);
+        ASSERT_EQ(id, field->meta().id);
 
         // check terms
-        auto terms = rdr->field(name);
+        auto terms = rdr->field(id);
         ASSERT_NE(nullptr, terms);
 
         ASSERT_EQ(5, terms->size());
@@ -701,23 +764,23 @@ TEST(segment_reader_test, open) {
 
       // check field
       {
-        const std::string_view name = "seq";
-        auto field = rdr->field(name);
-        ASSERT_EQ(name, field->meta().name);
+        constexpr irs::field_id id = kSeq;  // "seq"
+        auto field = rdr->field(id);
+        ASSERT_EQ(id, field->meta().id);
 
         // check terms
-        auto terms = rdr->field(name);
+        auto terms = rdr->field(id);
         ASSERT_NE(nullptr, terms);
       }
 
       // check field
       {
-        const std::string_view name = "same";
-        auto field = rdr->field(name);
-        ASSERT_EQ(name, field->meta().name);
+        constexpr irs::field_id id = kSame;  // "same"
+        auto field = rdr->field(id);
+        ASSERT_EQ(id, field->meta().id);
 
         // check terms
-        auto terms = rdr->field(name);
+        auto terms = rdr->field(id);
         ASSERT_NE(nullptr, terms);
         ASSERT_EQ(1, terms->size());
         ASSERT_EQ(5, terms->docs_count());
@@ -757,12 +820,12 @@ TEST(segment_reader_test, open) {
 
       // check field
       {
-        const std::string_view name = "duplicated";
-        auto field = rdr->field(name);
-        ASSERT_EQ(name, field->meta().name);
+        constexpr irs::field_id id = kDuplicated;  // "duplicated"
+        auto field = rdr->field(id);
+        ASSERT_EQ(id, field->meta().id);
 
         // check terms
-        auto terms = rdr->field(name);
+        auto terms = rdr->field(id);
         ASSERT_NE(nullptr, terms);
         ASSERT_EQ(2, terms->size());
         ASSERT_EQ(4, terms->docs_count());
@@ -814,12 +877,12 @@ TEST(segment_reader_test, open) {
 
       // check field
       {
-        const std::string_view name = "prefix";
-        auto field = rdr->field(name);
-        ASSERT_EQ(name, field->meta().name);
+        constexpr irs::field_id id = kPrefix;  // "prefix"
+        auto field = rdr->field(id);
+        ASSERT_EQ(id, field->meta().id);
 
         // check terms
-        auto terms = rdr->field(name);
+        auto terms = rdr->field(id);
         ASSERT_NE(nullptr, terms);
         ASSERT_EQ(2, terms->size());
         ASSERT_EQ(2, terms->docs_count());
@@ -867,8 +930,7 @@ TEST(segment_reader_test, open) {
 
       // invalid field
       {
-        const std::string_view name = "invalid_field";
-        ASSERT_EQ(nullptr, rdr->field(name));
+        ASSERT_EQ(nullptr, rdr->field(static_cast<irs::field_id>(999)));
       }
     }
   }

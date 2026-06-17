@@ -2,9 +2,13 @@
 # Different ways to set config options, different scopes —
 # rollback/commit semantics.
 #
-# Covers: plain SET, SET SESSION, SET LOCAL, SET GLOBAL, set_config(),
+# Covers: plain SET, SET SESSION, SET LOCAL, set_config(),
 # across both built-in (search_path, default_transaction_read_only)
-# and extension (sdb_write_conflict_policy) options.
+# and extension (sdb_strict_ddl) options.
+#
+# SET GLOBAL lives in tests/sqllogic/recovery/settings_global_scope.test --
+# that harness runs each file against its own serened instance, so the
+# global mutation can't race with sibling parallel sessions.
 # ----------------------------------------------------------------------
 
 statement ok
@@ -181,34 +185,14 @@ some_schema
 
 
 # --- SET GLOBAL is not rolled back ---
-statement ok
-BEGIN;
+# Moved to tests/sqllogic/recovery/settings_global_scope.test so the global
+# state mutation runs against an isolated serened instance. Keeping it here
+# would race with sibling tests running in parallel against the shared
+# server, since SET GLOBAL leaks the value to other open sessions until the
+# explicit restore (see basic.test occasionally inheriting read-only state).
 
 
-skipif postgres # SET GLOBAL is not supported syntax in pg
-statement ok
-SET GLOBAL default_transaction_read_only TO true;
-
-
-statement ok
-ROLLBACK;
-
-
-# GLOBAL SET is not tracked for rollback
-onlyif serenedb
-query
-SHOW default_transaction_read_only;
-----
-default_transaction_read_only
-on
-
-
-skipif postgres # SET GLOBAL is not supported syntax in pg
-statement ok
-SET GLOBAL default_transaction_read_only TO false;
-
-
-# --- Extension option (sdb_write_conflict_policy) — plain + local, commit + rollback ---
+# --- Extension option (sdb_strict_ddl) — plain + local, commit + rollback ---
 onlyif serenedb
 statement ok
 BEGIN;
@@ -216,7 +200,7 @@ BEGIN;
 
 onlyif serenedb
 statement ok
-SET sdb_write_conflict_policy TO 'do_nothing';
+SET sdb_strict_ddl TO 'true';
 
 
 onlyif serenedb
@@ -226,10 +210,10 @@ ROLLBACK;
 
 onlyif serenedb
 query
-SHOW sdb_write_conflict_policy;
+SHOW sdb_strict_ddl;
 ----
-sdb_write_conflict_policy
-emit_error
+sdb_strict_ddl
+off
 
 
 onlyif serenedb
@@ -239,7 +223,7 @@ BEGIN;
 
 onlyif serenedb
 statement ok
-SET LOCAL sdb_write_conflict_policy TO 'do_nothing';
+SET LOCAL sdb_strict_ddl TO 'true';
 
 
 onlyif serenedb
@@ -250,10 +234,10 @@ COMMIT;
 # SET LOCAL on extension option reverts on commit too
 onlyif serenedb
 query
-SHOW sdb_write_conflict_policy;
+SHOW sdb_strict_ddl;
 ----
-sdb_write_conflict_policy
-emit_error
+sdb_strict_ddl
+off
 
 
 # ----------------------------------------------------------------------
@@ -495,12 +479,12 @@ BEGIN;
 
 onlyif serenedb
 statement ok
-SET sdb_write_conflict_policy TO 'do_nothing';
+SET sdb_strict_ddl TO 'true';
 
 
 onlyif serenedb
 statement ok
-SET sdb_write_conflict_policy TO 'replace';
+SET sdb_strict_ddl TO 'false';
 
 
 onlyif serenedb
@@ -510,10 +494,10 @@ ROLLBACK;
 
 onlyif serenedb
 query
-SHOW sdb_write_conflict_policy;
+SHOW sdb_strict_ddl;
 ----
-sdb_write_conflict_policy
-emit_error
+sdb_strict_ddl
+off
 
 
 # --- Extension option: plain SET + SET LOCAL, COMMIT keeps plain, reverts LOCAL ---
@@ -524,12 +508,12 @@ BEGIN;
 
 onlyif serenedb
 statement ok
-SET sdb_write_conflict_policy TO 'do_nothing';
+SET sdb_strict_ddl TO 'true';
 
 
 onlyif serenedb
 statement ok
-SET LOCAL sdb_write_conflict_policy TO 'replace';
+SET LOCAL sdb_strict_ddl TO 'false';
 
 
 onlyif serenedb
@@ -539,16 +523,16 @@ COMMIT;
 
 onlyif serenedb
 query
-SHOW sdb_write_conflict_policy;
+SHOW sdb_strict_ddl;
 ----
-sdb_write_conflict_policy
-do_nothing
+sdb_strict_ddl
+on
 
 
 # Restore default for isolation from subsequent tests
 onlyif serenedb
 statement ok
-SET sdb_write_conflict_policy TO 'emit_error';
+SET sdb_strict_ddl TO 'false';
 
 
 # --- No tracking outside an explicit transaction ---

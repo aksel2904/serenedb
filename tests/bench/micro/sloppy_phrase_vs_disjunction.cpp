@@ -19,19 +19,27 @@
 ////////////////////////////////////////////////////////////////////////////////
 
 // Microbenchmark: SlopPhrase (DP) vs functionally-equivalent disjunction
-// of fixed phrases, on europarl text.
+// of fixed phrases, on europarl text plus a synthetic skewed corpus.
 //
 // For two terms [t0, t1] with slop=N and expected step 1, the
 // equivalent disjunction is built by MakeDisjunctionEquivalent.
 //
-// Three measurement paths per (term pair, slop): Prepare, Execute,
-// ExecuteWithOffsets (slop only). Per-iteration matched doc count is
-// exposed via state.counters["docs"] so the slop and disjunction
-// variants can be cross-checked.
+// The slop-phrase Execute path is measured under three gather strategies
+// driven via the gGatherOverride seam (A3 - no production counter):
+//   _auto    : the production heuristic decides per document
+//   _seek    : force the seek-gather path on every document
+//   _readall : force the plain read-all path on every document
+// Comparing _seek vs _readall isolates the gather mechanism; _auto shows
+// what the heuristic actually picks; DisjunctionExec is the baseline.
 //
-// Dataset path comes from env SERENEDB_BENCH_EUROPARL, with a fallback
-// path relative to the current working directory. Aborts if the file
-// is missing.
+// Term pairs include balanced pairs (where the gate stays on read-all,
+// so _seek measures the no-skew regression) and one skewed real pair
+// "the commission" (slot0 frequent -> exercises the reviewer's "frequent
+// lead" case). A synthetic 60:1 corpus gives the mechanism's ceiling.
+//
+// Europarl dataset path comes from env SERENEDB_BENCH_EUROPARL, with a
+// fallback path relative to the current working directory. Aborts if the
+// file is missing.
 
 #include <benchmark/benchmark.h>
 #include <utf8.h>
@@ -50,6 +58,7 @@
 #include <iresearch/search/boolean_filter.hpp>
 #include <iresearch/search/phrase_filter.hpp>
 #include <iresearch/search/phrase_query.hpp>
+#include <iresearch/search/slop_phrase_dp.hpp>
 #include <iresearch/store/data_output.hpp>
 #include <iresearch/store/mmap_directory.hpp>
 #include <iresearch/utils/string.hpp>
@@ -276,6 +285,8 @@ class EuroparlReader {
 }  // namespace bench_sloppy
 namespace {
 
+namespace dp = irs::detail::slop_dp;
+
 constexpr std::string_view kEuroparlFallbackPath =
   "resources/tests/iresearch/europarl.subset.big.txt";
 
@@ -284,6 +295,30 @@ constexpr std::string_view kFieldName = "body_anl";
 constexpr std::string_view kFormatName = "1_5simd";
 
 constexpr int kRepetitions = 5;
+
+// Number of documents in the synthetic skewed corpus.
+constexpr size_t kSyntheticDocs = 400;
+
+// A3: drive the gather strategy explicitly so the benchmark can compare
+// the seek-gather and read-all paths over identical data. Production
+// never writes gGatherOverride; this is benchmark/test-only.
+struct GatherModeGuard {
+  explicit GatherModeGuard(dp::GatherOverride mode) noexcept {
+    dp::gGatherOverride = mode;
+  }
+  ~GatherModeGuard() { dp::gGatherOverride = dp::GatherOverride::kAuto; }
+};
+
+struct ModeReg {
+  const char* suffix;
+  dp::GatherOverride mode;
+};
+
+constexpr ModeReg kModes[] = {
+  {"_auto", dp::GatherOverride::kAuto},
+  {"_seek", dp::GatherOverride::kForceSeek},
+  {"_readall", dp::GatherOverride::kForceReadAll},
+};
 
 struct TermPair {
   std::string_view label;
@@ -295,6 +330,9 @@ constexpr TermPair kTermPairs[] = {
   {"european_union", "european", "union"},
   {"human_rights", "human", "rights"},
   {"climate_change", "climate", "change"},
+  // Skewed: slot0 "the" is dense, "commission" is sparse, so the gate
+  // engages and the DP would otherwise lead from the dense slot.
+  {"the_commission", "the", "commission"},
 };
 
 constexpr irs::PosAttr::value_t kSlopValues[] = {1, 2, 5};
@@ -309,6 +347,16 @@ struct Corpus {
 [[noreturn]] void Die(const char* msg) {
   std::fprintf(stderr, "sloppy_phrase_vs_disjunction bench: %s\n", msg);
   std::abort();
+}
+
+// Registers analyzers and formats exactly once across all corpora.
+void EnsureRegistered() {
+  static const bool once = [] {
+    irs::analysis::analyzers::Init();
+    irs::formats::Init();
+    return true;
+  }();
+  (void)once;
 }
 
 std::filesystem::path ResolveDataPath() {
@@ -334,8 +382,7 @@ Corpus BuildIndex() {
   std::filesystem::remove_all(tmp_root);
   std::filesystem::create_directories(tmp_root);
 
-  irs::analysis::analyzers::Init();
-  irs::formats::Init();
+  EnsureRegistered();
 
   auto format = irs::formats::Get(std::string{kFormatName});
   if (!format) {
@@ -381,8 +428,72 @@ Corpus BuildIndex() {
                 .reader = std::move(rdr)};
 }
 
+// Builds a synthetic corpus where every document is 30x "zzcmn", one
+// "zzrre", 30x "zzcmn" - a 60:1 in-document frequency skew with the
+// dense term as phrase slot0. This is the ceiling case for seek-gather.
+Corpus BuildSyntheticIndex() {
+  auto tmp_root =
+    std::filesystem::temp_directory_path() / "serenedb-bench-sloppy-synthetic";
+  std::filesystem::remove_all(tmp_root);
+  std::filesystem::create_directories(tmp_root);
+
+  EnsureRegistered();
+
+  auto format = irs::formats::Get(std::string{kFormatName});
+  if (!format) {
+    Die("format 1_5simd not registered");
+  }
+
+  auto dir = std::make_unique<irs::MMapDirectory>(tmp_root);
+
+  auto writer = irs::IndexWriter::Make(*dir, format, irs::kOmCreate,
+                                       irs::IndexWriterOptions{});
+  if (!writer) {
+    Die("IndexWriter::Make returned null");
+  }
+
+  std::string body;
+  body.reserve(512);
+  for (int i = 0; i < 30; ++i) {
+    body += "zzcmn ";
+  }
+  body += "zzrre ";
+  for (int i = 0; i < 30; ++i) {
+    body += "zzcmn ";
+  }
+
+  bench_sloppy::EuroparlBodyTemplate tpl;
+  for (size_t d = 0; d < kSyntheticDocs; ++d) {
+    tpl.SetColumn(2, body);
+    auto trx = writer->GetBatch();
+    auto inserter = trx.Insert();
+    const auto& doc = tpl.Get();
+    if (!inserter.Insert<irs::Action::INDEX>(doc.indexed.begin(),
+                                             doc.indexed.end())) {
+      Die("synthetic Insert returned false");
+    }
+  }
+  writer->Commit();
+
+  std::fprintf(stderr,
+               "sloppy_phrase_vs_disjunction bench: indexed %zu synthetic "
+               "documents (60:1 skew)\n",
+               kSyntheticDocs);
+
+  auto rdr = irs::DirectoryReader{*dir, format};
+  return Corpus{.dir_path = std::move(tmp_root),
+                .dir = std::move(dir),
+                .format = std::move(format),
+                .reader = std::move(rdr)};
+}
+
 const Corpus& GetCorpus() {
   static const Corpus corpus = BuildIndex();
+  return corpus;
+}
+
+const Corpus& GetSyntheticCorpus() {
+  static const Corpus corpus = BuildSyntheticIndex();
   return corpus;
 }
 
@@ -471,8 +582,11 @@ void BenchPrepare(benchmark::State& state, const irs::DirectoryReader& rdr,
 }
 
 template<typename MakeFn>
-void BenchExecuteOnly(benchmark::State& state, const irs::DirectoryReader& rdr,
-                      MakeFn make) {
+[[gnu::noinline]] void BenchExecuteOnly(
+  benchmark::State& state, const irs::DirectoryReader& rdr, MakeFn make,
+  dp::GatherOverride mode = dp::GatherOverride::kAuto) {
+  GatherModeGuard guard{mode};
+
   auto q = make();
   auto prepared = q.prepare({.index = rdr});
   if (!prepared) {
@@ -545,6 +659,34 @@ void BenchExecuteWithOffsets(benchmark::State& state,
   state.counters["matches"] = static_cast<double>(matches_per_iter);
 }
 
+// Registers the slop Execute benchmark under all three gather modes plus
+// the disjunction baseline for one (corpus, term pair, slop).
+void RegisterExecVariants(const std::string& suffix, std::string_view t0,
+                          std::string_view t1, irs::PosAttr::value_t slop,
+                          const Corpus& (*corpus)()) {
+  for (const auto& m : kModes) {
+    benchmark::RegisterBenchmark(
+      ("SlopPhraseExec" + suffix + m.suffix).c_str(),
+      [t0, t1, slop, mode = m.mode, corpus](benchmark::State& state) {
+        BenchExecuteOnly(
+          state, corpus().reader,
+          [t0, t1, slop] { return MakeSlopPhrase(t0, t1, slop); }, mode);
+      })
+      ->Repetitions(kRepetitions)
+      ->ReportAggregatesOnly(true);
+  }
+
+  benchmark::RegisterBenchmark(
+    ("DisjunctionExec" + suffix).c_str(),
+    [t0, t1, slop, corpus](benchmark::State& state) {
+      BenchExecuteOnly(state, corpus().reader, [t0, t1, slop] {
+        return MakeDisjunctionEquivalent(t0, t1, slop);
+      });
+    })
+    ->Repetitions(kRepetitions)
+    ->ReportAggregatesOnly(true);
+}
+
 void RegisterAll() {
   for (const auto& pair : kTermPairs) {
     for (auto slop : kSlopValues) {
@@ -561,15 +703,7 @@ void RegisterAll() {
         ->Repetitions(kRepetitions)
         ->ReportAggregatesOnly(true);
 
-      benchmark::RegisterBenchmark(
-        ("SlopPhraseExec" + suffix).c_str(),
-        [t0 = pair.term0, t1 = pair.term1, slop](benchmark::State& state) {
-          BenchExecuteOnly(state, GetCorpus().reader, [t0, t1, slop] {
-            return MakeSlopPhrase(t0, t1, slop);
-          });
-        })
-        ->Repetitions(kRepetitions)
-        ->ReportAggregatesOnly(true);
+      RegisterExecVariants(suffix, pair.term0, pair.term1, slop, &GetCorpus);
 
       benchmark::RegisterBenchmark(
         ("SlopPhraseExecOffs" + suffix).c_str(),
@@ -588,17 +722,14 @@ void RegisterAll() {
         })
         ->Repetitions(kRepetitions)
         ->ReportAggregatesOnly(true);
-
-      benchmark::RegisterBenchmark(
-        ("DisjunctionExec" + suffix).c_str(),
-        [t0 = pair.term0, t1 = pair.term1, slop](benchmark::State& state) {
-          BenchExecuteOnly(state, GetCorpus().reader, [t0, t1, slop] {
-            return MakeDisjunctionEquivalent(t0, t1, slop);
-          });
-        })
-        ->Repetitions(kRepetitions)
-        ->ReportAggregatesOnly(true);
     }
+  }
+
+  // Synthetic 60:1 skew corpus: ceiling case for the seek-gather win.
+  for (auto slop : kSlopValues) {
+    const std::string suffix =
+      "_synthetic_slop" + std::to_string(static_cast<unsigned>(slop));
+    RegisterExecVariants(suffix, "zzcmn", "zzrre", slop, &GetSyntheticCorpus);
   }
 }
 

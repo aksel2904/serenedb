@@ -27,7 +27,6 @@
 
 #include "basics/containers/flat_hash_map.h"
 #include "basics/containers/node_hash_map.h"
-#include "basics/memory_types.h"
 #include "basics/message_buffer.h"
 #include "catalog/database.h"
 #include "general_server/asio_socket.h"
@@ -54,14 +53,6 @@ enum class State : uint8_t {
   Processing,
   // Error recovery. Skipping to next Sync packet
   ErrorRecovery,
-};
-
-inline constexpr std::string_view kZero{"", 1};
-
-inline constexpr std::string_view kAnonymObject{""};
-
-inline constexpr std::array<char, 5> kCopyDone{
-  'c', 0x00, 0x00, 0x00, 0x04,
 };
 
 using BufferView = std::string_view;
@@ -118,6 +109,9 @@ class PgSQLCommTaskBase : public rest::CommTask {
 
   void SendParameterStatus(std::string_view name, std::string_view value);
 
+  char TransactionStatusIndicator() const noexcept;
+  void SendReadyForQuery();
+
   void SendNotices();
   void SendError(const duckdb::ErrorData& error);
   void SendError(std::string_view message, int errcode);
@@ -151,7 +145,6 @@ class PgSQLCommTaskBase : public rest::CommTask {
   duckdb::unique_ptr<duckdb::PendingQueryResult> PendingQueryEnsured(
     duckdb::PreparedStatement& prepared, duckdb::vector<duckdb::Value>& values,
     bool allow_stream_result);
-
   DuckDBPortal BindStatement(DuckDBStatement& stmt, DuckDBBindInfo bind_info);
   void BuildColumnSerializers(DuckDBPortal& portal);
   void DeallocateNamedStatement(std::string_view name);

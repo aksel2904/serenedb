@@ -21,18 +21,22 @@
 #include "pg/pg_catalog/pg_class.h"
 
 #include <deque>
+#include <duckdb/catalog/catalog.hpp>
+#include <duckdb/catalog/catalog_entry/table_catalog_entry.hpp>
+#include <duckdb/catalog/entry_lookup_info.hpp>
+#include <duckdb/storage/data_table.hpp>
 #include <string>
 
 #include "app/app_server.h"
 #include "basics/assert.h"
 #include "catalog/catalog.h"
 #include "catalog/identifiers/object_id.h"
-#include "catalog/local_catalog.h"
+#include "catalog/sequence.h"
+#include "catalog/store/store.h"
 #include "catalog/user_type.h"
 #include "catalog/view.h"
 #include "pg/pg_catalog/fwd.h"
 #include "pg/system_catalog.h"
-#include "rest_server/serened.h"
 
 namespace sdb::pg {
 namespace {
@@ -74,18 +78,14 @@ constexpr uint64_t kNullMask = MaskFromNonNulls({
 
 }  // namespace
 
-PgClass MakeBaseRow(ObjectId schema_id, const catalog::SchemaObject& object) {
-  auto owner = object.GetOwnerId();
-  if (!owner) {
-    owner = id::kRootUser;
-  }
+PgClass MakeBaseRow(ObjectId schema_id, const catalog::Object& object) {
   return {
     .oid = object.GetId().id(),
     .relname = object.GetName(),
     .relnamespace = schema_id.id(),
     .reltype = 0,
     .reloftype = 0,
-    .relowner = owner.id(),
+    .relowner = id::kRootUser.id(),
     .relam = 0,
     .relfilenode = 0,
     .reltablespace = 0,
@@ -116,7 +116,33 @@ PgClass MakeBaseRow(ObjectId schema_id, const catalog::SchemaObject& object) {
 
 void RetrieveObjects(ObjectId database_id, std::vector<PgClass>& values,
                      std::deque<std::string>& pk_index_names,
-                     const catalog::Snapshot& catalog) {
+                     const catalog::Snapshot& catalog,
+                     duckdb::ClientContext& context) {
+  // reltuples is read from the store table's row-group metadata
+  // (DataTable::GetTotalRows), never a count(*) query: pg_catalog must not scan
+  // data.
+  auto count_store_rows = [&](const catalog::Table& table,
+                              std::string_view db_name,
+                              std::string_view schema_name) -> float {
+    if (table.GetEngine() != catalog::TableEngine::Transactional ||
+        table.Tombstoned()) {
+      return 0.0F;
+    }
+    auto store_name =
+      catalog::StoreTableName(db_name, schema_name, table.GetName());
+    duckdb::EntryLookupInfo lookup(duckdb::CatalogType::TABLE_ENTRY,
+                                   store_name);
+    auto entry = duckdb::Catalog::GetEntry(
+      context, std::string{catalog::kStoreDatabaseName}, "main", lookup,
+      duckdb::OnEntryNotFound::RETURN_NULL);
+    if (!entry) {
+      return 0.0F;
+    }
+    return static_cast<float>(
+      entry->Cast<duckdb::TableCatalogEntry>().GetStorage().GetTotalRows());
+  };
+  auto database = catalog.GetDatabase(database_id);
+  SDB_ASSERT(database);
   for (const auto& schema : catalog.GetSchemas(database_id)) {
     const auto schema_id = schema->GetId();
 
@@ -127,9 +153,8 @@ void RetrieveObjects(ObjectId database_id, std::vector<PgClass>& values,
       row.relnatts = static_cast<int16_t>(table->Columns().size());
       row.relchecks = static_cast<int16_t>(table->CheckConstraints().size());
       row.relhasindex = catalog.HasIndexes(table->GetId());
-      auto shard = catalog.GetTableShard(table->GetId());
-      SDB_ASSERT(shard);
-      row.reltuples = static_cast<float>(shard->GetTableStats().num_rows);
+      row.reltuples =
+        count_store_rows(*table, database->GetName(), schema->GetName());
       values.push_back(std::move(row));
     }
 
@@ -144,6 +169,13 @@ void RetrieveObjects(ObjectId database_id, std::vector<PgClass>& values,
       auto row = MakeBaseRow(schema_id, *index);
       row.relkind = PgClass::Relkind::Index;
       row.relnatts = static_cast<int16_t>(index->GetColumnIds().size());
+      values.push_back(std::move(row));
+    }
+
+    for (const auto& sequence :
+         catalog.GetSequences(database_id, schema->GetName())) {
+      auto row = MakeBaseRow(schema_id, *sequence);
+      row.relkind = PgClass::Relkind::Sequence;
       values.push_back(std::move(row));
     }
 
@@ -170,10 +202,6 @@ void RetrieveObjects(ObjectId database_id, std::vector<PgClass>& values,
       if (table->PKColumns().empty()) {
         continue;
       }
-      auto owner = table->GetOwnerId();
-      if (!owner) {
-        owner = id::kRootUser;
-      }
       pk_index_names.push_back(std::string{table->GetName()} + "_pkey");
       PgClass row{
         .oid = PkIndexOid(table->GetId().id()),
@@ -181,7 +209,7 @@ void RetrieveObjects(ObjectId database_id, std::vector<PgClass>& values,
         .relnamespace = schema_id.id(),
         .reltype = 0,
         .reloftype = 0,
-        .relowner = owner.id(),
+        .relowner = id::kRootUser.id(),
         .relam = 0,
         .relfilenode = 0,
         .reltablespace = 0,
@@ -218,7 +246,8 @@ catalog::MaterializedData SystemTableSnapshot<PgClass>::GetTableData() {
   std::vector<PgClass> values;
   std::deque<std::string> pk_index_names;
   auto catalog = _config.EnsureCatalogSnapshot();
-  RetrieveObjects(GetDatabaseId(), values, pk_index_names, *catalog);
+  RetrieveObjects(GetDatabaseId(), values, pk_index_names, *catalog,
+                  _config.GetClientContext());
 
   {
     VisitSystemTables([&](const catalog::VirtualTable& table, Oid schema_oid) {
