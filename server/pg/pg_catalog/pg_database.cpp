@@ -24,7 +24,6 @@
 #include "catalog/catalog.h"
 #include "catalog/database.h"
 #include "pg/pg_catalog/fwd.h"
-#include "rest_server/serened.h"
 
 namespace sdb::pg {
 namespace {
@@ -47,7 +46,7 @@ catalog::MaterializedData SystemTableSnapshot<PgDatabase>::GetTableData() {
     PgDatabase row{
       .oid = db->GetId().id(),
       .datname = db->GetName(),
-      .datdba = db->GetOwnerId().id(),
+      .datdba = db->GetParentId().id(),
       .encoding = 6,  // UTF8
       .datlocprovider = PgDatabase::Datlocprovider::Libc,
       .datistemplate = false,
@@ -57,8 +56,8 @@ catalog::MaterializedData SystemTableSnapshot<PgDatabase>::GetTableData() {
       .datfrozenxid = 0,
       .datminmxid = 0,
       .dattablespace = 0,
-      .datcollate = "en_US.UTF-8",
-      .datctype = "en_US.UTF-8",
+      .datcollate = "C.UTF-8",
+      .datctype = "C.UTF-8",
     };
     values.push_back(std::move(row));
   }

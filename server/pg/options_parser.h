@@ -24,6 +24,7 @@
 #include <absl/strings/internal/damerau_levenshtein_distance.h>
 #include <absl/strings/str_cat.h>
 #include <absl/strings/str_join.h>
+#include <absl/strings/str_split.h>
 
 #include <algorithm>
 #include <duckdb/common/named_parameter_map.hpp>
@@ -45,24 +46,75 @@ using Options = containers::NodeHashMap<std::string, OptionEntry>;
 struct OptionsContext {
   std::string_view operation;
   std::function<void(std::string)> notice;
+  // Appended to "unrecognized option" errors. Empty in scalar-function
+  // contexts where the WITH-syntax suggestion would be misleading.
+  std::string_view help_hint;
 };
 
 class OptionsParser {
  public:
-  OptionsParser(const duckdb::named_parameter_map_t& options,
-                const OptionGroup& option_group, OptionsContext context)
+  static Options MakeOptions(std::string_view text) {
+    Options out;
+    for (std::string_view entry :
+         absl::StrSplit(text, ',', absl::SkipWhitespace())) {
+      auto kv = absl::StrSplit(entry, absl::MaxSplits('=', 1));
+      auto it = kv.begin();
+      auto key_raw = absl::StripAsciiWhitespace(*it++);
+      if (it == kv.end()) {
+        THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
+                        ERR_MSG("option \"", key_raw, "\" has no value"),
+                        ERR_HINT("Use Key=Value syntax."));
+      }
+      auto value_raw = absl::StripAsciiWhitespace(*it);
+      if (value_raw.size() >= 2 &&
+          ((value_raw.front() == '"' && value_raw.back() == '"') ||
+           (value_raw.front() == '\'' && value_raw.back() == '\''))) {
+        value_raw = value_raw.substr(1, value_raw.size() - 2);
+      }
+      auto [_, inserted] = out.try_emplace(
+        absl::AsciiStrToLower(key_raw),
+        std::make_unique<duckdb::Value>(std::string{value_raw}));
+      if (!inserted) {
+        THROW_SQL_ERROR(ERR_CODE(ERRCODE_SYNTAX_ERROR),
+                        ERR_MSG("conflicting or redundant options"));
+      }
+    }
+    return out;
+  }
+
+  OptionsParser(Options options, const OptionGroup& option_group,
+                OptionsContext context)
     : _operation{context.operation},
+      _help_hint{context.help_hint},
       _notice{std::move(context.notice)},
+      _options{std::move(options)},
       _option_group{option_group} {
-    MakeOptions(options);
     HandleHelp();
+  }
+
+  OptionsParser(duckdb::named_parameter_map_t named_params,
+                const OptionGroup& option_group, OptionsContext context)
+    : OptionsParser{ConvertMap(std::move(named_params)), option_group,
+                    std::move(context)} {}
+
+ private:
+  static Options ConvertMap(duckdb::named_parameter_map_t named_params) {
+    Options out;
+    out.reserve(named_params.size());
+    for (auto&& [name, value] : named_params) {
+      auto [_, inserted] = out.try_emplace(
+        name, std::make_unique<duckdb::Value>(std::move(value)));
+      if (!inserted) {
+        THROW_SQL_ERROR(ERR_CODE(ERRCODE_SYNTAX_ERROR),
+                        ERR_MSG("conflicting or redundant options"));
+      }
+    }
+    return out;
   }
 
  protected:
   template<const OptionInfo& Info, typename T = OptionInfo::CppType<Info.type>>
   T EraseOptionOrDefault(std::string_view prefix = "") {
-    static_assert(Info.type != OptionInfo::Type::Enum,
-                  "Use EnumOptionInfo overload for enum options");
     constexpr bool kIsBool = Info.type == OptionInfo::Type::Boolean;
     constexpr bool kIsString = Info.type == OptionInfo::Type::String;
     if (const auto option = EraseOption(Info, !kIsBool, prefix)) {
@@ -79,13 +131,13 @@ class OptionsParser {
       }
       if constexpr (!std::holds_alternative<std::monostate>(Info.constraint)) {
         if constexpr (kIsString) {
-          // ConstraintFunction stores void(*)(string_view); string converts
-          // implicitly.
-          std::get<void (*)(std::string_view)>(Info.constraint)(
-            std::string_view{*value});
+          std::get<void (*)(std::string_view, std::string_view)>(
+            Info.constraint)(Info.name, std::string_view{*value});
         } else {
-          SDB_ASSERT(std::holds_alternative<void (*)(T)>(Info.constraint));
-          std::get<void (*)(T)>(Info.constraint)(*value);
+          SDB_ASSERT((std::holds_alternative<void (*)(std::string_view, T)>(
+            Info.constraint)));
+          std::get<void (*)(std::string_view, T)>(Info.constraint)(Info.name,
+                                                                   *value);
         }
       }
       return *value;
@@ -95,48 +147,6 @@ class OptionsParser {
         ERR_MSG("required parameter \"", Info.name, "\" was not found"));
     }
     return Info.GetDefaultValue<T>();
-  }
-
-  template<const auto& Info>
-    requires std::is_enum_v<
-      typename std::remove_cvref_t<decltype(Info)>::enum_type>
-  auto EraseOptionOrDefault(std::string_view prefix = "") {
-    using E = typename std::remove_cvref_t<decltype(Info)>::enum_type;
-
-    auto make_hint = [&] {
-      return absl::StrCat(
-        "Allowed values: ",
-        absl::StrJoin(Info.base.enum_values, ", ",
-                      [](std::string* out, std::string_view v) {
-                        absl::StrAppend(out, absl::AsciiStrToUpper(v));
-                      }));
-    };
-
-    if (const auto option = EraseOption(Info.base, true, prefix)) {
-      auto raw = TryExtract<std::string>(*option);
-      if (!raw) {
-        THROW_SQL_ERROR(
-          ERR_CODE(ERRCODE_SYNTAX_ERROR),
-          ERR_MSG(Info.base.ErrorMessage(_operation, option->ToString())),
-          ERR_HINT(make_hint()));
-      }
-      auto result =
-        magic_enum::enum_cast<E>(*raw, magic_enum::case_insensitive);
-      if (!result) {
-        THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
-                        ERR_MSG(Info.base.ErrorMessage(_operation, *raw)),
-                        ERR_HINT(make_hint()));
-      }
-      return *result;
-    }
-
-    if (Info.base.IsRequired()) {
-      THROW_SQL_ERROR(
-        ERR_CODE(ERRCODE_SYNTAX_ERROR),
-        ERR_MSG("required parameter \"", Info.base.name, "\" was not found"));
-    }
-
-    return Info.base.template GetDefaultValue<E>();
   }
 
   // requires_parameter == presence flag like ... WITH (FLAG)
@@ -256,16 +266,16 @@ class OptionsParser {
         THROW_SQL_ERROR(
           ERR_CODE(ERRCODE_SYNTAX_ERROR),
           ERR_MSG("option \"", name, "\" is not applicable in this context"),
-          ERR_HINT("Use WITH (HELP) to see available options"));
+          ERR_HINT(_help_hint));
       }
       auto hint = FindClosestOption(known_names, name);
       auto msg =
         hint.empty()
-          ? absl::StrCat("option \"", name, "\" not recognized")
-          : absl::StrCat("option \"", name,
+          ? absl::StrCat(_operation, ": option \"", name, "\" not recognized")
+          : absl::StrCat(_operation, ": option \"", name,
                          "\" not recognized, did you mean \"", hint, "\"?");
       THROW_SQL_ERROR(ERR_CODE(ERRCODE_SYNTAX_ERROR), ERR_MSG(msg),
-                      ERR_HINT("Use WITH (HELP) to see available options"));
+                      ERR_HINT(_help_hint));
     }
   }
 
@@ -298,6 +308,7 @@ class OptionsParser {
   }
 
   std::string _operation;
+  std::string _help_hint;
   std::function<void(std::string)> _notice;
   Options _options;
   const OptionGroup& _option_group;

@@ -33,32 +33,33 @@
 
 #include "app/app_server.h"
 #include "basics/assert.h"
-#include "search/inverted_index_shard.h"
+#include "search/inverted_index_storage.h"
 #include "storage_engine/search_engine.h"
 
 namespace sdb::search {
 
 template<typename T>
-concept IndexTaskType = requires(
-  const T& task, std::shared_ptr<InvertedIndexShard>&& inverted_index_shard) {
-  { T::ThreadGroup() } -> std::same_as<ThreadGroup>;
-  { T::TaskName() } -> std::same_as<std::string_view>;
-  {
-    task.GetContinuos(std::move(inverted_index_shard))
-  } -> std::same_as<T>;  // span continuous tasks
-};
+concept IndexTaskType =
+  requires(const T& task,
+           std::shared_ptr<InvertedIndexStorage>&& inverted_index_storage) {
+    { T::ThreadGroup() } -> std::same_as<ThreadGroup>;
+    { T::TaskName() } -> std::same_as<std::string_view>;
+    {
+      task.GetContinuos(std::move(inverted_index_storage))
+    } -> std::same_as<T>;  // span continuous tasks
+  };
 
 class Task {
  public:
-  Task(const std::shared_ptr<InvertedIndexShard>& inverted_index_shard)
-    : _id{inverted_index_shard->GetId()},
-      _inverted_index_shard{inverted_index_shard},
-      _state{inverted_index_shard->GetState()},
+  Task(const std::shared_ptr<InvertedIndexStorage>& inverted_index_storage)
+    : _id{inverted_index_storage->GetId()},
+      _inverted_index_storage{inverted_index_storage},
+      _state{inverted_index_storage->GetState()},
       _engine{&GetSearchEngine()} {}
 
   template<IndexTaskType Self>
   yaclib::Future<> Schedule(this Self&& self, absl::Duration delay = {}) {
-    SDB_TRACE("xxxxx", Logger::SEARCH, "Scheduling task: ", Self::TaskName());
+    SDB_TRACE(SEARCH, "Scheduling task: ", Self::TaskName());
     auto [future, promise] = yaclib::MakeContract();
     self._promise = std::move(promise);
     self._engine->Queue(Self::ThreadGroup(), delay, std::move(self));
@@ -68,74 +69,75 @@ class Task {
   template<IndexTaskType Self>
   void ScheduleContinue(
     this const Self& self,
-    std::shared_ptr<InvertedIndexShard>&& inverted_index_shard,
+    std::shared_ptr<InvertedIndexStorage>&& inverted_index_storage,
     absl::Duration delay = {}) {
-    SDB_TRACE("xxxxx", Logger::SEARCH, "Scheduling task: ", Self::TaskName());
-    self.GetContinuos(std::move(inverted_index_shard)).Schedule(delay).Detach();
+    SDB_TRACE(SEARCH, "Scheduling task: ", Self::TaskName());
+    self.GetContinuos(std::move(inverted_index_storage))
+      .Schedule(delay)
+      .Detach();
   }
 
  protected:
   ObjectId _id;
-  std::weak_ptr<InvertedIndexShard> _inverted_index_shard;
+  std::weak_ptr<InvertedIndexStorage> _inverted_index_storage;
   std::shared_ptr<ThreadPoolState> _state;
   yaclib::Promise<> _promise;
   SearchEngine* _engine;
 };
 
-class CommitTask : public Task {
+class RefreshTask : public Task {
  public:
   static constexpr ThreadGroup ThreadGroup() noexcept {
-    return ThreadGroup::Commit;
+    return ThreadGroup::Refresh;
   }
-  static constexpr std::string_view TaskName() noexcept { return "Commit"; }
-  CommitTask(const std::shared_ptr<InvertedIndexShard>& inverted_index_shard,
-             bool wait)
-    : Task{inverted_index_shard}, _wait{wait} {}
+  static constexpr std::string_view TaskName() noexcept { return "Refresh"; }
+  RefreshTask(
+    const std::shared_ptr<InvertedIndexStorage>& inverted_index_storage,
+    bool wait)
+    : Task{inverted_index_storage}, _wait{wait} {}
 
-  CommitTask GetContinuos(
-    std::shared_ptr<InvertedIndexShard>&& inverted_index_shard) const {
+  RefreshTask GetContinuos(
+    std::shared_ptr<InvertedIndexStorage>&& inverted_index_storage) const {
     // continue is always no-wait as we rescheduling next background commit
-    SDB_ASSERT(inverted_index_shard);
-    return CommitTask(inverted_index_shard, false);
+    SDB_ASSERT(inverted_index_storage);
+    return RefreshTask(inverted_index_storage, false);
   }
 
   void operator()();
   void Finalize(
-    std::shared_ptr<search::InvertedIndexShard> inverted_index_shard,
-    CommitResult res);
+    std::shared_ptr<search::InvertedIndexStorage> inverted_index_storage,
+    RefreshResult res);
 
  private:
-  absl::Duration _commit_interval_msec;
-  absl::Duration _consolidation_interval_msec;
-  size_t _cleanup_interval_step;
-  size_t _cleanup_interval_count;
+  absl::Duration _refresh_interval_msec{};
+  absl::Duration _compaction_interval_msec{};
+  size_t _cleanup_interval_step{0};
+  size_t _cleanup_interval_count{0};
   bool _wait;
 };
 
-class ConsolidationTask : public Task {
+class CompactionTask : public Task {
  public:
   static constexpr ThreadGroup ThreadGroup() noexcept {
-    return ThreadGroup::Consolidation;
+    return ThreadGroup::Compaction;
   }
-  static constexpr std::string_view TaskName() noexcept {
-    return "Consolidate";
-  }
-  ConsolidationTask(
-    const std::shared_ptr<InvertedIndexShard>& inverted_index_shard,
+  static constexpr std::string_view TaskName() noexcept { return "Compact"; }
+  CompactionTask(
+    const std::shared_ptr<InvertedIndexStorage>& inverted_index_storage,
     std::function<bool()> flush_progress)
-    : Task{inverted_index_shard}, _progress{std::move(flush_progress)} {}
+    : Task{inverted_index_storage}, _progress{std::move(flush_progress)} {}
 
   void operator()();
-  ConsolidationTask GetContinuos(
-    std::shared_ptr<InvertedIndexShard>&& inverted_index_shard) const {
-    SDB_ASSERT(inverted_index_shard);
-    return ConsolidationTask(inverted_index_shard, _progress);
+  CompactionTask GetContinuos(
+    std::shared_ptr<InvertedIndexStorage>&& inverted_index_storage) const {
+    SDB_ASSERT(inverted_index_storage);
+    return CompactionTask(inverted_index_storage, _progress);
   }
 
  private:
   irs::MergeWriter::FlushProgress _progress;
-  irs::ConsolidationPolicy _consolidation_policy;
-  absl::Duration _consolidation_interval_msec;
+  irs::CompactionPolicy _compaction_policy;
+  absl::Duration _compaction_interval_msec;
 };
 
 }  // namespace sdb::search

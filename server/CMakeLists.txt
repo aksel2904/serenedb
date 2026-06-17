@@ -8,7 +8,7 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/")
 
 add_executable(serened rest_server/serened.cpp ${ProductVersionFiles})
 
-target_link_libraries(serened sereneserver)
+target_link_libraries(serened sereneserver duckdb_shell_static)
 
 ################################################################################
 ## installation
@@ -35,13 +35,8 @@ target_link_libraries(
         serene_connector
         # TODO
         date_interface
-        rocksdb_interface
-        fuerte
         llhttp
         nghttp2::nghttp2
-        vpack
-        rocksdb
-        fuerte
         duckdb_static
         Folly::folly
 )
@@ -55,13 +50,9 @@ add_subdirectory(catalog)
 add_subdirectory(connector)
 add_subdirectory(database)
 add_subdirectory(general_server)
-add_subdirectory(metrics)
-add_subdirectory(network)
 add_subdirectory(pg)
 add_subdirectory(query)
 add_subdirectory(rest_server)
-add_subdirectory(statistics)
 add_subdirectory(storage_engine)
-add_subdirectory(rocksdb_engine_catalog)
 add_subdirectory(utils)
 add_subdirectory(search)

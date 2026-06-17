@@ -44,13 +44,9 @@
 #include "pg/sql_utils.h"
 
 namespace sdb::pg {
-namespace detail {
 
-template<typename E>
-  requires std::is_enum_v<E>
-inline constexpr auto kEnumNames = magic_enum::enum_names<E>();
-
-}  // namespace detail
+void CheckPositiveInt(std::string_view name, int value);
+void CheckNonNegativeInt(std::string_view name, int value);
 
 struct OptionInfo {
   enum class Type : uint8_t {
@@ -59,7 +55,6 @@ struct OptionInfo {
     Integer,
     Double,
     Character,
-    Enum
   };
 
   template<typename T>
@@ -77,8 +72,6 @@ struct OptionInfo {
       return Type::Double;
     } else if constexpr (std::is_same_v<T, char>) {
       return Type::Character;
-    } else if constexpr (std::is_enum_v<T>) {
-      return Type::Enum;
     } else {
       static_assert(false);
     }
@@ -92,9 +85,11 @@ struct OptionInfo {
 
   using DefaultValue =
     std::variant<std::monostate, std::string_view, bool, int, double, char>;
-  using ConstraintFunction =
-    std::variant<std::monostate, void (*)(std::string_view), void (*)(bool),
-                 void (*)(int), void (*)(double), void (*)(char)>;
+
+  using ConstraintFunction = std::variant<
+    std::monostate, void (*)(std::string_view, std::string_view),
+    void (*)(std::string_view, bool), void (*)(std::string_view, int),
+    void (*)(std::string_view, double), void (*)(std::string_view, char)>;
 
   bool operator==(std::string_view option_name) const {
     return name == option_name;
@@ -108,12 +103,10 @@ struct OptionInfo {
 
   ConstraintFunction constraint = std::monostate{};
 
-  std::span<const std::string_view> enum_values;
-
   template<typename T>
   consteval OptionInfo(std::string_view name, RequiredTag<T>,
                        std::string_view desc,
-                       void (*constraint_fn)(T) = nullptr)
+                       void (*constraint_fn)(std::string_view, T) = nullptr)
     : name{name}, type{GetType<T>()}, description{desc} {
     if (constraint_fn) {
       constraint = constraint_fn;
@@ -123,7 +116,7 @@ struct OptionInfo {
   template<typename T>
   consteval OptionInfo(std::string_view name, T default_value,
                        std::string_view desc,
-                       void (*constraint_fn)(T) = nullptr)
+                       void (*constraint_fn)(std::string_view, T) = nullptr)
     : name{name},
       type{GetType<T>()},
       description{desc},
@@ -145,13 +138,6 @@ struct OptionInfo {
       // to string.
       SDB_ASSERT(std::holds_alternative<std::string_view>(default_value));
       return std::string{std::get<std::string_view>(default_value)};
-    } else if constexpr (std::is_enum_v<T>) {
-      SDB_ASSERT(std::holds_alternative<std::string_view>(default_value));
-      const auto& value_str = std::get<std::string_view>(default_value);
-      auto value =
-        magic_enum::enum_cast<T>(value_str, magic_enum::case_insensitive);
-      SDB_ASSERT(value);
-      return *value;
     } else {
       SDB_ASSERT(std::holds_alternative<T>(default_value));
       return std::get<T>(default_value);
@@ -160,7 +146,7 @@ struct OptionInfo {
 
   template<Type V>
   using CppType = std::conditional_t<
-    V == Type::String || V == Type::Enum, std::string,
+    V == Type::String, std::string,
     std::conditional_t<
       V == Type::Boolean, bool,
       std::conditional_t<V == Type::Integer, int,
@@ -178,8 +164,6 @@ struct OptionInfo {
         return "double";
       case Type::Character:
         return "character";
-      case Type::Enum:
-        return "enum";
     }
   }
 
@@ -187,40 +171,17 @@ struct OptionInfo {
                            std::string_view raw_value) const {
     switch (type) {
       case Type::Boolean:
+      case Type::Integer:
+      case Type::Double:
         return absl::StrCat("invalid value for ", operation, " parameter \"",
                             name, "\": \"", raw_value, "\"");
-      case Type::Integer:
-        return absl::StrCat("invalid input syntax for type integer: \"",
-                            raw_value, "\"");
-      case Type::Double:
-        return absl::StrCat("invalid input syntax for type double: \"",
-                            raw_value, "\"");
       case Type::Character:
         return absl::StrCat(operation, " ", name,
                             " must be a single one-byte character");
       case Type::String:
         return absl::StrCat(operation, " ", name, " must be a string");
-      case Type::Enum:
-        return absl::StrCat(operation, " ", absl::AsciiStrToUpper(name), " \"",
-                            raw_value, "\" not recognized");
     }
   }
-};
-
-template<typename E>
-  requires std::is_enum_v<E>
-struct EnumOptionInfo {
-  using enum_type = E;
-
-  OptionInfo base;
-
-  consteval EnumOptionInfo(std::string_view name, E def, std::string_view desc)
-    : base{name, magic_enum::enum_name(def), desc} {
-    base.type = OptionInfo::Type::Enum;
-    base.enum_values = detail::kEnumNames<E>;
-  }
-
-  consteval operator OptionInfo() const { return base; }
 };
 
 struct OptionGroup {

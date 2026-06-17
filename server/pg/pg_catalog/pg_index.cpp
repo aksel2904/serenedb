@@ -25,11 +25,9 @@
 #include "basics/down_cast.h"
 #include "basics/errors.h"
 #include "catalog/catalog.h"
-#include "catalog/local_catalog.h"
 #include "catalog/table.h"
 #include "pg/pg_catalog/fwd.h"
 #include "pg/system_catalog.h"
-#include "rest_server/serened.h"
 
 namespace sdb::pg {
 namespace {
@@ -84,7 +82,7 @@ catalog::MaterializedData SystemTableSnapshot<PgIndex>::GetTableData() {
         for (auto col_id : column_ids) {
           int16_t attnum = 0;
           for (size_t i = 0; i < columns.size(); ++i) {
-            if (columns[i].id == col_id) {
+            if (columns[i].GetId() == col_id) {
               attnum = static_cast<int16_t>(i + 1);
               break;
             }
@@ -128,7 +126,7 @@ catalog::MaterializedData SystemTableSnapshot<PgIndex>::GetTableData() {
       for (auto pk_id : pk_columns) {
         int16_t attnum = 0;
         for (size_t i = 0; i < columns.size(); ++i) {
-          if (columns[i].id == pk_id) {
+          if (columns[i].GetId() == pk_id) {
             attnum = static_cast<int16_t>(i + 1);
             break;
           }

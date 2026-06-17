@@ -56,8 +56,6 @@ class SegmentReader final : public SubReader {
 
   const SegmentInfo& Meta() const final;
 
-  ColumnIterator::ptr columns() const final;
-
   DocIterator::ptr docs_iterator() const final;
 
   const DocumentMask* docs_mask() const final;
@@ -65,15 +63,14 @@ class SegmentReader final : public SubReader {
   // FIXME find a better way to mask documents
   DocIterator::ptr mask(DocIterator::ptr&& it) const final;
 
-  const TermReader* field(std::string_view name) const final;
+  const TermReader* field(field_id id) const final;
+  std::span<const field_id> field_ids() const final;
 
-  FieldIterator::ptr fields() const final;
+  NormReader::ptr norms(field_id field) const final;
 
-  const irs::ColumnReader* sort() const final;
-
-  const irs::ColumnReader* column(std::string_view name) const final;
-
-  const irs::ColumnReader* column(field_id field) const final;
+  const ColumnReader* Column(field_id field) const final;
+  const HnswReader* HNSW(field_id field) const final;
+  const ColReader* GetColReader() const final;
 
   const std::shared_ptr<const SegmentReaderImpl>& GetImpl() const noexcept {
     return _impl;

@@ -29,6 +29,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <string_view>
 
 #include "basics/async_utils.hpp"
@@ -38,6 +39,11 @@
 #include "basics/wait_group.hpp"
 #include "iresearch/formats/formats.hpp"
 #include "iresearch/index/column_info.hpp"
+
+namespace duckdb {
+
+class DatabaseInstance;
+}
 #include "iresearch/index/directory_reader.hpp"
 #include "iresearch/index/field_meta.hpp"
 #include "iresearch/index/index_features.hpp"
@@ -67,47 +73,47 @@ enum OpenMode {
 
 ENABLE_BITMASK_ENUM(OpenMode);
 
-// A set of candidates denoting an instance of consolidation
-using Consolidation = std::vector<const SubReader*>;
-using ConsolidationView = std::span<const SubReader* const>;
+// A set of candidates denoting an instance of compaction
+using Compaction = std::vector<const SubReader*>;
+using CompactionView = std::span<const SubReader* const>;
 
-// segments that are under consolidation
-using ConsolidatingSegments = absl::flat_hash_set<std::string_view>;
+// segments that are under compaction
+using CompactingSegments = absl::flat_hash_set<std::string_view>;
 
-// Mark consolidation candidate segments matching the current policy
-// candidates the segments that should be consolidated
+// Mark compaction candidate segments matching the current policy
+// candidates the segments that should be compacted
 // in: segment candidates that may be considered by this policy
 // out: actual segments selected by the current policy
 // dir the segment directory
 // meta the index meta containing segments to be considered
-// Consolidating_segments segments that are currently in progress
-// of consolidation
+// Compacting_segments segments that are currently in progress
+// of compaction
 // Final candidates are all segments selected by at least some policy
-using ConsolidationPolicy =
-  std::function<void(Consolidation& candidates, const IndexReader& index,
-                     const ConsolidatingSegments& consolidating_segments)>;
+using CompactionPolicy =
+  std::function<void(Compaction& candidates, const IndexReader& index,
+                     const CompactingSegments& compacting_segments)>;
 
-enum class ConsolidationError : uint32_t {
-  // Consolidation failed
+enum class CompactionError : uint32_t {
+  // Compaction failed
   Fail = 0,
 
-  // Consolidation successfully finished
+  // Compaction successfully finished
   Ok,
 
-  // Consolidation was scheduled for the upcoming commit
+  // Compaction was scheduled for the upcoming commit
   Pending,
 };
 
-// Represents result of a consolidation
-struct ConsolidationResult {
+// Represents result of a compaction
+struct CompactionResult {
   // Number of candidates
   size_t size{0};
 
   // Error code
-  ConsolidationError error{ConsolidationError::Fail};
+  CompactionError error{CompactionError::Fail};
 
   // intentionally implicit
-  operator bool() const noexcept { return error != ConsolidationError::Fail; }
+  operator bool() const noexcept { return error != CompactionError::Fail; }
 };
 
 // Options the the writer should use for segments
@@ -143,9 +149,6 @@ struct IndexWriterOptions : public SegmentOptions {
   // Options for snapshot management
   IndexReaderOptions reader_options;
 
-  // Returns column info the writer should use for columnstore
-  ColumnInfoProvider column_info;
-
   // Provides payload for index_meta created by writer
   PayloadProvider meta_payload_provider;
 
@@ -162,13 +165,24 @@ struct IndexWriterOptions : public SegmentOptions {
   // corruption from multiple index_writers
   bool lock_repository{true};
 
+  // Enables the typed .col on segments allocated by this writer.
+  // Lifetime of `*db` must extend until IndexWriter shutdown.
+  duckdb::DatabaseInstance* db = nullptr;
+
+  // Per-column knobs the writer consults at flush + merge time. The
+  // catalog is the single source of truth; both callbacks return what's
+  // currently configured for the column, never anything baked into a
+  // source segment. See `iresearch/index/column_info.hpp` for the shape.
+  ColumnOptionsProvider column_options;
+  NormColumnOptionsProvider norm_column_options;
+
   IndexWriterOptions() {}  // compiler requires non-default definition
 };
 
 struct CommitInfo {
   uint64_t tick = writer_limits::kMaxTick;
   ProgressReportCallback progress;
-  bool reopen_columnstore = false;
+  bool reopen_reader = false;
 };
 
 // The object is using for indexing data. Only one writer can write to
@@ -315,44 +329,33 @@ class IndexWriter : private util::Noncopyable {
     // will not take any effect
     explicit operator bool() const noexcept { return _writer.valid(); }
 
-    // Inserts the specified field into the document according to the
-    // specified ACTION
-    // Note that 'Field' type type must satisfy the Field concept
-    // field attribute to be inserted
-    // Return true, if field was successfully inserted
-    template<Action A, typename Field>
+    // Inserts a field into the document for inverted indexing.
+    template<typename Field>
     bool Insert(Field&& field) const {
-      return _writer.insert<A>(std::forward<Field>(field), _doc_id);
+      return _writer.insert(std::forward<Field>(field), _doc_id);
     }
 
-    // Inserts the specified field (denoted by the pointer) into the
-    //        document according to the specified ACTION
-    // Note that 'Field' type type must satisfy the Field concept
-    // Note that pointer must not be nullptr
-    // field attribute to be inserted
-    // Return true, if field was successfully inserted
-    template<Action A, typename Field>
+    // Inserts the field denoted by `field` (must not be nullptr).
+    template<typename Field>
     bool Insert(Field* field) const {
-      return _writer.insert<A>(*field, _doc_id);
+      return _writer.insert(*field, _doc_id);
     }
 
-    // Inserts the specified range of fields, denoted by the [begin;end)
-    // into the document according to the specified ACTION
-    // Note that 'Iterator' underline value type must satisfy the Field concept
-    // begin the beginning of the fields range
-    // end the end of the fields range
-    // Return true, if the range was successfully inserted
-    template<Action A, typename Iterator>
+    // Inserts the range of fields [begin; end) for inverted indexing.
+    template<typename Iterator>
     bool Insert(Iterator begin, Iterator end) const {
       for (; _writer.valid() && begin != end; ++begin) {
-        Insert<A>(*begin);
+        Insert(*begin);
       }
-
       return _writer.valid();
     }
 #ifdef SDB_GTEST
     SegmentWriter& Writer() noexcept { return _writer; }
 #endif
+
+    ColWriter* GetColWriter() noexcept { return _writer.GetColWriter(); }
+
+    doc_id_t DocId() const noexcept { return _doc_id; }
 
    private:
     void Finish() noexcept;
@@ -371,11 +374,7 @@ class IndexWriter : private util::Noncopyable {
     Transaction(Transaction&& other) = default;
     Transaction& operator=(Transaction&& other) = default;
 
-    ~Transaction() {
-      // FIXME(gnusi): consider calling Abort in future
-      // Commit can throw in such case -> better error handling
-      Commit();
-    }
+    ~Transaction() { Abort(); }
 
     // Create a document to filled by the caller
     // for insertion into the index index
@@ -471,6 +470,12 @@ class IndexWriter : private util::Noncopyable {
 
     uint64_t GetQueries() const noexcept { return _queries; }
 
+    // Reserve `n` query sub-ticks without recording a query. Lets a caller that
+    // batches several Insert ops into one Transaction give each op its own
+    // strictly-ascending document tick (Insert snapshots _queries but, unlike
+    // Remove/Replace, does not advance it). Used by WAL-replay streaming.
+    void AdvanceQueries(uint64_t n = 1) noexcept { _queries += n; }
+
    private:
     bool CommitImpl(uint64_t last_tick) noexcept;
     // refresh segment if required (guarded by FlushContext::context_mutex_)
@@ -527,22 +532,22 @@ class IndexWriter : private util::Noncopyable {
   // Policy the specified defragmentation policy
   // Codec desired format that will be used for segment creation,
   // nullptr == use index_writer's codec
-  // Progress callback triggered for consolidation steps, if the
-  // callback returns false then consolidation is aborted
+  // Progress callback triggered for compaction steps, if the
+  // callback returns false then compaction is aborted
   // For deferred policies during the commit stage each policy will be
   // given the exact same index_meta containing all segments in the
   // commit, however, the resulting acceptor will only be segments not
-  // yet marked for consolidation by other policies in the same commit
-  ConsolidationResult Consolidate(
-    const ConsolidationPolicy& policy, Format::ptr codec = nullptr,
-    const MergeWriter::FlushProgress& progress = {});
+  // yet marked for compaction by other policies in the same commit
+  CompactionResult Compact(const CompactionPolicy& policy,
+                           Format::ptr codec = nullptr,
+                           const MergeWriter::FlushProgress& progress = {});
 
   // Imports index from the specified index reader into new segment
   // Reader the index reader to import.
   // Desired format that will be used for segment creation,
   // nullptr == use index_writer's codec.
-  // Progress callback triggered for consolidation steps, if the
-  // callback returns false then consolidation is aborted.
+  // Progress callback triggered for compaction steps, if the
+  // callback returns false then compaction is aborted.
   // Returns true on success.
   bool Import(const IndexReader& reader, Format::ptr codec = nullptr,
               const MergeWriter::FlushProgress& progress = {});
@@ -563,31 +568,30 @@ class IndexWriter : private util::Noncopyable {
   // nullptr == default sort order
   const Comparer* Comparator() const noexcept { return _comparator; }
 
-  // Begins the two-phase transaction.
+  // Begins the two-phase refresh (publish the in-memory writer's segment).
   // payload arbitrary user supplied data to store in the index
-  // Returns true if transaction has been successfully started.
-
-  bool Begin(const CommitInfo& info = {}) {
+  // Returns true if a refresh has been successfully started.
+  bool RefreshBegin(const CommitInfo& info = {}) {
     _commit_lock.ForgetDeadlockInfo();
     std::lock_guard lock{_commit_lock};
     return Start(info);
   }
 
-  // Rollbacks the two-phase transaction
-  void Rollback() {
+  // Discards a pending two-phase refresh.
+  void RefreshAbort() {
     _commit_lock.ForgetDeadlockInfo();
     std::lock_guard lock{_commit_lock};
     Abort();
   }
 
-  // Make all buffered changes visible for readers.
+  // Publish all buffered changes so they become visible to readers.
   // payload arbitrary user supplied data to store in the index
-  // Return whether any changes were committed.
+  // Return whether any changes were published.
   //
-  // Note that if begin() has been already called commit() is
-  // relatively lightweight operation.
-  // FIXME(gnusi): Commit() should return committed index snapshot
-  bool Commit(const CommitInfo& info = {}) {
+  // If RefreshBegin() has already been called RefreshCommit() is
+  // relatively lightweight.
+  // FIXME(gnusi): RefreshCommit() should return committed index snapshot
+  bool RefreshCommit(const CommitInfo& info = {}) {
     _commit_lock.ForgetDeadlockInfo();
     std::lock_guard lock{_commit_lock};
     const bool modified = Start(info);
@@ -602,43 +606,51 @@ class IndexWriter : private util::Noncopyable {
               IndexFileRefs::ref_t&& lock_file_ref, Directory& dir,
               Format::ptr codec, size_t segment_pool_size,
               const SegmentOptions& segment_limits, const Comparer* comparator,
-              const ColumnInfoProvider& column_info,
               const PayloadProvider& meta_payload_provider,
               std::shared_ptr<const DirectoryReaderImpl>&& committed_reader);
 
  private:
-  struct ConsolidationContext : util::Noncopyable {
-    std::shared_ptr<const DirectoryReaderImpl> consolidation_reader;
-    Consolidation candidates;
-    MergeWriter merger;
+  struct CompactionContext : util::Noncopyable {
+    std::shared_ptr<const DirectoryReaderImpl> compaction_reader;
+    Compaction candidates;
+    std::optional<MergeWriter> merger;
   };
 
-  static_assert(std::is_nothrow_move_constructible_v<ConsolidationContext>);
+  static_assert(std::is_nothrow_move_constructible_v<CompactionContext>);
 
   struct ImportContext {
     ImportContext(
       IndexSegment&& segment, uint64_t tick, FileRefs&& refs,
-      Consolidation&& consolidation_candidates,
+      Compaction&& compaction_candidates,
       std::shared_ptr<const SegmentReaderImpl>&& reader,
-      std::shared_ptr<const DirectoryReaderImpl>&& consolidation_reader,
+      std::shared_ptr<const DirectoryReaderImpl>&& compaction_reader,
       MergeWriter&& merger) noexcept
       : tick{tick},
         segment{std::move(segment)},
         refs{std::move(refs)},
         reader{std::move(reader)},
-        consolidation_ctx{
-          .consolidation_reader = std::move(consolidation_reader),
-          .candidates = std::move(consolidation_candidates),
-          .merger = std::move(merger)} {}
+        compaction_ctx{.compaction_reader = std::move(compaction_reader),
+                       .candidates = std::move(compaction_candidates),
+                       .merger = std::move(merger)} {}
 
-    ImportContext(IndexSegment&& segment, uint64_t tick, FileRefs&& refs,
-                  std::shared_ptr<const SegmentReaderImpl>&& reader,
-                  IResourceManager& resource_manager) noexcept
+    ImportContext(
+      IndexSegment&& segment, uint64_t tick, FileRefs&& refs,
+      Compaction&& compaction_candidates,
+      std::shared_ptr<const SegmentReaderImpl>&& reader,
+      std::shared_ptr<const DirectoryReaderImpl>&& compaction_reader) noexcept
       : tick{tick},
         segment{std::move(segment)},
         refs{std::move(refs)},
         reader{std::move(reader)},
-        consolidation_ctx{.merger{resource_manager}} {}
+        compaction_ctx{.compaction_reader = std::move(compaction_reader),
+                       .candidates = std::move(compaction_candidates)} {}
+
+    ImportContext(IndexSegment&& segment, uint64_t tick, FileRefs&& refs,
+                  std::shared_ptr<const SegmentReaderImpl>&& reader) noexcept
+      : tick{tick},
+        segment{std::move(segment)},
+        refs{std::move(refs)},
+        reader{std::move(reader)} {}
 
     ImportContext(ImportContext&&) = default;
 
@@ -649,7 +661,7 @@ class IndexWriter : private util::Noncopyable {
     IndexSegment segment;
     FileRefs refs;
     std::shared_ptr<const SegmentReaderImpl> reader;
-    ConsolidationContext consolidation_ctx;
+    CompactionContext compaction_ctx;
   };
 
   static_assert(std::is_nothrow_move_constructible_v<ImportContext>);
@@ -658,11 +670,13 @@ class IndexWriter : private util::Noncopyable {
   struct FlushedSegment : public IndexSegment {
     FlushedSegment() = default;
     explicit FlushedSegment(IndexSegment&& segment, DocMap&& old2new,
-                            DocsMask&& docs_mask, size_t docs_begin) noexcept
+                            DocsMask&& docs_mask, size_t docs_begin,
+                            PreloadedHnswGraphs&& hnsw_graphs = {}) noexcept
       : IndexSegment{std::move(segment)},
         old2new{std::move(old2new)},
         docs_mask{std::move(docs_mask)},
         document_mask{{this->docs_mask.set.get_allocator()}},
+        hnsw_graphs{std::move(hnsw_graphs)},
         _docs_begin{docs_begin},
         _docs_end{_docs_begin + meta.docs_count} {}
 
@@ -681,6 +695,7 @@ class IndexWriter : private util::Noncopyable {
     // Flushed segment removals
     DocsMask docs_mask;
     DocumentMask document_mask;
+    PreloadedHnswGraphs hnsw_graphs;
     bool was_flush = false;
 
    private:
@@ -852,7 +867,7 @@ class IndexWriter : private util::Noncopyable {
     WaitGroup pending;
 
     // set of segments to be removed from the index upon commit
-    ConsolidatingSegments segment_mask;
+    CompactingSegments segment_mask;
 
     FlushContext() = default;
 
@@ -880,7 +895,7 @@ class IndexWriter : private util::Noncopyable {
     void StartReset(IndexWriter& writer, bool keep_next = false) noexcept {
       auto* curr = ctx.get();
       if (curr != nullptr) {
-        std::lock_guard lock{writer._consolidating.lock};
+        std::lock_guard lock{writer._compacting.lock};
         writer.Cleanup(*curr, keep_next ? nullptr : curr->next);
       }
     }
@@ -931,8 +946,7 @@ class IndexWriter : private util::Noncopyable {
   ActiveSegmentContext GetSegmentContext();
 
   // Return options for SegmentWriter
-  SegmentWriterOptions GetSegmentWriterOptions(
-    bool consolidation) const noexcept;
+  SegmentWriterOptions GetSegmentWriterOptions(bool compaction) const noexcept;
 
   // Return next segment identifier
   uint64_t NextSegmentId() noexcept;
@@ -949,18 +963,20 @@ class IndexWriter : private util::Noncopyable {
   void Abort() noexcept;
 
   IndexFeatures _wand_features{};  // Set of features required for wand
-  ScorerPtr _wand_scorer;
-  ColumnInfoProvider _column_info;
+  ScorerPtr _topk_scorer;
+  duckdb::DatabaseInstance* _db = nullptr;
+  ColumnOptionsProvider _column_options;
+  NormColumnOptionsProvider _norm_column_options;
   PayloadProvider _meta_payload_provider;  // provides payload for new segments
   const Comparer* _comparator;
   Format::ptr _codec;
-  // Prevent concurrent Begin/Commit/Rollback/Clear and multiple Consolidate
+  // Prevent concurrent Begin/Commit/Rollback/Clear and multiple Compact
   absl::Mutex _commit_lock;
   struct {
     std::recursive_mutex lock;  // TODO(mbkkt) make it absl::Mutex
-    // It's recursive because our tests, where consolidation policy calls commit
-    ConsolidatingSegments segments;  // segments that are under consolidation
-  } _consolidating;
+    // It's recursive because our tests, where compaction policy calls commit
+    CompactingSegments segments;  // segments that are under compaction
+  } _compacting;
   // directory used for initialization of readers
   Directory& _dir;
   // currently active context accumulating data to be

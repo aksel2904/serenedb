@@ -21,6 +21,7 @@
 #pragma once
 
 #include <cstdint>
+#include <duckdb/common/types/string_type.hpp>
 #include <span>
 #include <string_view>
 
@@ -29,30 +30,11 @@
 
 namespace sdb::connector {
 
-struct ColumnInfo {
-  catalog::Column::Id id;
-  std::string_view name;
-};
-
-enum class ValueFlags : uint8_t {
-  None = 0,
-  HaveNulls = 1 << 0,
-  HaveLength = 1 << 1,
-  Constant = 1 << 2,
-  FlatMap = 1 << 3,
-};
-
-ENABLE_BITMASK_ENUM(ValueFlags);
+inline std::string_view AsView(const duckdb::string_t& s) noexcept {
+  return {s.GetData(), s.GetSize()};
+}
 
 // TODO(Dronplane) unify with key?
 inline constexpr std::string_view kStringPrefix{"\0", 1};
-inline constexpr std::string_view kTrueValue{"\1", 1};
-inline constexpr std::string_view kFalseValue{"\0", 1};
-
-static_assert(
-  sizeof(ValueFlags) == 1,
-  "ValueFlags should be one byte. If need more adjust writing/reading");
-
-inline constexpr std::string_view kBulkInsertDir = "bulk_insert";
 
 }  // namespace sdb::connector

@@ -24,16 +24,14 @@
 
 namespace sdb::connector {
 
-bool DuckDBSearchSinkInsertWriter::SwitchColumn(const duckdb::LogicalType& type,
-                                                bool have_nulls,
-                                                catalog::Column::Id column_id) {
-  return SwitchColumnImpl(type, have_nulls, column_id);
-}
-
-bool DuckDBSearchSinkUpdateWriter::SwitchColumn(const duckdb::LogicalType& type,
-                                                bool have_nulls,
-                                                catalog::Column::Id column_id) {
-  return SwitchColumnImpl(type, have_nulls, column_id);
+bool DuckDBSearchSinkInsertWriter::SwitchColumn(
+  const ColumnDescriptor& col, const duckdb::Vector& vec,
+  std::span<const std::string_view> row_keys, duckdb::idx_t count) {
+  if (IsIndexed(col.id)) {
+    SwitchFieldImpl(static_cast<irs::field_id>(col.id), col.type, vec, row_keys,
+                    count);
+  }
+  return false;
 }
 
 }  // namespace sdb::connector

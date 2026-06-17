@@ -21,9 +21,13 @@
 /// @author Vasiliy Nabatchikov
 ////////////////////////////////////////////////////////////////////////////////
 
+#include <absl/synchronization/notification.h>
+
+#include <latch>
 #include <thread>
 
 #include "basics/file_utils_ext.hpp"
+#include "formats/column/test_cs_helpers.hpp"
 #include "index_tests.hpp"
 #include "iresearch/search/term_filter.hpp"
 #include "iresearch/store/fs_directory.hpp"
@@ -33,23 +37,16 @@
 
 namespace {
 
-bool Visit(const irs::ColumnReader& reader,
-           const std::function<bool(irs::doc_id_t, irs::bytes_view)>& visitor) {
-  auto it = reader.iterator(irs::ColumnHint::Consolidation);
+inline constexpr irs::field_id kSameId = 1;
+inline constexpr irs::field_id kUpdatedId = 2;
 
-  irs::PayAttr dummy;
-  auto* payload = irs::get<irs::PayAttr>(*it);
-  if (!payload) {
-    payload = &dummy;
+template<typename ParticleT>
+void StoreNamed(irs::IndexWriter::Document& d, const ParticleT& fields,
+                std::string_view name, irs::field_id id) {
+  const auto* field = fields.template get<tests::StringField>(name);
+  if (field) {
+    irs::tests::StoreFieldAt(*d.GetColWriter(), id, d.DocId(), *field);
   }
-
-  while (it->next()) {
-    if (!visitor(it->value(), payload->value)) {
-      return false;
-    }
-  }
-
-  return true;
 }
 
 }  // namespace
@@ -90,7 +87,9 @@ class IndexProfileTestCase : public tests::IndexTestBase {
 
       CsvDocTemplateT() {
         fields.emplace_back(std::make_shared<tests::StringField>("id"));
+        fields.back()->id = tests::FieldIdForRuntime("id");
         fields.emplace_back(std::make_shared<tests::StringField>("label"));
+        fields.back()->id = tests::FieldIdForRuntime("label");
         reserve(fields.size());
       }
 
@@ -128,9 +127,12 @@ class IndexProfileTestCase : public tests::IndexTestBase {
     auto total_threads = thread_count + num_import_threads + num_update_threads;
     irs::async_utils::ThreadPool<> thread_pool(total_threads);
     std::mutex mutex;
+    // notification only for the first update task, so at least one
+    // update would execute after an insert
+    std::latch inserts{static_cast<std::ptrdiff_t>(thread_count)};
 
     if (!writer) {
-      irs::IndexWriterOptions options;
+      auto options = irs::tests::DefaultWriterOptions();
       // match original implementation or may run out of file handles
       // (e.g. MacOS/Travis)
       options.segment_count_max = 8;
@@ -140,7 +142,8 @@ class IndexProfileTestCase : public tests::IndexTestBase {
     // initialize reader data source for import threads
     if (num_import_threads != 0) {
       auto import_writer =
-        irs::IndexWriter::Make(import_dir, codec(), irs::kOmCreate);
+        irs::IndexWriter::Make(import_dir, codec(), irs::kOmCreate,
+                               irs::tests::DefaultWriterOptions());
 
       {
         REGISTER_TIMER_NAMED_DETAILED("init - setup");
@@ -152,10 +155,8 @@ class IndexProfileTestCase : public tests::IndexTestBase {
           auto ctx = import_writer->GetBatch();
           {
             auto d = ctx.Insert();
-            EXPECT_TRUE(d.Insert<irs::Action::INDEX>(doc->indexed.begin(),
-                                                     doc->indexed.end()));
-            EXPECT_TRUE(d.Insert<irs::Action::STORE>(doc->stored.begin(),
-                                                     doc->stored.end()));
+            EXPECT_TRUE(d.Insert(doc->indexed.begin(), doc->indexed.end()));
+            StoreNamed(d, doc->indexed, "same", kSameId);
           }
           TransactionTick(ctx);
         }
@@ -164,11 +165,12 @@ class IndexProfileTestCase : public tests::IndexTestBase {
       {
         std::unique_lock commit_lock{_commit_mutex};
         REGISTER_TIMER_NAMED_DETAILED("init - commit");
-        import_writer->Commit({.tick = CommitTick()});
+        import_writer->RefreshCommit({.tick = CommitTick()});
       }
 
       REGISTER_TIMER_NAMED_DETAILED("init - open");
-      import_reader = irs::DirectoryReader(import_dir);
+      import_reader = irs::DirectoryReader(import_dir, codec(),
+                                           irs::tests::DefaultReaderOptions());
     }
 
     {
@@ -178,7 +180,7 @@ class IndexProfileTestCase : public tests::IndexTestBase {
       for (size_t i = 0; i < thread_count; ++i) {
         thread_pool.run([&mutex, &writer, thread_count, i, writer_batch_size,
                          &parsed_docs_count, &writer_commit_count,
-                         &import_again, this] {
+                         &import_again, &inserts, this] {
           {
             // wait for all threads to be registered
             std::lock_guard lock(mutex);
@@ -218,12 +220,8 @@ class IndexProfileTestCase : public tests::IndexTestBase {
               auto ctx = writer->GetBatch();
               {
                 auto d = ctx.Insert();
-                EXPECT_TRUE(
-                  d.Insert<irs::Action::INDEX>(csv_doc_template.indexed.begin(),
-                                               csv_doc_template.indexed.end()));
-                EXPECT_TRUE(
-                  d.Insert<irs::Action::STORE>(csv_doc_template.stored.begin(),
-                                               csv_doc_template.stored.end()));
+                EXPECT_TRUE(d.Insert(csv_doc_template.indexed.begin(),
+                                     csv_doc_template.indexed.end()));
               }
               TransactionTick(ctx);
             }
@@ -239,7 +237,7 @@ class IndexProfileTestCase : public tests::IndexTestBase {
 
               {
                 REGISTER_TIMER_NAMED_DETAILED("commit");
-                writer->Commit({.tick = CommitTick()});
+                writer->RefreshCommit({.tick = CommitTick()});
               }
 
               count = 0;
@@ -250,12 +248,13 @@ class IndexProfileTestCase : public tests::IndexTestBase {
           {
             std::unique_lock commit_lock{_commit_mutex};
             REGISTER_TIMER_NAMED_DETAILED("commit");
-            writer->Commit({.tick = CommitTick()});
+            writer->RefreshCommit({.tick = CommitTick()});
           }
 
           ++writer_commit_count;
           import_again.store(false);  // stop any import threads, on completion
-                                      // of any insert thread
+          // of any insert thread
+          inserts.count_down();
         });
       }
 
@@ -288,10 +287,15 @@ class IndexProfileTestCase : public tests::IndexTestBase {
       // register update jobs
       for (size_t i = 0; i < num_update_threads; ++i) {
         thread_pool.run([&mutex, &writer, num_update_threads, i, update_skip,
-                         writer_batch_size, &writer_commit_count, this] {
+                         writer_batch_size, &writer_commit_count, &inserts,
+                         this] {
           {
             // wait for all threads to be registered
             std::lock_guard lock(mutex);
+          }
+
+          if (!i) {
+            inserts.wait();
           }
 
           CsvDocTemplateT csv_doc_template;
@@ -331,38 +335,40 @@ class IndexProfileTestCase : public tests::IndexTestBase {
 
             {
               irs::Filter::ptr filter = std::make_unique<irs::ByTerm>();
-              auto key_field = csv_doc_template.indexed.begin()->Name();
+              auto key_name = csv_doc_template.indexed.begin()->Name();
+              auto key_id = csv_doc_template.indexed.begin()->Id();
               auto key_term =
-                csv_doc_template.indexed.get<tests::StringField>(key_field)
+                csv_doc_template.indexed.get<tests::StringField>(key_name)
                   ->value();
-              auto value_field = (++(csv_doc_template.indexed.begin()))->Name();
+              auto value_name = (++(csv_doc_template.indexed.begin()))->Name();
               auto value_term =
-                csv_doc_template.indexed.get<tests::StringField>(value_field)
+                csv_doc_template.indexed.get<tests::StringField>(value_name)
                   ->value();
               std::string updated_term(value_term.data(), value_term.size());
 
               auto& filter_impl = static_cast<irs::ByTerm&>(*filter);
-              *filter_impl.mutable_field() = key_field;
+              *filter_impl.mutable_field_id() = key_id;
               filter_impl.mutable_options()->term =
                 irs::ViewCast<irs::byte_type>(key_term);
               // double up term
               updated_term.append(value_term.data(), value_term.size());
-              csv_doc_template.indexed.get<tests::StringField>(value_field)
+              csv_doc_template.indexed.get<tests::StringField>(value_name)
                 ->value(updated_term);
-              csv_doc_template.insert(
-                std::make_shared<tests::StringField>("updated"));
+              {
+                auto f = std::make_shared<tests::StringField>("updated");
+                f->id = tests::FieldIdForRuntime("updated");
+                csv_doc_template.insert(std::move(f));
+              }
 
               REGISTER_TIMER_NAMED_DETAILED("update");
               {
                 auto ctx = writer->GetBatch();
                 {
                   auto d = ctx.Replace(std::move(filter));
-                  EXPECT_TRUE(d.Insert<irs::Action::INDEX>(
-                    csv_doc_template.indexed.begin(),
-                    csv_doc_template.indexed.end()));
-                  EXPECT_TRUE(d.Insert<irs::Action::STORE>(
-                    csv_doc_template.stored.begin(),
-                    csv_doc_template.stored.end()));
+                  EXPECT_TRUE(d.Insert(csv_doc_template.indexed.begin(),
+                                       csv_doc_template.indexed.end()));
+                  StoreNamed(d, csv_doc_template.indexed, "updated",
+                             kUpdatedId);
                 }
                 TransactionTick(ctx);
               }
@@ -379,7 +385,7 @@ class IndexProfileTestCase : public tests::IndexTestBase {
 
               {
                 REGISTER_TIMER_NAMED_DETAILED("commit");
-                writer->Commit({.tick = CommitTick()});
+                writer->RefreshCommit({.tick = CommitTick()});
               }
 
               count = 0;
@@ -390,7 +396,7 @@ class IndexProfileTestCase : public tests::IndexTestBase {
           {
             std::unique_lock commit_lock{_commit_mutex};
             REGISTER_TIMER_NAMED_DETAILED("commit");
-            writer->Commit({.tick = CommitTick()});
+            writer->RefreshCommit({.tick = CommitTick()});
           }
 
           ++writer_commit_count;
@@ -403,8 +409,8 @@ class IndexProfileTestCase : public tests::IndexTestBase {
     // ensure all data have been committed
     {
       std::unique_lock commit_lock{_commit_mutex};
-      writer->Commit({.tick = CommitTick()});
-      EXPECT_FALSE(writer->Commit());
+      writer->RefreshCommit({.tick = CommitTick()});
+      EXPECT_FALSE(writer->RefreshCommit());
     }
 
     auto path = test_dir();
@@ -420,7 +426,8 @@ class IndexProfileTestCase : public tests::IndexTestBase {
     irs::file_utils::EnsureAbsolute(path);
     std::cout << "Path to timing log: " << path.string() << std::endl;
 
-    auto reader = irs::DirectoryReader(dir(), codec());
+    auto reader =
+      irs::DirectoryReader(dir(), codec(), irs::tests::DefaultReaderOptions());
     // not all commits might produce a new segment,
     ASSERT_LE(1, reader.size());
     // some might merge with concurrent commits
@@ -445,16 +452,16 @@ class IndexProfileTestCase : public tests::IndexTestBase {
     for (size_t i = 0, count = reader.size(); i < count; ++i) {
       indexed_docs_count += reader[i].live_docs_count();
 
-      const auto* column = reader[i].column("same");
+      const auto* column = reader[i].Column(kSameId);
       if (column) {
-        // field present in all docs from simple_sequential.json
-        Visit(*column, imported_visitor);
+        irs::tests::VisitBlobColumn(*reader[i].GetColReader(), *column,
+                                    imported_visitor);
       }
 
-      column = reader[i].column("updated");
+      column = reader[i].Column(kUpdatedId);
       if (column) {
-        // field inserted by updater threads
-        Visit(*column, updated_visitor);
+        irs::tests::VisitBlobColumn(*reader[i].GetColReader(), *column,
+                                    updated_visitor);
       }
     }
 
@@ -492,7 +499,7 @@ class IndexProfileTestCase : public tests::IndexTestBase {
   void ProfileBulkIndexDedicatedCommit(size_t insert_threads,
                                        size_t commit_threads,
                                        size_t commit_interval) {
-    irs::IndexWriterOptions options;
+    auto options = irs::tests::DefaultWriterOptions();
     std::atomic<bool> working(true);
     std::atomic<size_t> writer_commit_count(0);
 
@@ -510,7 +517,7 @@ class IndexProfileTestCase : public tests::IndexTestBase {
             {
               std::unique_lock commit_lock{_commit_mutex};
               REGISTER_TIMER_NAMED_DETAILED("commit");
-              writer->Commit({.tick = CommitTick()});
+              writer->RefreshCommit({.tick = CommitTick()});
             }
             ++writer_commit_count;
             std::this_thread::sleep_for(
@@ -527,12 +534,11 @@ class IndexProfileTestCase : public tests::IndexTestBase {
     thread_pool.stop();
   }
 
-  void ProfileBulkIndexDedicatedConsolidate(size_t num_threads,
-                                            size_t batch_size,
-                                            size_t consolidate_interval) {
+  void ProfileBulkIndexDedicatedCompact(size_t num_threads, size_t batch_size,
+                                        size_t compact_interval) {
     const auto policy =
-      irs::index_utils::MakePolicy(irs::index_utils::ConsolidateCount());
-    irs::IndexWriterOptions options;
+      irs::index_utils::MakePolicy(irs::index_utils::CompactionCount());
+    auto options = irs::tests::DefaultWriterOptions();
     std::atomic<bool> working(true);
     irs::async_utils::ThreadPool<> thread_pool(2);
 
@@ -541,14 +547,13 @@ class IndexProfileTestCase : public tests::IndexTestBase {
 
     auto writer = open_writer(irs::kOmCreate, options);
 
-    thread_pool.run(
-      [consolidate_interval, &working, &writer, &policy]() -> void {
-        while (working.load()) {
-          writer->Consolidate(policy);
-          std::this_thread::sleep_for(
-            std::chrono::milliseconds(consolidate_interval));
-        }
-      });
+    thread_pool.run([compact_interval, &working, &writer, &policy]() -> void {
+      while (working.load()) {
+        writer->Compact(policy);
+        std::this_thread::sleep_for(
+          std::chrono::milliseconds(compact_interval));
+      }
+    });
 
     {
       irs::Finally finalizer = [&working]() noexcept { working = false; };
@@ -556,18 +561,18 @@ class IndexProfileTestCase : public tests::IndexTestBase {
     }
 
     thread_pool.stop();
-    // ensure there are no consolidation-pending segments
-    // left in 'consolidating_segments_' before applying the final consolidation
+    // ensure there are no compaction-pending segments
+    // left in 'compacting_segments_' before applying the final compaction
     {
       std::unique_lock commit_lock{_commit_mutex};
-      writer->Commit({.tick = CommitTick()});
-      EXPECT_FALSE(writer->Commit());
+      writer->RefreshCommit({.tick = CommitTick()});
+      EXPECT_FALSE(writer->RefreshCommit());
     }
-    ASSERT_TRUE(writer->Consolidate(policy));
+    ASSERT_TRUE(writer->Compact(policy));
     {
       std::unique_lock commit_lock{_commit_mutex};
-      writer->Commit({.tick = CommitTick()});
-      EXPECT_FALSE(writer->Commit());
+      writer->RefreshCommit({.tick = CommitTick()});
+      EXPECT_FALSE(writer->RefreshCommit());
     }
 
     struct DummyDocTemplateT : public tests::CsvDocGenerator::DocTemplate {
@@ -584,7 +589,8 @@ class IndexProfileTestCase : public tests::IndexTestBase {
       ++docs_count;
     }
 
-    auto reader = irs::DirectoryReader(dir(), codec());
+    auto reader =
+      irs::DirectoryReader(dir(), codec(), irs::tests::DefaultReaderOptions());
     ASSERT_EQ(1, reader.size());
     ASSERT_EQ(docs_count, reader[0].docs_count());
   }
@@ -605,9 +611,9 @@ TEST_P(IndexProfileTestCase, profile_bulk_index_multithread_cleanup_mt) {
   ProfileBulkIndexDedicatedCleanup(16, 10000, 100);
 }
 
-TEST_P(IndexProfileTestCase, profile_bulk_index_multithread_consolidate_mt) {
+TEST_P(IndexProfileTestCase, profile_bulk_index_multithread_compact_mt) {
   // a lot of threads cause a lot of contention for the segment pool
-  ProfileBulkIndexDedicatedConsolidate(8, 10000, 500);
+  ProfileBulkIndexDedicatedCompact(8, 10000, 500);
 }
 
 TEST_P(IndexProfileTestCase,
@@ -667,11 +673,10 @@ TEST_P(IndexProfileTestCase, profile_bulk_index_multithread_cleanup_mt_tick) {
   ProfileBulkIndexDedicatedCleanup(16, 10000, 100);
 }
 
-TEST_P(IndexProfileTestCase,
-       profile_bulk_index_multithread_consolidate_mt_tick) {
+TEST_P(IndexProfileTestCase, profile_bulk_index_multithread_compact_mt_tick) {
   SetOnTick(true);
   // a lot of threads cause a lot of contention for the segment pool
-  ProfileBulkIndexDedicatedConsolidate(8, 10000, 500);
+  ProfileBulkIndexDedicatedCompact(8, 10000, 500);
 }
 
 TEST_P(IndexProfileTestCase,

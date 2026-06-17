@@ -21,50 +21,68 @@
 #pragma once
 
 #include <duckdb/common/types/value.hpp>
+#include <duckdb/main/client_context.hpp>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include "basics/containers/flat_hash_set.h"
 #include "catalog/object.h"
+#include "catalog/persistence/index.h"
 #include "catalog/scorer_options.h"
 #include "catalog/table_options.h"
-#include "catalog/types.h"
 
 namespace sdb {
-
-class IndexShard;
-struct IndexShardOptions;
-
 namespace catalog {
+
+inline constexpr std::string_view kIncludedKind = "included";
+inline constexpr std::string_view kHNSWKind = "hnsw";
 
 class SecondaryIndex;
 class InvertedIndex;
 
-// Aggregated info about column for index creation.
-// Filled on different levels during creaton to gather all
-// necessary info for building and validating new index.
+using persistence::ExpressionData;
+using persistence::InvertedIndexOptions;
+
 struct CreateIndexColumn {
-  const catalog::Column* catalog_column{nullptr};
+  const catalog::Column* catalog_column = nullptr;
   std::string_view name;
   std::string opclass;
-  std::vector<std::string> json_path;
+  std::optional<ExpressionData> indexed_expr;
   // nullopt = no parentheses in source SQL; an (empty or non-empty) map means
   // parens were present, distinguishing `col opclass` from `col opclass ()`.
   std::optional<duckdb::case_insensitive_map_t<duckdb::Value>> opclass_options;
+
+  bool IsIndexedExpression() const noexcept { return indexed_expr.has_value(); }
+
+  bool HasParentheses() const noexcept { return opclass_options.has_value(); }
+
+  bool IsBuiltin(std::string_view name) const noexcept {
+    return HasParentheses() && opclass == name;
+  }
+
+  const ExpressionData& GetIndexedExpression() const {
+    SDB_ASSERT(IsIndexedExpression());
+    return *indexed_expr;
+  }
+
+  const catalog::Column* GetCatalogColumn() const noexcept {
+    SDB_ASSERT(!IsIndexedExpression());
+    return catalog_column;
+  }
 };
 
-class Index : public SchemaObject {
+class Index : public Object {
  public:
+  ObjectId GetDatabaseId() const noexcept { return _database_id; }
   auto GetRelationId() const noexcept { return _relation_id; }
   std::span<const Column::Id> GetColumnIds() const noexcept {
     return _column_ids;
   }
 
-  virtual containers::FlatHashSet<ObjectId> GetTokenizers() const { return {}; }
+  virtual std::vector<Column::Id> GetReferencedColumnIds() const = 0;
 
-  // TODO(codeworse): support arguments for index shards
-  virtual ResultOr<std::shared_ptr<IndexShard>> CreateIndexShard(
-    bool is_new, ObjectId id, IndexShardOptions& options) const = 0;
+  virtual containers::FlatHashSet<ObjectId> GetTokenizers() const { return {}; }
 
   virtual ~Index() = default;
 
@@ -73,6 +91,7 @@ class Index : public SchemaObject {
         ObjectId relation_id, std::string name,
         std::vector<Column::Id> column_ids, ObjectType type);
 
+  ObjectId _database_id;
   ObjectId _relation_id;
   std::vector<Column::Id> _column_ids;
 };
@@ -83,11 +102,12 @@ ResultOr<std::shared_ptr<SecondaryIndex>> CreateSecondaryIndex(
   bool unique);
 
 ResultOr<std::shared_ptr<InvertedIndex>> CreateInvertedIndex(
-  ObjectId database_id, std::string_view schema_name, ObjectId schema_id,
-  ObjectId id, ObjectId relation_id, std::string name,
+  duckdb::ClientContext& context, ObjectId database_id,
+  std::string_view schema_name, ObjectId schema_id, ObjectId id,
+  ObjectId relation_id, std::string name,
   std::vector<catalog::CreateIndexColumn> columns,
   const std::shared_ptr<const Snapshot>& snapshot,
-  std::optional<ScorerOptions> wand_scorer);
+  InvertedIndexOptions options);
 
 }  // namespace catalog
 }  // namespace sdb

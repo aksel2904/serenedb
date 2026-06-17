@@ -18,40 +18,64 @@
 /// Copyright holder is SereneDB GmbH, Berlin, Germany
 ////////////////////////////////////////////////////////////////////////////////
 
-#include <iresearch/parser/parser.h>
-
+#include <duckdb/common/types/string_type.hpp>
+#include <duckdb/common/types/vector.hpp>
+#include <duckdb/common/vector/flat_vector.hpp>
+#include <duckdb/common/vector/string_vector.hpp>
+#include <duckdb/main/database.hpp>
 #include <iostream>
 #include <iresearch/analysis/analyzer.hpp>
-#include <iresearch/analysis/analyzers.hpp>
+#include <iresearch/analysis/segmentation_tokenizer.hpp>
+#include <iresearch/formats/column/col_reader.hpp>
+#include <iresearch/formats/column/column_reader.hpp>
+#include <iresearch/formats/column/column_writer.hpp>
 #include <iresearch/formats/formats.hpp>
 #include <iresearch/index/directory_reader.hpp>
 #include <iresearch/index/index_writer.hpp>
 #include <iresearch/index/norm.hpp>
+#include <iresearch/parser/parser.hpp>
+#include <iresearch/search/bm25.hpp>
 #include <iresearch/search/doc_collector.hpp>
 #include <iresearch/search/mixed_boolean_filter.hpp>
 #include <iresearch/search/scorer.hpp>
-#include <iresearch/search/scorers.hpp>
 #include <iresearch/store/memory_directory.hpp>
 #include <iresearch/store/store_utils.hpp>
-#include <iresearch/utils/compression.hpp>
 #include <iresearch/utils/directory_utils.hpp>
 #include <iresearch/utils/index_utils.hpp>
-#include <iresearch/utils/text_format.hpp>
+#include <iresearch/utils/type_limits.hpp>
+#include <memory>
+
+#include "basics/duckdb_engine.h"
 
 // This example demonstrates the core iresearch workflow:
 //   1. Create a directory and index writer
-//   2. Define fields and index documents
+//   2. Define fields and index documents (inverted index + cs stored values)
 //   3. Parse Lucene-syntax queries and execute them (count + top-K with BM25)
 
-// A minimal text field that tokenizes its value and optionally stores it.
-// Fields must provide: Name(), GetIndexFeatures(), GetTokens(), Write().
-struct TextField {
-  std::string_view name;
-  std::string_view text;
-  irs::analysis::Analyzer::ptr tokenizer{irs::analysis::analyzers::Get(
-    "segmentation", irs::Type<irs::text_format::Json>::get(), R"({})")};
+// Per-segment .col writer needs a duckdb::DatabaseInstance for codec lookup
+// and the buffer manager. main() brackets Initialize / Shutdown on the
+// process-wide sdb::DuckDBEngine; this helper just hands out a reference.
+duckdb::DatabaseInstance& Db() {
+  return sdb::DuckDBEngine::Instance().instance();
+}
 
-  std::string_view Name() const noexcept { return name; }
+// Stored-value column ids. Field-name -> field_id mapping is the caller's
+// responsibility in the new cs (column lookups are id-based, not by name).
+inline constexpr irs::field_id kTitleColumnId = 1;
+inline constexpr irs::field_id kBodyColumnId = 2;
+
+// A minimal text field that tokenizes its value for the inverted index.
+// Fields must provide: Name(), GetIndexFeatures(), GetTokens().
+// Stored values are written separately into the .col writer (see
+// AppendStoredText below) -- the legacy `Write()` STORE callback is gone.
+struct TextField {
+  irs::field_id id;
+  std::string_view text;
+  irs::analysis::Analyzer::ptr tokenizer{
+    irs::analysis::SegmentationTokenizer::Make(
+      irs::analysis::SegmentationTokenizer::Options{})};
+
+  irs::field_id Id() const noexcept { return id; }
 
   irs::IndexFeatures GetIndexFeatures() const noexcept {
     return irs::IndexFeatures::Freq | irs::IndexFeatures::Pos |
@@ -62,25 +86,46 @@ struct TextField {
     tokenizer->reset(text);
     return *tokenizer;
   }
-
-  // Write is called when Action::STORE is used. Return true to store the value.
-  bool Write(irs::DataOutput& out) const {
-    irs::WriteStr(out, text);
-    return true;
-  }
 };
 
-// Helper: index a single document with two text fields.
+// Append one BLOB row to a cs column. Wraps the per-row-at-a-time pattern
+// the example uses (one Insert per doc, one stored value per field).
+void AppendStoredText(irs::ColumnWriter& cw, irs::doc_id_t doc,
+                      std::string_view text) {
+  duckdb::Vector v{duckdb::LogicalType::BLOB, /*capacity=*/1};
+  auto* slots = duckdb::FlatVector::GetDataMutable<duckdb::string_t>(v);
+  slots[0] = duckdb::StringVector::AddStringOrBlob(v, text.data(), text.size());
+  duckdb::FlatVector::ValidityMutable(v).SetAllValid(1);
+  const uint64_t row = static_cast<uint64_t>(doc) - irs::doc_limits::min();
+  cw.Append(row, v, /*count=*/1);
+}
+
+// Helper: index a single document with two text fields. Stored text bytes
+// flow into per-segment cs BLOB columns at `kTitleColumnId` / `kBodyColumnId`
+// (replaces the legacy Action::STORE pathway).
 void IndexDocument(irs::IndexWriter::Transaction& ctx, TextField& title_field,
                    TextField& body_field, std::string_view title,
-                   std::string_view body) {
+                   std::string_view body, irs::ColumnWriter*& title_cw,
+                   irs::ColumnWriter*& body_cw) {
   title_field.text = title;
   body_field.text = body;
 
   auto doc = ctx.Insert();
   std::array<TextField*, 2> fields{&title_field, &body_field};
-  doc.Insert<irs::Action::INDEX | irs::Action::STORE>(fields.begin(),
-                                                      fields.end());
+  doc.Insert(fields.begin(), fields.end());
+
+  auto* cs = doc.GetColWriter();
+  if (cs == nullptr) {
+    return;  // cs disabled (no `options.db` plumbed through).
+  }
+  if (title_cw == nullptr) {
+    title_cw = &cs->OpenColumn(kTitleColumnId, duckdb::LogicalType::BLOB);
+  }
+  if (body_cw == nullptr) {
+    body_cw = &cs->OpenColumn(kBodyColumnId, duckdb::LogicalType::BLOB);
+  }
+  AppendStoredText(*title_cw, doc.DocId(), title);
+  AppendStoredText(*body_cw, doc.DocId(), body);
 }
 
 // Parse a Lucene-syntax query string into a filter.
@@ -89,7 +134,7 @@ void IndexDocument(irs::IndexWriter::Transaction& ctx, TextField& title_field,
 //                   AND/OR operators, prefix (term*), wildcards, fuzzy
 //                   (term~N), ranges ([min TO max]).
 irs::Filter::ptr ParseQuery(std::string_view query_str,
-                            std::string_view default_field,
+                            irs::field_id default_field,
                             irs::analysis::Analyzer& tokenizer) {
   auto root = std::make_unique<irs::MixedBooleanFilter>();
   sdb::ParserContext context{*root, default_field, tokenizer};
@@ -125,42 +170,54 @@ size_t CountMatches(const irs::DirectoryReader& reader,
 
 // Index five sample documents about information retrieval topics.
 void BuildIndex(irs::IndexWriter& writer) {
-  TextField title_field{.name = "title"};
-  TextField body_field{.name = "body"};
+  TextField title_field{.id = kTitleColumnId};
+  TextField body_field{.id = kBodyColumnId};
 
   {
     auto ctx = writer.GetBatch();
+    // cs writers are opened lazily by the first IndexDocument that observes
+    // a non-null `Document::GetColWriter()`. The pointers refer into the
+    // per-segment cs Writer and stay valid until the transaction commits.
+    irs::ColumnWriter* title_cw = nullptr;
+    irs::ColumnWriter* body_cw = nullptr;
 
     IndexDocument(ctx, title_field, body_field,
                   "Introduction to Information Retrieval",
                   "Information retrieval is the activity of obtaining "
                   "information system resources that are relevant to an "
-                  "information need from a collection.");
+                  "information need from a collection.",
+                  title_cw, body_cw);
 
     IndexDocument(ctx, title_field, body_field, "Search Engine Architecture",
                   "A search engine architecture describes the core components "
                   "including the indexer, the query processor, and the "
-                  "ranking system that scores documents by relevance.");
+                  "ranking system that scores documents by relevance.",
+                  title_cw, body_cw);
 
     IndexDocument(ctx, title_field, body_field,
                   "Inverted Index Data Structures",
                   "An inverted index is a database index storing a mapping "
                   "from content, such as words or numbers, to its locations "
-                  "in a set of documents.");
+                  "in a set of documents.",
+                  title_cw, body_cw);
 
     IndexDocument(ctx, title_field, body_field, "BM25 Scoring Function",
                   "BM25 is a ranking function used by search engines to "
                   "estimate the relevance of documents to a given search "
-                  "query based on term frequency and document length.");
+                  "query based on term frequency and document length.",
+                  title_cw, body_cw);
 
     IndexDocument(ctx, title_field, body_field, "The History of Databases",
                   "Databases have evolved from flat file systems to "
                   "relational models and beyond, powering modern applications "
-                  "from banking to social media.");
-  }  // Transaction commits here when ctx goes out of scope.
+                  "from banking to social media.",
+                  title_cw, body_cw);
+
+    ctx.Commit();
+  }
 
   // Commit flushes segments to disk and makes documents visible to readers.
-  writer.Commit();
+  writer.RefreshCommit();
   std::cout << "Indexed 5 documents.\n\n";
 }
 
@@ -176,7 +233,7 @@ void PrintIndexStats(const irs::DirectoryReader& reader) {
 void QuerySingleTerm(const irs::DirectoryReader& reader,
                      irs::analysis::Analyzer& tokenizer) {
   std::cout << "=== Single Term Query ===\n";
-  auto filter = ParseQuery("search", "body", tokenizer);
+  auto filter = ParseQuery("search", kBodyColumnId, tokenizer);
   auto count = CountMatches(reader, *filter);
   std::cout << "Query 'search' (default field=body): " << count
             << " matches\n\n";
@@ -186,7 +243,7 @@ void QuerySingleTerm(const irs::DirectoryReader& reader,
 void QueryTopK(const irs::DirectoryReader& reader, const irs::Scorer& scorer,
                irs::analysis::Analyzer& tokenizer) {
   std::cout << "=== Top-K with BM25 Scoring ===\n";
-  auto filter = ParseQuery("search", "body", tokenizer);
+  auto filter = ParseQuery("search", kBodyColumnId, tokenizer);
 
   constexpr size_t kTopK = 3;
   std::vector<irs::ScoreDoc> results(irs::BlockSize(kTopK));
@@ -207,7 +264,7 @@ void QueryTopK(const irs::DirectoryReader& reader, const irs::Scorer& scorer,
 void QueryBooleanAnd(const irs::DirectoryReader& reader,
                      irs::analysis::Analyzer& tokenizer) {
   std::cout << "=== Boolean AND Query ===\n";
-  auto filter = ParseQuery("+index +search", "body", tokenizer);
+  auto filter = ParseQuery("+index +search", kBodyColumnId, tokenizer);
   auto count = CountMatches(reader, *filter);
   std::cout << "Query '+index +search': " << count << " matches\n\n";
 }
@@ -216,7 +273,7 @@ void QueryBooleanAnd(const irs::DirectoryReader& reader,
 void QueryBooleanOr(const irs::DirectoryReader& reader,
                     irs::analysis::Analyzer& tokenizer) {
   std::cout << "=== Boolean OR Query ===\n";
-  auto filter = ParseQuery("database retrieval", "body", tokenizer);
+  auto filter = ParseQuery("database retrieval", kBodyColumnId, tokenizer);
   auto count = CountMatches(reader, *filter);
   std::cout << "Query 'database retrieval': " << count << " matches\n\n";
 }
@@ -225,7 +282,7 @@ void QueryBooleanOr(const irs::DirectoryReader& reader,
 void QueryPhrase(const irs::DirectoryReader& reader,
                  irs::analysis::Analyzer& tokenizer) {
   std::cout << "=== Phrase Query ===\n";
-  auto filter = ParseQuery(R"("search engine")", "body", tokenizer);
+  auto filter = ParseQuery(R"("search engine")", kBodyColumnId, tokenizer);
   auto count = CountMatches(reader, *filter);
   std::cout << "Query '\"search engine\"': " << count << " matches\n\n";
 }
@@ -234,7 +291,7 @@ void QueryPhrase(const irs::DirectoryReader& reader,
 void QueryPrefix(const irs::DirectoryReader& reader,
                  irs::analysis::Analyzer& tokenizer) {
   std::cout << "=== Prefix Query ===\n";
-  auto filter = ParseQuery("rank*", "body", tokenizer);
+  auto filter = ParseQuery("rank*", kBodyColumnId, tokenizer);
   auto count = CountMatches(reader, *filter);
   std::cout << "Query 'rank*': " << count << " matches\n\n";
 }
@@ -243,41 +300,50 @@ void QueryPrefix(const irs::DirectoryReader& reader,
 void QueryExclusion(const irs::DirectoryReader& reader,
                     irs::analysis::Analyzer& tokenizer) {
   std::cout << "=== Exclusion Query ===\n";
-  auto filter = ParseQuery("+documents -database", "body", tokenizer);
+  auto filter = ParseQuery("+documents -database", kBodyColumnId, tokenizer);
   auto count = CountMatches(reader, *filter);
   std::cout << "Query '+documents -database': " << count << " matches\n\n";
 }
 
-// Read back stored field values from the columnar storage.
+// Read back stored field values from the per-segment .col writer. Title
+// and body live as BLOB columns at `kTitleColumnId` / `kBodyColumnId`;
+// each doc-id maps to row `doc_id - doc_limits::min()` in the column.
 void ReadStoredFields(const irs::DirectoryReader& reader) {
   std::cout << "=== Stored Fields ===\n";
   for (size_t seg_idx = 0; seg_idx < reader.size(); ++seg_idx) {
     auto& segment = reader[seg_idx];
 
-    const auto* title_col = segment.column("title");
-    const auto* body_col = segment.column("body");
+    const auto* col_reader = segment.GetColReader();
+    if (!col_reader) {
+      continue;
+    }
+    const auto* title_col = col_reader->Column(kTitleColumnId);
+    const auto* body_col = col_reader->Column(kBodyColumnId);
     if (!title_col || !body_col) {
       continue;
     }
 
-    auto title_it = title_col->iterator(irs::ColumnHint::Normal);
-    auto* title_payload = irs::get<irs::PayAttr>(*title_it);
+    irs::ColumnReader::PointReader title_cursor{*col_reader, *title_col};
+    irs::ColumnReader::PointReader body_cursor{*col_reader, *body_col};
+    duckdb::Vector title_vec{duckdb::LogicalType::BLOB, 1};
+    duckdb::Vector body_vec{duckdb::LogicalType::BLOB, 1};
 
-    auto body_it = body_col->iterator(irs::ColumnHint::Normal);
-    auto* body_payload = irs::get<irs::PayAttr>(*body_it);
-
-    while (title_it->next()) {
-      irs::BytesViewInput in;
-      in.reset(title_payload->value);
-      auto title = irs::ReadString<std::string>(in);
-
-      body_it->seek(title_it->value());
-      in.reset(body_payload->value);
-      auto body = irs::ReadString<std::string>(in);
-
-      std::cout << "  doc=" << title_it->value() << "\n"
-                << "    title: \"" << title << "\"\n"
-                << "    body:  \"" << body << "\"\n";
+    const uint64_t row_count = title_col->RowCount();
+    for (uint64_t row = 0; row < row_count; ++row) {
+      title_cursor.FetchRow(row, title_vec, 0);
+      body_cursor.FetchRow(row, body_vec, 0);
+      const auto& title_slot =
+        duckdb::FlatVector::GetData<duckdb::string_t>(title_vec)[0];
+      const auto& body_slot =
+        duckdb::FlatVector::GetData<duckdb::string_t>(body_vec)[0];
+      const auto doc = static_cast<irs::doc_id_t>(row + irs::doc_limits::min());
+      std::cout << "  doc=" << doc << "\n    title: \""
+                << std::string_view{title_slot.GetData(),
+                                    static_cast<size_t>(title_slot.GetSize())}
+                << "\"\n    body:  \""
+                << std::string_view{body_slot.GetData(),
+                                    static_cast<size_t>(body_slot.GetSize())}
+                << "\"\n";
     }
   }
   std::cout << "\n";
@@ -287,9 +353,13 @@ void ReadStoredFields(const irs::DirectoryReader& reader) {
 void RemoveDocuments(irs::IndexWriter& writer,
                      irs::analysis::Analyzer& tokenizer) {
   std::cout << "=== Remove Documents ===\n";
-  auto filter = ParseQuery("databases", "title", tokenizer);
-  writer.GetBatch().Remove(*filter);
-  writer.Commit();
+  auto filter = ParseQuery("databases", kTitleColumnId, tokenizer);
+  {
+    auto trx = writer.GetBatch();
+    trx.Remove(*filter);
+    trx.Commit();
+  }
+  writer.RefreshCommit();
 
   auto updated_reader = writer.GetSnapshot();
   std::cout << "After removal:\n";
@@ -298,47 +368,61 @@ void RemoveDocuments(irs::IndexWriter& writer,
             << "\n\n";
 }
 
-// Consolidate segments after removal to reclaim space and merge segments.
-// Deleted documents are only physically removed during consolidation.
-void ConsolidateIndex(irs::IndexWriter& writer, irs::Directory& dir) {
-  std::cout << "=== Consolidate Index ===\n";
+// Compact segments after removal to reclaim space and merge segments.
+// Deleted documents are only physically removed during compaction.
+void CompactIndex(irs::IndexWriter& writer, irs::Directory& dir) {
+  std::cout << "=== Compact Index ===\n";
 
   auto before = writer.GetSnapshot();
-  std::cout << "Before consolidation: " << before.size() << " segment(s)\n";
+  std::cout << "Before compaction: " << before.size() << " segment(s)\n";
 
-  // Tier-based consolidation merges segments of similar size.
-  irs::index_utils::ConsolidateTier tier_opts;
+  // Tier-based compaction merges segments of similar size.
+  irs::index_utils::CompactionTier tier_opts;
   tier_opts.min_segments = 1;
   tier_opts.max_segments = 10;
   auto policy = irs::index_utils::MakePolicy(tier_opts);
 
-  writer.Consolidate(policy);
-  writer.Commit();
+  writer.Compact(policy);
+  writer.RefreshCommit();
 
   // Remove files no longer referenced by any reader.
   irs::directory_utils::RemoveAllUnreferenced(dir);
 
   auto after = writer.GetSnapshot();
-  std::cout << "After consolidation:  " << after.size() << " segment(s)\n";
+  std::cout << "After compaction:  " << after.size() << " segment(s)\n";
   std::cout << "  Total documents: " << after.docs_count() << "\n";
   std::cout << "  Live documents:  " << after.live_docs_count() << "\n";
 }
 
 int main() {
+  // Bracket the process-wide duckdb::DuckDB lifetime; Db() reads it back.
+  auto& engine = sdb::DuckDBEngine::Instance();
+  engine.Initialize();
+
   // Initialize subsystems (required once per process).
-  irs::analysis::analyzers::Init();
   irs::formats::Init();
-  irs::scorers::Init();
-  irs::compression::Init();
 
   auto format = irs::formats::Get("1_5simd");
-  auto scorer =
-    irs::scorers::Get("bm25", irs::Type<irs::text_format::Json>::get(), "{}");
-  auto tokenizer = irs::analysis::analyzers::Get(
-    "segmentation", irs::Type<irs::text_format::Json>::get(), "{}");
+  auto scorer = irs::BM25::Make(irs::BM25::Options{});
+  auto tokenizer = irs::analysis::SegmentationTokenizer::Make(
+    irs::analysis::SegmentationTokenizer::Options{});
 
   irs::MemoryDirectory dir;
-  auto writer = irs::IndexWriter::Make(dir, format, irs::kOmCreate, {});
+  irs::IndexWriterOptions options;
+  options.db = &Db();
+  options.reader_options.db = &Db();
+  options.column_options = [](irs::field_id) -> irs::ColumnOptions {
+    return {.row_group_size = DEFAULT_ROW_GROUP_SIZE};
+  };
+  options.norm_column_options =
+    [next = std::make_shared<std::atomic<irs::field_id>>(0)](
+      irs::field_id) -> irs::NormColumnOptions {
+    return {
+      .id = next->fetch_add(1, std::memory_order_relaxed),
+      .row_group_size = DEFAULT_ROW_GROUP_SIZE,
+    };
+  };
+  auto writer = irs::IndexWriter::Make(dir, format, irs::kOmCreate, options);
 
   BuildIndex(*writer);
 
@@ -354,7 +438,8 @@ int main() {
   QueryExclusion(reader, *tokenizer);
   ReadStoredFields(reader);
   RemoveDocuments(*writer, *tokenizer);
-  ConsolidateIndex(*writer, dir);
+  CompactIndex(*writer, dir);
 
+  engine.Shutdown();
   return 0;
 }

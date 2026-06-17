@@ -25,7 +25,7 @@
 
 #include "assert_format.hpp"
 #include "doc_generator.hpp"
-#include "iresearch/analysis/analyzers.hpp"
+#include "iresearch/analysis/analyzer.hpp"
 #include "iresearch/analysis/token_attributes.hpp"
 #include "iresearch/analysis/tokenizers.hpp"
 #include "iresearch/index/directory_reader.hpp"
@@ -44,6 +44,17 @@ struct TermAttr;
 }
 
 namespace tests {
+
+irs::IndexWriterOptions CsDefaultWriterOptions();
+irs::IndexReaderOptions CsDefaultReaderOptions();
+
+// `db` is mandatory at IndexWriter::Make. Fixtures that build their own
+// IndexWriterOptions (e.g. to set a custom scorer) often leave `db` unset;
+// fill it from the shared CsDb() so they keep working. Also fills
+// `norm_column_options` from the shared monotonic allocator when the caller
+// didn't set one -- with a cs writer present, a Norm-featured field requires
+// a norm_column_options callback (FieldsData::emplace asserts it).
+irs::IndexWriterOptions EnsureWriterDb(irs::IndexWriterOptions opts);
 
 class DirectoryMock : public irs::Directory {
  public:
@@ -190,18 +201,18 @@ class IndexTestBase : public virtual TestParamBase<index_test_context> {
 
   irs::IndexWriter::ptr open_writer(
     irs::Directory& dir, irs::OpenMode mode = irs::kOmCreate,
-    const irs::IndexWriterOptions& options = {}) const {
-    return irs::IndexWriter::Make(dir, _codec, mode, options);
+    const irs::IndexWriterOptions& options = CsDefaultWriterOptions()) const {
+    return irs::IndexWriter::Make(dir, _codec, mode, EnsureWriterDb(options));
   }
 
   irs::IndexWriter::ptr open_writer(
     irs::OpenMode mode = irs::kOmCreate,
-    const irs::IndexWriterOptions& options = {}) const {
-    return irs::IndexWriter::Make(*_dir, _codec, mode, options);
+    const irs::IndexWriterOptions& options = CsDefaultWriterOptions()) const {
+    return irs::IndexWriter::Make(*_dir, _codec, mode, EnsureWriterDb(options));
   }
 
   irs::DirectoryReader open_reader(
-    const irs::IndexReaderOptions& options = {}) const {
+    const irs::IndexReaderOptions& options = CsDefaultReaderOptions()) const {
     return irs::DirectoryReader{*_dir, _codec, options};
   }
 
@@ -211,10 +222,6 @@ class IndexTestBase : public virtual TestParamBase<index_test_context> {
                     irs::automaton_table_matcher* matcher = nullptr) const {
     tests::AssertIndex(open_reader().GetImpl(), index(), features, skip,
                        matcher);
-  }
-
-  void assert_columnstore(size_t skip = 0) const {
-    tests::AssertColumnstore(open_reader().GetImpl(), index(), skip);
   }
 
   void SetUp() final {
@@ -236,24 +243,33 @@ class IndexTestBase : public virtual TestParamBase<index_test_context> {
     irs::timer_utils::InitStats();  // disable profile state tracking
   }
 
+  // Called inside the per-doc insert transaction. Tests use it to copy
+  // selected source fields into cs columns keyed by a per-file
+  // `constexpr irs::field_id` constant (see `tests::StoreFieldAt`).
+  using StoreHook =
+    std::function<void(irs::IndexWriter::Document&, const tests::Document&)>;
+
   void write_segment(irs::IndexWriter& writer, tests::IndexSegment& segment,
-                     tests::DocGeneratorBase& gen);
+                     tests::DocGeneratorBase& gen, const StoreHook& store = {});
 
   void write_segment_batched(irs::IndexWriter& writer,
                              tests::IndexSegment& segment,
                              tests::DocGeneratorBase& gen, size_t batch_size);
 
-  void add_segment(irs::IndexWriter& writer, tests::DocGeneratorBase& gen);
+  void add_segment(irs::IndexWriter& writer, tests::DocGeneratorBase& gen,
+                   const StoreHook& store = {});
 
   void add_segments(irs::IndexWriter& writer,
                     std::vector<DocGeneratorBase::ptr>& gens);
 
-  void add_segment(tests::DocGeneratorBase& gen,
-                   irs::OpenMode mode = irs::kOmCreate,
-                   const irs::IndexWriterOptions& opts = {});
-  void add_segment_batched(tests::DocGeneratorBase& gen, size_t batch_size,
-                           irs::OpenMode mode = irs::kOmCreate,
-                           const irs::IndexWriterOptions& opts = {});
+  void add_segment(
+    tests::DocGeneratorBase& gen, irs::OpenMode mode = irs::kOmCreate,
+    const irs::IndexWriterOptions& opts = CsDefaultWriterOptions(),
+    const StoreHook& store = {});
+  void add_segment_batched(
+    tests::DocGeneratorBase& gen, size_t batch_size,
+    irs::OpenMode mode = irs::kOmCreate,
+    const irs::IndexWriterOptions& opts = CsDefaultWriterOptions());
 
  private:
   index_t _index;

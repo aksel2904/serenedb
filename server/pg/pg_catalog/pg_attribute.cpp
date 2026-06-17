@@ -24,7 +24,6 @@
 #include "basics/down_cast.h"
 #include "catalog/catalog.h"
 #include "catalog/identifiers/object_id.h"
-#include "catalog/local_catalog.h"
 #include "catalog/object.h"
 #include "catalog/schema.h"
 #include "catalog/table.h"
@@ -33,7 +32,6 @@
 #include "pg/pg_catalog/fwd.h"
 #include "pg/pg_types.h"
 #include "pg/system_catalog.h"
-#include "rest_server/serened.h"
 
 namespace sdb::pg {
 namespace {
@@ -122,7 +120,7 @@ void EmitColumnsForTable(const catalog::Table& table,
 
     bool is_pk = false;
     for (auto pk_id : pk_columns) {
-      if (pk_id == col.id) {
+      if (pk_id == col.GetId()) {
         is_pk = true;
         break;
       }
@@ -137,7 +135,7 @@ void EmitColumnsForTable(const catalog::Table& table,
 
     PgAttribute row{
       .attrelid = table.GetId().id(),
-      .attname = col.name,
+      .attname = col.GetName(),
       .atttypid = type_oid,
       .attlen = phys.attlen,
       .attnum = static_cast<int16_t>(i + 1),

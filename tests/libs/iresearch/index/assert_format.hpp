@@ -86,8 +86,6 @@ struct Term {
 struct Field : public irs::FieldMeta {
   struct FeatureInfo {
     irs::field_id id;
-    irs::FeatureWriterFactory factory;
-    irs::FeatureWriter::ptr writer;
   };
 
   struct FieldStats : irs::FieldStats {
@@ -95,7 +93,7 @@ struct Field : public irs::FieldMeta {
     uint32_t offs{};
   };
 
-  Field(const std::string_view& name, irs::IndexFeatures index_features);
+  Field(irs::field_id id, irs::IndexFeatures index_features);
   Field(Field&& rhs) = default;
   Field& operator=(Field&& rhs) = default;
 
@@ -118,21 +116,15 @@ struct Field : public irs::FieldMeta {
 
 class ColumnValues {
  public:
-  explicit ColumnValues(irs::field_id id, irs::FeatureWriterFactory factory,
-                        irs::FeatureWriter* writer)
-    : _id{id}, _factory{factory}, _writer{writer} {}
-
   ColumnValues(std::string name, irs::field_id id)
     : _id{id}, _name{std::move(name)} {}
+
+  explicit ColumnValues(irs::field_id id) : _id{id} {}
 
   void insert(irs::doc_id_t key, irs::bytes_view value);
 
   irs::field_id id() const noexcept { return _id; }
-  std::string_view name() const noexcept {
-    return _name.has_value() ? _name.value() : std::string_view{};
-  }
-
-  irs::bstring payload() const;
+  std::string_view name() const noexcept { return _name; }
 
   auto begin() const { return _values.begin(); }
   auto end() const { return _values.end(); }
@@ -140,20 +132,16 @@ class ColumnValues {
   auto empty() const { return _values.empty(); }
 
   void sort(const std::map<irs::doc_id_t, irs::doc_id_t>& docs);
-  void rewrite();
 
  private:
   irs::field_id _id;
-  std::optional<std::string> _name;
-  mutable std::optional<irs::bstring> _payload;
+  std::string _name;
   std::map<irs::doc_id_t, irs::bstring> _values;
-  irs::FeatureWriterFactory _factory;
-  irs::FeatureWriter* _writer{};
 };
 
 class IndexSegment : irs::util::Noncopyable {
  public:
-  using field_map_t = std::map<std::string_view, Field>;
+  using field_map_t = std::map<irs::field_id, Field>;
   using columns_t = std::deque<ColumnValues>;  // pointers remain valid
   using named_columns_t = std::map<std::string, ColumnValues*>;
 
@@ -222,7 +210,7 @@ void IndexSegment::insert(IndexedFieldIterator indexed_begin,
   // reset field per-document state
   _doc_fields.clear();
   for (auto it = indexed_begin; it != indexed_end; ++it) {
-    auto field = _fields.find(it->Name());
+    auto field = _fields.find(it->Id());
 
     if (field != _fields.end()) {
       field->second.stats = {};
@@ -246,23 +234,14 @@ void IndexSegment::insert(IndexedFieldIterator indexed_begin,
 
 using index_t = std::vector<IndexSegment>;
 
-void AssertColumnstore(
-  const irs::Directory& dir, irs::Format::ptr codec,
-  const index_t& expected_index,
-  size_t skip = 0);  // do not validate the first 'skip' segments
-
-void AssertColumnstore(
-  irs::IndexReader::ptr actual_index, const index_t& expected_index,
-  size_t skip = 0);  // do not validate the first 'skip' segments
-
 void AssertIndex(irs::IndexReader::ptr actual_index,
                  const index_t& expected_index, irs::IndexFeatures features,
-                 size_t skip = 0,  // do not validate the first 'skip' segments
+                 size_t skip = 0,
                  irs::automaton_table_matcher* matcher = nullptr);
 
 void AssertIndex(const irs::Directory& dir, irs::Format::ptr codec,
                  const index_t& index, irs::IndexFeatures features,
-                 size_t skip = 0,  // no not validate the first 'skip' segments
+                 size_t skip = 0,
                  irs::automaton_table_matcher* matcher = nullptr);
 
 }  // namespace tests

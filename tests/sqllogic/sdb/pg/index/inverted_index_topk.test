@@ -42,7 +42,7 @@ CREATE INDEX docs_topk_idx ON docs USING inverted(id, body en_topk);
 
 
 statement ok
-VACUUM (UPDATE_INDEXES) docs;
+VACUUM (REFRESH_TABLE) docs;
 
 
 query
@@ -50,13 +50,6 @@ EXPLAIN SELECT id FROM docs_topk_idx WHERE body @@ ts_phrase('fox') ORDER BY BM2
 ----
 QUERY PLAN
 ┌───────────────────────────┐
-│         PROJECTION        │
-│    ────────────────────   │
-│             #0            │
-│                           │
-│           ~1 row          │
-└─────────────┬─────────────┘
-┌─────────────┴─────────────┐
 │           TOP_N           │
 │    ────────────────────   │
 │           Top: 5          │
@@ -68,11 +61,20 @@ QUERY PLAN
 │       IRESEARCH_SCAN      │
 │    ────────────────────   │
 │    Index: docs_topk_idx   │
-│      Lookup: rocksdb      │
+│       Lookup: table       │
 │                           │
 │          Filter:          │
-│ AND[PHRASE[body(string) = │
-│    <Term:fox(0, 0); >]]   │
+│  ┌─────────────────────┐  │
+│  │┌───────────────────┐│  │
+│  ││        AND        ││  │
+│  │└─────────┬─────────┘│  │
+│  │┌─────────┴─────────┐│  │
+│  ││       PHRASE      ││  │
+│  ││    ────────────   ││  │
+│  ││  body(string) =   ││  │
+│  ││ <Term:fox(0, 0); >││  │
+│  │└───────────────────┘│  │
+│  └─────────────────────┘  │
 │                           │
 │           Score:          │
 │    bm25(k1=1.2, b=0.75)   │
@@ -81,8 +83,18 @@ QUERY PLAN
 │             id            │
 │  sdb_inverted_index_score │
 │                           │
-│          ~5 rows          │
+│           ~1 row          │
 └───────────────────────────┘
+
+
+query
+SELECT id FROM docs_topk_idx WHERE body @@ ts_phrase('fox') ORDER BY BM25(docs_topk_idx.tableoid) ASC LIMIT 5;
+----
+id
+1
+5
+4
+2
 
 
 query ?
@@ -103,11 +115,20 @@ QUERY PLAN
 │       IRESEARCH_SCAN      │
 │    ────────────────────   │
 │    Index: docs_topk_idx   │
-│      Lookup: rocksdb      │
+│       Lookup: table       │
 │                           │
 │          Filter:          │
-│ AND[PHRASE[body(string) = │
-│    <Term:fox(0, 0); >]]   │
+│  ┌─────────────────────┐  │
+│  │┌───────────────────┐│  │
+│  ││        AND        ││  │
+│  │└─────────┬─────────┘│  │
+│  │┌─────────┴─────────┐│  │
+│  ││       PHRASE      ││  │
+│  ││    ────────────   ││  │
+│  ││  body(string) =   ││  │
+│  ││ <Term:fox(0, 0); >││  │
+│  │└───────────────────┘│  │
+│  └─────────────────────┘  │
 │                           │
 │           Score:          │
 │    bm25(k1=1.2, b=0.75)   │
@@ -116,7 +137,7 @@ QUERY PLAN
 │             id            │
 │  sdb_inverted_index_score │
 │                           │
-│          ~5 rows          │
+│           ~1 row          │
 └───────────────────────────┘
 
 
@@ -125,13 +146,6 @@ EXPLAIN SELECT id FROM docs_topk_idx WHERE body @@ ts_phrase('fox') ORDER BY BM2
 ----
 QUERY PLAN
 ┌───────────────────────────┐
-│         PROJECTION        │
-│    ────────────────────   │
-│             #0            │
-│                           │
-│           ~1 row          │
-└─────────────┬─────────────┘
-┌─────────────┴─────────────┐
 │           TOP_N           │
 │    ────────────────────   │
 │           Top: 5          │
@@ -146,11 +160,20 @@ QUERY PLAN
 │       IRESEARCH_SCAN      │
 │    ────────────────────   │
 │    Index: docs_topk_idx   │
-│      Lookup: rocksdb      │
+│       Lookup: table       │
 │                           │
 │          Filter:          │
-│ AND[PHRASE[body(string) = │
-│    <Term:fox(0, 0); >]]   │
+│  ┌─────────────────────┐  │
+│  │┌───────────────────┐│  │
+│  ││        AND        ││  │
+│  │└─────────┬─────────┘│  │
+│  │┌─────────┴─────────┐│  │
+│  ││       PHRASE      ││  │
+│  ││    ────────────   ││  │
+│  ││  body(string) =   ││  │
+│  ││ <Term:fox(0, 0); >││  │
+│  │└───────────────────┘│  │
+│  └─────────────────────┘  │
 │                           │
 │           Score:          │
 │    bm25(k1=1.2, b=0.75)   │
@@ -159,7 +182,7 @@ QUERY PLAN
 │             id            │
 │  sdb_inverted_index_score │
 │                           │
-│          ~5 rows          │
+│           ~1 row          │
 └───────────────────────────┘
 
 
@@ -168,13 +191,6 @@ EXPLAIN SELECT id FROM docs_topk_idx WHERE body @@ ts_phrase('fox') ORDER BY BM2
 ----
 QUERY PLAN
 ┌───────────────────────────┐
-│         PROJECTION        │
-│    ────────────────────   │
-│             #0            │
-│                           │
-│           ~1 row          │
-└─────────────┬─────────────┘
-┌─────────────┴─────────────┐
 │          ORDER_BY         │
 │    ────────────────────   │
 │           #1 ASC          │
@@ -185,11 +201,20 @@ QUERY PLAN
 │       IRESEARCH_SCAN      │
 │    ────────────────────   │
 │    Index: docs_topk_idx   │
-│      Lookup: rocksdb      │
+│       Lookup: table       │
 │                           │
 │          Filter:          │
-│ AND[PHRASE[body(string) = │
-│    <Term:fox(0, 0); >]]   │
+│  ┌─────────────────────┐  │
+│  │┌───────────────────┐│  │
+│  ││        AND        ││  │
+│  │└─────────┬─────────┘│  │
+│  │┌─────────┴─────────┐│  │
+│  ││       PHRASE      ││  │
+│  ││    ────────────   ││  │
+│  ││  body(string) =   ││  │
+│  ││ <Term:fox(0, 0); >││  │
+│  │└───────────────────┘│  │
+│  └─────────────────────┘  │
 │                           │
 │           Score:          │
 │    bm25(k1=1.2, b=0.75)   │
@@ -198,42 +223,62 @@ QUERY PLAN
 │             id            │
 │  sdb_inverted_index_score │
 │                           │
-│          ~5 rows          │
+│           ~1 row          │
 └───────────────────────────┘
 
 
 # ---- EXPLAIN with LIMIT: strategy should flip to iresearch_score_topk_scan ----
 # When the query has ORDER BY BM25() DESC + LIMIT k, the optimizer rule
 # TryAttachScoreTopK pulls the limit into SearchScan.score_top_k. This changes
-# the scan function name and adds a "TopK: k" line to the EXPLAIN box.
+# the scan function name and adds a "Top: k" line to the EXPLAIN box.
 
 query
 EXPLAIN SELECT id FROM docs_topk_idx WHERE body @@ ts_phrase('fox') ORDER BY BM25(docs_topk_idx.tableoid) DESC LIMIT 3;
 ----
 QUERY PLAN
 ┌───────────────────────────┐
+│           TOP_N           │
+│    ────────────────────   │
+│           Top: 3          │
+│     Order By: #1 DESC     │
+│                           │
+│           ~1 row          │
+└─────────────┬─────────────┘
+┌─────────────┴─────────────┐
 │       IRESEARCH_SCAN      │
 │    ────────────────────   │
 │    Index: docs_topk_idx   │
-│      Lookup: rocksdb      │
+│       Lookup: table       │
 │                           │
 │          Filter:          │
-│ AND[PHRASE[body(string) = │
-│    <Term:fox(0, 0); >]]   │
+│  ┌─────────────────────┐  │
+│  │┌───────────────────┐│  │
+│  ││        AND        ││  │
+│  │└─────────┬─────────┘│  │
+│  │┌─────────┴─────────┐│  │
+│  ││       PHRASE      ││  │
+│  ││    ────────────   ││  │
+│  ││  body(string) =   ││  │
+│  ││ <Term:fox(0, 0); >││  │
+│  │└───────────────────┘│  │
+│  └─────────────────────┘  │
 │                           │
 │           Score:          │
 │    bm25(k1=1.2, b=0.75)   │
 │                           │
-│          TopK: 3          │
-│      Projections: id      │
+│           Top: 3          │
 │                           │
-│          ~5 rows          │
+│        Projections:       │
+│             id            │
+│  sdb_inverted_index_score │
+│                           │
+│           ~1 row          │
 └───────────────────────────┘
 
 
 # ---- EXPLAIN: UNION ALL of two topk branches ----
 # Each branch independently qualifies for TryAttachScoreTopK; both scans
-# should show Strategy=iresearch_score_topk_scan with TopK=3.
+# should show Strategy=iresearch_score_topk_scan with Top=3.
 
 query
 EXPLAIN (SELECT id, BM25(docs_topk_idx.tableoid) > 0 AS has_score FROM docs_topk_idx WHERE body @@ ts_phrase('fox') ORDER BY BM25(docs_topk_idx.tableoid) DESC LIMIT 3)
@@ -247,16 +292,25 @@ QUERY PLAN
 │    ────────────────────   │
 │           id ASC          │
 │                           │
-│          ~0 rows          │
+│          ~2 rows          │
 └─────────────┬─────────────┘
 ┌─────────────┴─────────────┐
 │           UNION           ├──────────────┐
 └─────────────┬─────────────┘              │
 ┌─────────────┴─────────────┐┌─────────────┴─────────────┐
+│           TOP_N           ││           TOP_N           │
+│    ────────────────────   ││    ────────────────────   │
+│           Top: 3          ││           Top: 3          │
+│     Order By: #2 DESC     ││     Order By: #2 DESC     │
+│                           ││                           │
+│           ~1 row          ││           ~1 row          │
+└─────────────┬─────────────┘└─────────────┬─────────────┘
+┌─────────────┴─────────────┐┌─────────────┴─────────────┐
 │         PROJECTION        ││         PROJECTION        │
 │    ────────────────────   ││    ────────────────────   │
 │             id            ││             id            │
 │         has_score         ││         has_score         │
+│  sdb_inverted_index_score ││  sdb_inverted_index_score │
 │                           ││                           │
 │           ~1 row          ││           ~1 row          │
 └─────────────┬─────────────┘└─────────────┬─────────────┘
@@ -264,22 +318,31 @@ QUERY PLAN
 │       IRESEARCH_SCAN      ││       IRESEARCH_SCAN      │
 │    ────────────────────   ││    ────────────────────   │
 │    Index: docs_topk_idx   ││    Index: docs_topk_idx   │
-│      Lookup: rocksdb      ││      Lookup: rocksdb      │
+│       Lookup: table       ││       Lookup: table       │
 │                           ││                           │
 │          Filter:          ││          Filter:          │
-│ AND[PHRASE[body(string) = ││ AND[PHRASE[body(string) = │
-│    <Term:fox(0, 0); >]]   ││   <Term:lazy(0, 0); >]]   │
+│  ┌─────────────────────┐  ││  ┌─────────────────────┐  │
+│  │┌───────────────────┐│  ││  │┌───────────────────┐│  │
+│  ││        AND        ││  ││  ││        AND        ││  │
+│  │└─────────┬─────────┘│  ││  │└─────────┬─────────┘│  │
+│  │┌─────────┴─────────┐│  ││  │┌─────────┴─────────┐│  │
+│  ││       PHRASE      ││  ││  ││       PHRASE      ││  │
+│  ││    ────────────   ││  ││  ││    ────────────   ││  │
+│  ││  body(string) =   ││  ││  ││  body(string) =   ││  │
+│  ││ <Term:fox(0, 0); >││  ││  ││<Term:lazy(0, 0); >││  │
+│  │└───────────────────┘│  ││  │└───────────────────┘│  │
+│  └─────────────────────┘  ││  └─────────────────────┘  │
 │                           ││                           │
 │           Score:          ││           Score:          │
 │    bm25(k1=1.2, b=0.75)   ││    bm25(k1=1.2, b=0.75)   │
 │                           ││                           │
-│          TopK: 3          ││          TopK: 3          │
+│           Top: 3          ││           Top: 3          │
 │                           ││                           │
 │        Projections:       ││        Projections:       │
 │             id            ││             id            │
 │  sdb_inverted_index_score ││  sdb_inverted_index_score │
 │                           ││                           │
-│          ~5 rows          ││          ~5 rows          │
+│           ~1 row          ││           ~1 row          │
 └───────────────────────────┘└───────────────────────────┘
 
 
@@ -298,28 +361,45 @@ QUERY PLAN
 │    ────────────────────   │
 │         sub.id ASC        │
 │                           │
-│          ~0 rows          │
+│           ~1 row          │
+└─────────────┬─────────────┘
+┌─────────────┴─────────────┐
+│           TOP_N           │
+│    ────────────────────   │
+│           Top: 3          │
+│     Order By: #1 DESC     │
+│                           │
+│           ~1 row          │
 └─────────────┬─────────────┘
 ┌─────────────┴─────────────┐
 │       IRESEARCH_SCAN      │
 │    ────────────────────   │
 │    Index: docs_topk_idx   │
-│      Lookup: rocksdb      │
+│       Lookup: table       │
 │                           │
 │          Filter:          │
-│ AND[PHRASE[body(string) = │
-│    <Term:fox(0, 0); >]]   │
+│  ┌─────────────────────┐  │
+│  │┌───────────────────┐│  │
+│  ││        AND        ││  │
+│  │└─────────┬─────────┘│  │
+│  │┌─────────┴─────────┐│  │
+│  ││       PHRASE      ││  │
+│  ││    ────────────   ││  │
+│  ││  body(string) =   ││  │
+│  ││ <Term:fox(0, 0); >││  │
+│  │└───────────────────┘│  │
+│  └─────────────────────┘  │
 │                           │
 │           Score:          │
 │    bm25(k1=1.2, b=0.75)   │
 │                           │
-│          TopK: 3          │
+│           Top: 3          │
 │                           │
 │        Projections:       │
 │             id            │
 │  sdb_inverted_index_score │
 │                           │
-│          ~5 rows          │
+│           ~1 row          │
 └───────────────────────────┘
 
 
@@ -396,7 +476,7 @@ INSERT INTO docs VALUES (19, 'purple fox');
 
 
 statement ok
-VACUUM (UPDATE_INDEXES) docs;
+VACUUM (REFRESH_TABLE) docs;
 
 
 # Get expected results from full scan across two segments

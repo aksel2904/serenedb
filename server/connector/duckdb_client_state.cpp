@@ -22,16 +22,74 @@
 
 #include <duckdb/common/enum_util.hpp>
 #include <duckdb/common/exception.hpp>
+#include <duckdb/main/attached_database.hpp>
 #include <duckdb/main/client_context.hpp>
+#include <duckdb/main/prepared_statement_data.hpp>
+#include <utility>
 
 #include "basics/assert.h"
 #include "basics/containers/trivial_map.h"
+#include "basics/debugging.h"
 #include "basics/system-compiler.h"
+#include "catalog/database.h"
+#include "catalog/store/store.h"
+#include "connector/duckdb_physical_create_index.h"
+#include "connector/duckdb_physical_progress.h"
 #include "pg/connection_context.h"
+#include "pg/copy_messages_queue.h"
 #include "pg/errcodes.h"
+#include "pg/progress_tracker.h"
 #include "pg/sql_exception_macro.h"
 
 namespace sdb::connector {
+namespace {
+
+std::unique_ptr<pg::ProgressReporter> MakeProgressReporter(
+  ObjectId datid, const duckdb::PreparedStatementData& prepared) {
+  if (!prepared.physical_plan) {
+    return nullptr;
+  }
+  const auto& root = prepared.physical_plan->Root();
+
+  if (prepared.statement_type == duckdb::StatementType::COPY_STATEMENT) {
+    // COPY FROM plans as a native insert with the SDB_PROGRESS pass-through
+    // (carrying the facade table) directly underneath.
+    const SereneDBPhysicalProgress* progress_op = nullptr;
+    if (!root.children.empty()) {
+      progress_op =
+        dynamic_cast<const SereneDBPhysicalProgress*>(&root.children[0].get());
+    }
+    if (!progress_op) {
+      return nullptr;
+    }
+    auto reporter = std::make_unique<pg::ProgressReporter>(
+      datid, progress_op->TargetTableId(), pg::ProgressCommand::Copy);
+    reporter->SetCommand(pg::copy_progress::Command::CopyFrom);
+    reporter->SetType(pg::copy_progress::Type::File);
+    return reporter;
+  }
+
+  if (prepared.statement_type == duckdb::StatementType::CREATE_STATEMENT) {
+    const auto* ci = dynamic_cast<const SereneDBPhysicalCreateIndex*>(&root);
+    if (!ci) {
+      return nullptr;
+    }
+    auto reporter = std::make_unique<pg::ProgressReporter>(
+      ci->DatabaseId(), ci->TargetRelationId(),
+      pg::ProgressCommand::CreateIndex);
+    reporter->SetCommand(pg::create_index_progress::Command::CreateIndex);
+    reporter->SetPhase(pg::create_index_progress::Phase::Initializing);
+    if (ci->estimated_cardinality > 0) {
+      reporter->Set(pg::create_index_progress::Param::TuplesTotal,
+                    static_cast<int64_t>(ci->estimated_cardinality));
+    }
+    return reporter;
+  }
+
+  return nullptr;
+}
+
+}  // namespace
 
 void SereneDBClientState::Register(
   duckdb::ClientContext& client_ctx,
@@ -108,7 +166,8 @@ void SereneDBClientState::Register(
           ERR_HINT("Available values: repeatable read, read committed."));
       }
       auto& conn_ctx = GetSereneDBContext(ctx);
-      if (conn_ctx.IsExplicitTransaction() && conn_ctx.HasRocksDBSnapshot() &&
+      if (conn_ctx.IsExplicitTransaction() &&
+          conn_ctx.HadQueryInTransaction() &&
           level != conn_ctx.GetIsolationLevel()) {
         throw duckdb::InvalidInputException(
           "SET TRANSACTION ISOLATION LEVEL must be called before any query");
@@ -116,12 +175,48 @@ void SereneDBClientState::Register(
     };
 }
 
+namespace {
+
+// Published for the duration of the storage commit: BoundIndex appends run
+// on the committing connection's thread inside LocalStorage::Flush, after
+// TransactionPreCommit and before TransactionCommit/Rollback, with no
+// ClientContext parameter of their own.
+thread_local ConnectionContext* tls_committing_ctx = nullptr;
+
+}  // namespace
+
+ConnectionContext* CurrentCommittingContext() noexcept {
+  return tls_committing_ctx;
+}
+
 void SereneDBClientState::TransactionPreCommit(
   duckdb::MetaTransaction& transaction, duckdb::ClientContext& context) {
+  // Pre-durability crash point: fires before the engine commit, so the
+  // transaction must be absent after restart. Only write transactions
+  // crash (the fault-arming SET itself must survive). Name historical.
+  SDB_IF_FAILURE("crash_before_search_commit") {
+    if (transaction.ModifiedDatabase()) {
+      SDB_IMMEDIATE_ABORT();
+    }
+  }
   // Revert SET LOCAL variables while the DuckDB transaction is still active
   // so catalog lookups performed by custom-impl settings (e.g. search_path)
   // can succeed via their normal set_local path.
   _connection_ctx->PreCommit();
+  tls_committing_ctx = _connection_ctx.get();
+}
+
+void SereneDBClientState::TransactionPreCheckpoint(duckdb::AttachedDatabase& db,
+                                                   duckdb::ClientContext&) {
+  // Commit the search-index leg synchronously with the store table changes:
+  // this fires after the store database's changes are durable but before the
+  // in-commit checkpoint, so the checkpoint's force-refresh never waits on an
+  // un-committed in-flight batch. Only the store database carries indexed
+  // tables, so settle on its commit.
+  if (db.GetName() != catalog::kStoreDatabaseName) {
+    return;
+  }
+  _connection_ctx->CommitSearch();
 }
 
 void SereneDBClientState::TransactionPreRollback(
@@ -132,6 +227,15 @@ void SereneDBClientState::TransactionPreRollback(
 
 void SereneDBClientState::TransactionCommit(
   duckdb::MetaTransaction& transaction, duckdb::ClientContext& context) {
+  // Post-durability crash point: the engine commit is durable, search
+  // ticks are not yet -- recovery must rebuild the storage. Only write
+  // transactions crash. Name historical.
+  SDB_IF_FAILURE("crash_after_search_commit") {
+    if (transaction.ModifiedDatabase()) {
+      SDB_IMMEDIATE_ABORT();
+    }
+  }
+  tls_committing_ctx = nullptr;
   auto r = _connection_ctx->Commit();
   if (!r.ok()) {
     throw duckdb::TransactionException("SereneDB commit failed: %s",
@@ -141,6 +245,7 @@ void SereneDBClientState::TransactionCommit(
 
 void SereneDBClientState::TransactionRollback(
   duckdb::MetaTransaction& transaction, duckdb::ClientContext& context) {
+  tls_committing_ctx = nullptr;
   auto r = _connection_ctx->Rollback();
   if (!r.ok()) {
     throw duckdb::TransactionException("SereneDB rollback failed: %s",
@@ -148,18 +253,31 @@ void SereneDBClientState::TransactionRollback(
   }
 }
 
+duckdb::RebindQueryInfo SereneDBClientState::OnExecutePrepared(
+  duckdb::ClientContext& context, duckdb::PreparedStatementCallbackInfo& info,
+  duckdb::RebindQueryInfo current_rebind) {
+  if (const auto& db = _connection_ctx->GetDatabasePtr()) {
+    progress = MakeProgressReporter(db->GetId(), info.prepared_statement);
+  }
+  return current_rebind;
+}
+
 void SereneDBClientState::QueryEnd(duckdb::ClientContext& context) {
-  copy_queue = nullptr;
-  send_buffer = nullptr;
+  if (auto* queue = _connection_ctx->GetCopyQueue()) {
+    queue->CloseListening();
+  }
   copy_stdin_buffer.reset();
   copy_stdin_open_count = 0;
+  copy_stdin_done = false;
+  progress.reset();
   _connection_ctx->OnNewStatement();
 }
 
 ConnectionContext& GetSereneDBContext(duckdb::ClientContext& context) {
   auto state =
     context.registered_state->Get<SereneDBClientState>(kSereneDBClientStateKey);
-  SDB_ASSERT(state, "SereneDB client state not registered");
+  SDB_ASSERT(state, "SereneDB client state not registered; active query: ",
+             context.GetCurrentQuery());
   return state->GetConnectionContext();
 }
 

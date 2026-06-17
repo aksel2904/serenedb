@@ -154,7 +154,7 @@ void NextvalFunction(duckdb::DataChunk& args, duckdb::ExpressionState& state,
       ThrowMaxReached(opts, qualified);
     }
     for (duckdb::idx_t i = 0; i < num_rows; ++i) {
-      out[i] = GetValue(opts, r0 + i * opts.increment);
+      out.WriteValue(GetValue(opts, r0 + i * opts.increment));
     }
     return;
   }
@@ -165,7 +165,7 @@ void NextvalFunction(duckdb::DataChunk& args, duckdb::ExpressionState& state,
   for (duckdb::idx_t i = 0; i < num_rows; ++i) {
     auto idx = fmt.sel->get_index(i);
     std::string_view seq_name{names[idx].GetData(), names[idx].GetSize()};
-    out[i] = Nextval(context, seq_name);
+    out.WriteValue(Nextval(context, seq_name));
   }
 }
 
@@ -193,7 +193,7 @@ void CurrvalFunction(duckdb::DataChunk& args, duckdb::ExpressionState& state,
   for (duckdb::idx_t i = 0; i < num_rows; ++i) {
     auto idx = fmt.sel->get_index(i);
     std::string_view seq_name{names[idx].GetData(), names[idx].GetSize()};
-    out[i] = Currval(context, seq_name);
+    out.WriteValue(Currval(context, seq_name));
   }
 }
 
@@ -230,46 +230,45 @@ void Setval3Function(duckdb::DataChunk& args, duckdb::ExpressionState& state,
 
 void RegisterSequenceFunctions(duckdb::DatabaseInstance& db) {
   duckdb::ExtensionLoader loader{db, "serenedb"};
-
   {
     duckdb::ScalarFunction func{
-      "nextval",
+      std::string{kNextval},
       {duckdb::LogicalType::VARCHAR},
       duckdb::LogicalType::BIGINT,
       NextvalFunction,
     };
-    func.stability = duckdb::FunctionStability::VOLATILE;
+    func.SetVolatile();
     loader.RegisterFunction(func);
   }
   {
     duckdb::ScalarFunction func{
-      "currval",
+      std::string{kCurrval},
       {duckdb::LogicalType::VARCHAR},
       duckdb::LogicalType::BIGINT,
       CurrvalFunction,
     };
-    func.stability = duckdb::FunctionStability::VOLATILE;
+    func.SetVolatile();
     loader.RegisterFunction(func);
   }
   {
     duckdb::ScalarFunction func{
-      "setval",
+      std::string{kSetval},
       {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT},
       duckdb::LogicalType::BIGINT,
       Setval2Function,
     };
-    func.stability = duckdb::FunctionStability::VOLATILE;
+    func.SetVolatile();
     loader.RegisterFunction(func);
   }
   {
     duckdb::ScalarFunction func{
-      "setval",
+      std::string{kSetval},
       {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BIGINT,
        duckdb::LogicalType::BOOLEAN},
       duckdb::LogicalType::BIGINT,
       Setval3Function,
     };
-    func.stability = duckdb::FunctionStability::VOLATILE;
+    func.SetVolatile();
     loader.RegisterFunction(func);
   }
 }

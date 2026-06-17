@@ -21,11 +21,8 @@
 
 #include "exec_context.h"
 
-#include "auth/role_utils.h"
 #include "basics/static_strings.h"
 #include "catalog/identifiers/object_id.h"
-#include "general_server/authentication_feature.h"
-#include "general_server/state.h"
 
 namespace sdb {
 
@@ -38,65 +35,12 @@ ExecContext::ExecContext(std::string_view user, std::string_view dbname,
     _database{dbname},
     _database_id{database_id},
     _type{ExecContext::Type::Default} {
-  AuthenticationFeature* af = AuthenticationFeature::instance();
-  SDB_ASSERT(af != nullptr);
+  // Auth is intentionally absent until post-RBAC. Every context is admin.
   _database_auth_level = auth::Level::RW;
   _system_db_auth_level = auth::Level::RW;
-
   _is_admin_user = true;
-  if (af->isActive()) {
-    _database_auth_level = _system_db_auth_level =
-      auth::DatabaseAuthLevel(user, dbname, false);
-    if (dbname != StaticStrings::kDefaultDatabase) {
-      _system_db_auth_level =
-        auth::DatabaseAuthLevel(user, StaticStrings::kDefaultDatabase, false);
-    }
-    _is_admin_user = (_system_db_auth_level == auth::Level::RW);
-    if (!_is_admin_user && ServerState::instance()->ReadOnly()) {
-      _is_admin_user =
-        auth::DatabaseAuthLevel(user, StaticStrings::kDefaultDatabase, true) ==
-        auth::Level::RW;
-    }
-  }
 }
 
 const ExecContext& ExecContext::superuser() { return kSuperuser; }
-
-std::shared_ptr<const ExecContext> ExecContext::superuserAsShared() {
-  return {std::shared_ptr<const ExecContext>{}, &kSuperuser};
-}
-
-bool ExecContext::isAuthEnabled() {
-  AuthenticationFeature* af = AuthenticationFeature::instance();
-  SDB_ASSERT(af != nullptr);
-  return af->isActive();
-}
-
-bool ExecContext::canUseDatabase(std::string_view db,
-                                 auth::Level requested) const {
-  if (isInternal() || _database == db) {
-    // should be RW for superuser, RO for read-only
-    return requested <= _database_auth_level;
-  }
-
-  AuthenticationFeature* af = AuthenticationFeature::instance();
-  SDB_ASSERT(af != nullptr);
-  if (af->isActive()) {
-    auth::Level allowed = auth::DatabaseAuthLevel(_user, db);
-    return requested <= allowed;
-  }
-  return true;
-}
-
-std::shared_ptr<ExecContext> ExecContext::create(std::string_view user,
-                                                 std::string_view dbname,
-                                                 ObjectId database_id) {
-  return std::make_shared<ExecContext>(user, dbname, database_id);
-}
-
-std::shared_ptr<Superuser> Superuser::create(std::string_view database,
-                                             ObjectId database_id) {
-  return std::make_shared<Superuser>(database, database_id);
-}
 
 }  // namespace sdb

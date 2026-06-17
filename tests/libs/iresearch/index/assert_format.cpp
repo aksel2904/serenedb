@@ -29,6 +29,7 @@
 
 #include "basics/bit_utils.hpp"
 #include "basics/down_cast.h"
+#include "formats/column/test_cs_helpers.hpp"
 #include "iresearch/analysis/token_attributes.hpp"
 #include "iresearch/analysis/tokenizers.hpp"
 #include "iresearch/index/comparer.hpp"
@@ -48,28 +49,6 @@
 #include "iresearch/utils/type_limits.hpp"
 #include "tests_shared.hpp"
 
-namespace {
-
-bool Visit(const irs::ColumnReader& reader,
-           const std::function<bool(irs::doc_id_t, irs::bytes_view)>& visitor) {
-  auto it = reader.iterator(irs::ColumnHint::Consolidation);
-
-  irs::PayAttr dummy;
-  auto* payload = irs::get<irs::PayAttr>(*it);
-  if (!payload) {
-    payload = &dummy;
-  }
-
-  while (it->next()) {
-    if (!visitor(it->value(), payload->value)) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-}  // namespace
 namespace tests {
 
 void AssertTerm(size_t segment_index, size_t field_index, size_t term_index,
@@ -115,8 +94,8 @@ void Term::sort(const std::map<irs::doc_id_t, irs::doc_id_t>& docs) {
   postings = std::move(resorted_postings);
 }
 
-Field::Field(const std::string_view& name, irs::IndexFeatures index_features)
-  : FieldMeta(name, index_features), stats{} {}
+Field::Field(irs::field_id id, irs::IndexFeatures index_features)
+  : FieldMeta(id, index_features), stats{} {}
 
 Term& Field::insert(irs::bytes_view t) {
   auto res = terms.emplace(t);
@@ -171,17 +150,6 @@ void ColumnValues::insert(irs::doc_id_t key, irs::bytes_view value) {
   }
 }
 
-irs::bstring ColumnValues::payload() const {
-  if (!_payload.has_value() && _writer) {
-    _payload.emplace();
-    irs::BytesOutput writer{_payload.value()};
-    _writer->finish(writer);
-    _payload = _payload->substr(sizeof(uint32_t));  // skip size
-  }
-
-  return _payload.value_or(irs::bstring{});
-}
-
 void ColumnValues::sort(const std::map<irs::doc_id_t, irs::doc_id_t>& docs) {
   std::map<irs::doc_id_t, irs::bstring> resorted_values;
 
@@ -192,62 +160,7 @@ void ColumnValues::sort(const std::map<irs::doc_id_t, irs::doc_id_t>& docs) {
   _values = std::move(resorted_values);
 }
 
-void ColumnValues::rewrite() {
-  if (_writer && _factory) {
-    irs::bstring hdr = payload();
-    const irs::bytes_view ref = hdr;
-    auto writer = _factory({&ref, 1});
-    ASSERT_NE(nullptr, writer);
-
-    std::map<irs::doc_id_t, irs::bstring> values;
-    for (auto& value : _values) {
-      irs::BytesOutput out{values[value.first]};
-      writer->write(out, value.second);
-    }
-
-    ASSERT_TRUE(_payload.has_value());
-    _payload.value().clear();
-    irs::BytesOutput payload_writer{_payload.value()};
-    writer->finish(payload_writer);
-    _payload = _payload.value().substr(sizeof(uint32_t));  // skip size
-    _values = std::move(values);
-  }
-}
-
-void IndexSegment::compute_features() {
-  struct ColumnOutput final : public irs::ColumnOutput {
-    explicit ColumnOutput(irs::bstring& buf) noexcept : buf{&buf} {}
-
-    void Prepare(irs::doc_id_t) final { written = true; }
-
-    void WriteByte(irs::byte_type b) final { (*buf) += b; }
-
-    void WriteBytes(const irs::byte_type* b, size_t size) final {
-      buf->append(b, size);
-    }
-
-    void Reset() final { buf->clear(); }
-
-    irs::bstring* buf;
-    bool written{false};
-  } out{_buf};
-
-  for (auto* field : _doc_fields) {
-    for (auto& entry : field->feature_infos) {
-      if (entry.writer) {
-        _buf.clear();
-
-        const auto doc_id = doc();
-        out.written = false;
-        entry.writer->write(field->stats, doc_id, out);
-
-        if (out.written) {
-          _columns[entry.id].insert(doc_id, _buf);
-        }
-      }
-    }
-  }
-}
+void IndexSegment::compute_features() {}
 
 void IndexSegment::insert_sorted(const Ifield* f) {
   if (f) {
@@ -287,34 +200,30 @@ void IndexSegment::insert_stored(const Ifield& f) {
 }
 
 void IndexSegment::insert_indexed(const Ifield& f) {
-  const std::string_view field_name = f.Name();
-
+  EXPECT_TRUE(irs::field_limits::valid(f.Id()))
+    << "insert_indexed: field must have a catalog-allocated id, not "
+       "field_limits::invalid()";
   const auto requested_features = f.GetIndexFeatures();
   const auto features = requested_features & (~irs::IndexFeatures::Offs);
 
-  const auto res = _fields.emplace(field_name, Field{field_name, features});
+  const auto res = _fields.emplace(f.Id(), Field{f.Id(), features});
 
   Field& field = res.first->second;
 
   if (res.second) {
-    auto& new_field = res.first->second;
-    _id_to_field.emplace_back(&new_field);
+    _id_to_field.emplace_back(&field);
 
     if (irs::IsSubsetOf(irs::IndexFeatures::Norm, requested_features)) {
-      auto feature_writer = irs::Norm::MakeWriter({});
-      if (feature_writer) {
-        const size_t id = _columns.size();
-        EXPECT_LE(id, std::numeric_limits<irs::field_id>::max());
-        _columns.emplace_back(id, &irs::Norm::MakeWriter, feature_writer.get());
-
-        new_field.feature_infos.emplace_back(
-          Field::FeatureInfo{irs::field_id{id}, &irs::Norm::MakeWriter,
-                             std::move(feature_writer)});
-
-        new_field.norm = irs::field_id{id};
-      }
+      // Allocate an id for the field's norm column slot. Production code
+      // assigns this via the cs writer; in this expected-segment model
+      // we keep a stable per-segment counter matching the order norm
+      // fields are first seen.
+      const size_t id = _columns.size();
+      EXPECT_LE(id, std::numeric_limits<irs::field_id>::max());
+      _columns.emplace_back(irs::field_id{id});
+      field.feature_infos.emplace_back(Field::FeatureInfo{irs::field_id{id}});
+      field.norm = irs::field_id{id};
     }
-    const_cast<std::string_view&>(res.first->first) = field.name;
   }
 
   _doc_fields.insert(&field);
@@ -944,202 +853,6 @@ void AssertTermsSeek(size_t segment_index, size_t field_index,
   }
 }
 
-void AssertPk(const irs::ColumnReader& actual_reader,
-              const auto& expected_values) {
-  ASSERT_EQ(expected_values.size(), actual_reader.size());
-
-  // check iterators & values
-  {
-    auto actual_it = actual_reader.iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, actual_it);
-
-    auto actual_seek_it = actual_reader.iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, actual_seek_it);
-
-    auto* actual_value = irs::get<irs::PayAttr>(*actual_it);
-    ASSERT_NE(nullptr, actual_value);
-
-    for (auto& [expected_value, expected_key, _] : expected_values) {
-      ASSERT_TRUE(actual_it->next());
-
-      auto actual_stateless_seek_it =
-        actual_reader.iterator(irs::ColumnHint::Normal);
-      ASSERT_NE(nullptr, actual_stateless_seek_it);
-
-      ASSERT_EQ(expected_key, actual_it->value());
-      ASSERT_EQ(expected_value, actual_value->value);
-      ASSERT_EQ(expected_key, actual_seek_it->seek(expected_key));
-      ASSERT_EQ(expected_key, actual_stateless_seek_it->seek(expected_key));
-    }
-    ASSERT_FALSE(actual_it->next());
-    ASSERT_FALSE(actual_it->next());
-  }
-
-  // check visit
-  {
-    auto begin = expected_values.begin();
-
-    Visit(actual_reader,
-          [&begin](auto actual_key, const auto& actual_value) mutable {
-            auto& [expected_value, expected_key, _] = *begin;
-            EXPECT_EQ(expected_key, actual_key);
-            EXPECT_EQ(expected_value, actual_value);
-            ++begin;
-            return true;
-          });
-    ASSERT_EQ(begin, expected_values.end());
-  }
-}
-
-void AssertColumn(const irs::ColumnReader* actual_reader,
-                  const ColumnValues& expected_values) {
-  if (!actual_reader) {
-    ASSERT_TRUE(expected_values.empty());
-    return;
-  }
-
-  if (irs::IsNull(expected_values.name())) {
-    // field features are stored as annonymous columns
-    ASSERT_TRUE(irs::IsNull(actual_reader->name()));
-  } else {
-    ASSERT_EQ(expected_values.name(), actual_reader->name());
-  }
-
-  if (!irs::IsNull(actual_reader->payload())) {
-    // old formats may not support column header payload
-    auto p1 = expected_values.payload();
-    auto p2 = actual_reader->payload();
-    ASSERT_EQ(p1, p2);
-  }
-
-  ASSERT_EQ(expected_values.size(), actual_reader->size());
-
-  // check iterators & values
-  {
-    auto actual_it = actual_reader->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, actual_it);
-
-    auto actual_seek_it = actual_reader->iterator(irs::ColumnHint::Normal);
-    ASSERT_NE(nullptr, actual_seek_it);
-
-    auto* actual_value = irs::get<irs::PayAttr>(*actual_it);
-    ASSERT_NE(nullptr, actual_value);
-
-    for (auto& [expected_key, expected_value] : expected_values) {
-      ASSERT_TRUE(actual_it->next());
-
-      auto actual_stateless_seek_it =
-        actual_reader->iterator(irs::ColumnHint::Normal);
-      ASSERT_NE(nullptr, actual_stateless_seek_it);
-
-      ASSERT_EQ(expected_key, actual_it->value());
-      ASSERT_EQ(expected_value, actual_value->value);
-      ASSERT_EQ(expected_key, actual_seek_it->seek(expected_key));
-      ASSERT_EQ(expected_key, actual_stateless_seek_it->seek(expected_key));
-    }
-    ASSERT_FALSE(actual_it->next());
-    ASSERT_FALSE(actual_it->next());
-  }
-
-  // check visit
-  {
-    auto begin = expected_values.begin();
-
-    Visit(*actual_reader,
-          [&begin](auto actual_key, const auto& actual_value) mutable {
-            auto& [expected_key, expected_value] = *begin;
-            EXPECT_EQ(expected_key, actual_key);
-            EXPECT_EQ(expected_value, actual_value);
-            ++begin;
-            return true;
-          });
-    ASSERT_EQ(begin, expected_values.end());
-  }
-}
-
-void AssertColumnstore(irs::IndexReader::ptr actual_index,
-                       const index_t& expected_index, size_t skip /*= 0*/) {
-  // check number of segments
-  ASSERT_EQ(expected_index.size(), actual_index->size());
-  size_t i = 0;
-  for (auto& actual_segment : *actual_index) {
-    // skip segment if validation not required
-    if (skip) {
-      ++i;
-      --skip;
-      continue;
-    }
-
-    const tests::IndexSegment& expected_segment = expected_index[i];
-
-    // check pk if present
-    if (auto& expected_pk = expected_segment.pk(); !expected_pk.empty()) {
-      auto* actual_pk = actual_segment.sort();
-      ASSERT_NE(nullptr, actual_pk);
-      AssertPk(*actual_pk, expected_pk);
-    }
-
-    // check stored columns
-    auto& expected_columns = expected_segment.named_columns();
-    auto expected_columns_begin = expected_columns.begin();
-    auto actual_columns = actual_segment.columns();
-
-    for (; actual_columns->next(); ++expected_columns_begin) {
-      auto& actual_column = actual_columns->value();
-      ASSERT_EQ(expected_columns_begin->first, actual_column.name());
-      // column id is format dependent
-      ASSERT_TRUE(
-        irs::field_limits::valid(expected_columns_begin->second->id()));
-      ASSERT_TRUE(irs::field_limits::valid(actual_column.id()));
-      ASSERT_LT(expected_columns_begin->second->id(),
-                expected_segment.columns().size());
-
-      const auto* actual_column_reader =
-        actual_segment.column(actual_column.id());
-      ASSERT_EQ(actual_column_reader,
-                actual_segment.column(actual_column.name()));
-
-      AssertColumn(
-        actual_column_reader,
-        expected_segment.columns()[expected_columns_begin->second->id()]);
-    }
-    ASSERT_FALSE(actual_columns->next());
-    ASSERT_EQ(expected_columns_begin, expected_columns.end());
-
-    // check stored features
-    auto check_feature = [&](irs::field_id expected, irs::field_id actual) {
-      // we don't check column ids as they are format dependent
-      ASSERT_EQ(irs::field_limits::valid(expected),
-                irs::field_limits::valid(actual));
-      if (irs::field_limits::valid(expected)) {
-        ASSERT_LT(expected, expected_segment.columns().size());
-        const auto* actual_column = actual_segment.column(actual);
-        AssertColumn(actual_column, expected_segment.columns()[expected]);
-      }
-    };
-
-    const auto& expected_fields = expected_segment.fields();
-    auto expected_field = expected_fields.begin();
-    auto actual_fields = actual_segment.fields();
-    for (; actual_fields->next(); ++expected_field) {
-      check_feature(expected_field->second.norm,
-                    actual_fields->value().meta().norm);
-    }
-    ASSERT_FALSE(actual_fields->next());
-    ASSERT_EQ(expected_field, expected_fields.end());
-
-    ++i;
-  }
-}
-
-void AssertColumnstore(const irs::Directory& dir, irs::Format::ptr codec,
-                       const index_t& expected_index, size_t skip /*= 0*/) {
-  auto reader = irs::DirectoryReader(dir, codec);
-  ASSERT_NE(nullptr, reader);
-
-  AssertColumnstore(reader.GetImpl(), expected_index, skip);
-}
-
 void AssertIndex(irs::IndexReader::ptr actual_index,
                  const index_t& expected_index, irs::IndexFeatures features,
                  size_t skip /*= 0*/,
@@ -1163,25 +876,26 @@ void AssertIndex(irs::IndexReader::ptr actual_index,
     ASSERT_EQ(1, actual_segment.size());
     ASSERT_EQ(&actual_segment, &*actual_segment.begin());
 
-    // get field name iterators
+    // get field iterators
     auto& expected_fields = expected_segment.fields();
     auto expected_field = expected_fields.begin();
 
-    // iterate over fields
-    auto actual_fields = actual_segment.fields();
+    // iterate over fields by id
+    auto actual_field_ids = actual_segment.field_ids();
     size_t field_index = 0;
-    for (; actual_fields->next(); ++expected_field) {
+    auto actual_id_it = actual_field_ids.begin();
+    for (; actual_id_it != actual_field_ids.end();
+         ++actual_id_it, ++expected_field) {
       SCOPED_TRACE(absl::StrCat("field_index=", field_index++));
-      ASSERT_EQ(expected_field->first, actual_fields->value().meta().name);
-      ASSERT_EQ(expected_field->second.name,
-                actual_fields->value().meta().name);
-      ASSERT_EQ(expected_field->second.index_features,
-                actual_fields->value().meta().index_features);
+      ASSERT_NE(expected_fields.end(), expected_field);
+      ASSERT_EQ(expected_field->second.id, *actual_id_it);
 
       // check field terms
-      const auto* actual_terms = actual_segment.field(expected_field->first);
+      const auto* actual_terms = actual_segment.field(*actual_id_it);
       ASSERT_NE(nullptr, actual_terms);
-      ASSERT_EQ(actual_fields->value().meta(), actual_terms->meta());
+      ASSERT_EQ(expected_field->second.id, actual_terms->meta().id);
+      ASSERT_EQ(expected_field->second.index_features,
+                actual_terms->meta().index_features);
 
       // check term reader
       ASSERT_EQ((expected_field->second.min)(), (actual_terms->min)());
@@ -1192,7 +906,7 @@ void AssertIndex(irs::IndexReader::ptr actual_index,
       // check field meta
       const irs::FieldMeta& expected_meta = expected_field->second;
       const irs::FieldMeta& actual_meta = actual_terms->meta();
-      ASSERT_EQ(expected_meta.name, actual_meta.name);
+      ASSERT_EQ(expected_meta.id, actual_meta.id);
       ASSERT_EQ(expected_meta.index_features, actual_meta.index_features);
       // we don't check column ids as they are format dependent
       ASSERT_EQ(irs::field_limits::valid(expected_meta.norm),
@@ -1218,7 +932,7 @@ void AssertIndex(irs::IndexReader::ptr actual_index,
       AssertTermsSeek(segment_index, field_index, expected_field->second,
                       *actual_terms, features, matcher);
     }
-    ASSERT_FALSE(actual_fields->next());
+    ASSERT_EQ(actual_field_ids.end(), actual_id_it);
 
     ++i;
     ASSERT_EQ(expected_fields.end(), expected_field);
@@ -1229,7 +943,8 @@ void AssertIndex(const irs::Directory& dir, irs::Format::ptr codec,
                  const index_t& expected_index, irs::IndexFeatures features,
                  size_t skip /*= 0*/,
                  irs::automaton_table_matcher* matcher /*= nullptr*/) {
-  auto reader = irs::DirectoryReader(dir, codec);
+  auto reader =
+    irs::DirectoryReader(dir, codec, ::irs::tests::DefaultReaderOptions());
   ASSERT_NE(nullptr, reader);
 
   AssertIndex(reader.GetImpl(), expected_index, features, skip, matcher);
@@ -1240,6 +955,6 @@ namespace irs {
 
 // use base irs::position type for ancestors
 template<>
-struct Type<tests::DocIteratorImpl::PosIterator> : Type<irs::PosAttr> {};
+struct Type<::tests::DocIteratorImpl::PosIterator> : Type<irs::PosAttr> {};
 
 }  // namespace irs

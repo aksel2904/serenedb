@@ -20,8 +20,11 @@
 
 #include "connector/duckdb_schema_entry.h"
 
+#include <duckdb/catalog/catalog.hpp>
+#include <duckdb/common/constants.hpp>
 #include <duckdb/common/string_util.hpp>
 #include <duckdb/parser/constraints/check_constraint.hpp>
+#include <duckdb/parser/constraints/foreign_key_constraint.hpp>
 #include <duckdb/parser/constraints/not_null_constraint.hpp>
 #include <duckdb/parser/constraints/unique_constraint.hpp>
 #include <duckdb/parser/expression/cast_expression.hpp>
@@ -43,6 +46,7 @@
 #include <iostream>
 
 #include "app/app_server.h"
+#include "basics/static_strings.h"
 #include "basics/string_utils.h"
 #include "catalog/catalog.h"
 #include "catalog/function.h"
@@ -63,10 +67,15 @@
 #include "pg/errcodes.h"
 #include "pg/sql_exception.h"
 #include "pg/sql_exception_macro.h"
-#include "search/inverted_index_shard.h"
-#include "storage_engine/secondary_index_shard.h"
+#include "search/inverted_index_storage.h"
 
 namespace sdb::connector {
+namespace {
+
+// Extracts column names from `[a, b, c]` -- the only accepted shape. Anything
+// else (row, single ref, string) throws.
+
+}  // namespace
 
 ObjectId SereneDBSchemaEntry::GetDatabaseId() const {
   return catalog.Cast<SereneDBCatalog>().GetDatabaseId();
@@ -80,7 +89,31 @@ duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::LookupEntry(
   auto result = snapshot->GetDuckDBEntryCache().EnsureEntry(
     lookup_info.GetCatalogType(), catalog, *this, GetDatabaseId(), name,
     lookup_info.GetEntryName(), *snapshot);
-  return result;
+  if (result || name != StaticStrings::kPgCatalogSchema) {
+    return result;
+  }
+
+  // Pg-compat fallback for `pg_catalog.<x>` that redirects to the system
+  // catalog.
+  switch (lookup_info.GetCatalogType()) {
+    case duckdb::CatalogType::MACRO_ENTRY:
+    case duckdb::CatalogType::TABLE_MACRO_ENTRY:
+    case duckdb::CatalogType::SCALAR_FUNCTION_ENTRY:
+    case duckdb::CatalogType::TABLE_FUNCTION_ENTRY:
+    case duckdb::CatalogType::AGGREGATE_FUNCTION_ENTRY:
+    case duckdb::CatalogType::TYPE_ENTRY: {
+      auto& sys = duckdb::Catalog::GetSystemCatalog(transaction.GetContext());
+      auto main_schema = sys.GetSchema(transaction, DEFAULT_SCHEMA,
+                                       duckdb::OnEntryNotFound::RETURN_NULL);
+      if (main_schema) {
+        return main_schema->LookupEntry(transaction, lookup_info);
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  return nullptr;
 }
 
 void SereneDBSchemaEntry::Scan(
@@ -103,6 +136,12 @@ duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateTable(
   auto& create_info = info.Base();
   auto& table_info = create_info.Cast<duckdb::CreateTableInfo>();
 
+  if (!table_info.options.empty()) {
+    THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
+                    ERR_MSG("unrecognized parameter \"",
+                            table_info.options.begin()->first, "\""));
+  }
+
   catalog::CreateTableOptions options;
   options.name = table_info.table;
 
@@ -118,7 +157,7 @@ duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateTable(
     }
     auto name_exists = [&](std::string_view candidate) {
       return std::ranges::any_of(options.check_constraints, [&](const auto& c) {
-        return c.name == candidate;
+        return c.GetName() == candidate;
       });
     };
     if (!name_exists(base_name)) {
@@ -172,35 +211,21 @@ duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateTable(
       return;
     }
     has_not_null[col_idx] = true;
-    auto& col_name = options.columns[col_idx].name;
+    std::string col_name{options.columns[col_idx].GetName()};
     auto col_ref = duckdb::make_uniq<duckdb::ColumnRefExpression>(col_name);
     auto is_not_null = duckdb::make_uniq<duckdb::OperatorExpression>(
       duckdb::ExpressionType::OPERATOR_IS_NOT_NULL, std::move(col_ref));
     options.check_constraints.push_back(catalog::CheckConstraint{
-      .id = catalog::NextId(),
-      .name = choose_constraint_name(table_info.table, col_name, "not_null"),
-      .expr = std::make_shared<ColumnExpr>(std::move(is_not_null)),
-    });
-  };
-
-  auto append_pk = [&](catalog::Column::Id col_id) {
-    if (absl::c_linear_search(options.pk_columns, col_id)) {
-      throw duckdb::CatalogException(
-        "column \"%s\" appears twice in primary key constraint",
-        options.columns[col_id].name);
-    }
-    append_not_null(col_id);  // PK implies NOT NULL
-    options.pk_columns.push_back(col_id);
+      ObjectId{}, catalog::NextId(),
+      choose_constraint_name(table_info.table, col_name, "not_null"),
+      std::make_shared<ColumnExpr>(std::move(is_not_null))});
   };
 
   // SERIAL expands to base int + nextval default + NOT NULL. The sequence
-  // name and nextval default are resolved by LocalCatalog under its mutex.
-  catalog::Column::Id next_col_id = 0;
+  // name and nextval default are resolved by Catalog under its mutex.
   for (auto& col : table_info.columns.Logical()) {
-    auto& sdb_col = options.columns.emplace_back();
-    sdb_col.id = next_col_id++;
-    sdb_col.name = col.Name();
-    sdb_col.type = col.Type();
+    auto& sdb_col = options.columns.emplace_back(ObjectId{}, catalog::NextId(),
+                                                 col.Name(), col.Type());
 
     bool is_smallserial = pg::IsSmallserial(sdb_col.type);
     bool is_serial = pg::IsSerial(sdb_col.type);
@@ -216,7 +241,7 @@ duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateTable(
         seq_opts.max_value = std::numeric_limits<int64_t>::max();
       }
       sdb_col.type = duckdb::LogicalType{sdb_col.type.id()};
-      options.sequences.emplace_back(sdb_col.id, seq_opts);
+      options.sequences.emplace_back(sdb_col.GetId(), seq_opts);
       append_not_null(options.columns.size() - 1);
     } else if (col.Generated()) {
       sdb_col.generated_type = catalog::Column::GeneratedType::kStored;
@@ -227,36 +252,73 @@ duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateTable(
     }
   }
 
+  containers::FlatHashMap<catalog::Column::Id, size_t> col_idx_by_id;
+  col_idx_by_id.reserve(options.columns.size());
+  for (size_t i = 0; i < options.columns.size(); ++i) {
+    col_idx_by_id.emplace(options.columns[i].GetId(), i);
+  }
+  auto find_column_idx = [&](catalog::Column::Id col_id) -> size_t {
+    auto it = col_idx_by_id.find(col_id);
+    SDB_ASSERT(it != col_idx_by_id.end());
+    return it->second;
+  };
+  auto append_pk = [&](catalog::Column::Id col_id) {
+    if (absl::c_contains(options.pk_columns, col_id)) {
+      THROW_SQL_ERROR(
+        ERR_CODE(ERRCODE_DUPLICATE_COLUMN),
+        ERR_MSG("column \"", options.columns[find_column_idx(col_id)].GetName(),
+                "\" appears twice in primary key constraint"));
+    }
+    append_not_null(find_column_idx(col_id));  // PK implies NOT NULL
+    options.pk_columns.push_back(col_id);
+  };
+
   for (auto& constraint : table_info.constraints) {
     switch (constraint->type) {
       case duckdb::ConstraintType::UNIQUE: {
         auto& unique = constraint->Cast<duckdb::UniqueConstraint>();
         if (!unique.IsPrimaryKey()) {
+          std::vector<catalog::Column::Id> cols;
+          if (unique.HasIndex()) {
+            auto idx = unique.GetIndex().index;
+            SDB_ASSERT(idx < options.columns.size());
+            cols.push_back(options.columns[idx].GetId());
+          } else {
+            for (auto& col_name : unique.GetColumnNames()) {
+              auto it = absl::c_find_if(options.columns, [&](const auto& col) {
+                return col.GetName() == col_name;
+              });
+              if (it == options.columns.end()) {
+                throw duckdb::CatalogException(
+                  "column \"%s\" named in key does not exist", col_name);
+              }
+              cols.push_back(it->GetId());
+            }
+          }
+          options.unique_constraints.push_back(std::move(cols));
           break;
         }
         if (unique.HasIndex()) {
           auto idx = unique.GetIndex().index;
           SDB_ASSERT(idx < options.columns.size());
-          append_pk(options.columns[idx].id);
+          append_pk(options.columns[idx].GetId());
         } else {
           for (auto& pk_name : unique.GetColumnNames()) {
             auto it = absl::c_find_if(options.columns, [&](const auto& col) {
-              return col.name == pk_name;
+              return col.GetName() == pk_name;
             });
             if (it == options.columns.end()) {
               throw duckdb::CatalogException(
                 "column \"%s\" named in key does not exist", pk_name);
             }
-            append_pk(it->id);
+            append_pk(it->GetId());
           }
         }
-        break;
-      }
+      } break;
       case duckdb::ConstraintType::NOT_NULL: {
         auto& nn = constraint->Cast<duckdb::NotNullConstraint>();
         append_not_null(nn.index.index);
-        break;
-      }
+      } break;
       case duckdb::ConstraintType::CHECK: {
         auto& check = constraint->Cast<duckdb::CheckConstraint>();
         std::string name;
@@ -267,10 +329,60 @@ duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateTable(
           name = choose_constraint_name(table_info.table, col, "check");
         }
         options.check_constraints.push_back(catalog::CheckConstraint{
-          .id = catalog::NextId(),
-          .name = std::move(name),
-          .expr = std::make_shared<ColumnExpr>(check.expression->Copy()),
-        });
+          ObjectId{}, catalog::NextId(), std::move(name),
+          std::make_shared<ColumnExpr>(check.expression->Copy())});
+        break;
+      }
+      case duckdb::ConstraintType::FOREIGN_KEY: {
+        auto& fk = constraint->Cast<duckdb::ForeignKeyConstraint>();
+        if (fk.info.type != duckdb::ForeignKeyType::FK_TYPE_FOREIGN_KEY_TABLE) {
+          break;
+        }
+        catalog::TableForeignKey out;
+        for (auto& col_name : fk.fk_columns) {
+          auto it = absl::c_find_if(options.columns, [&](const auto& col) {
+            return col.GetName() == col_name;
+          });
+          if (it == options.columns.end()) {
+            throw duckdb::CatalogException(
+              "column \"%s\" named in foreign key does not exist", col_name);
+          }
+          out.columns.push_back(it->GetId());
+        }
+        const bool self_reference = fk.info.table == table_info.table;
+        if (self_reference) {
+          for (auto& col_name : fk.pk_columns) {
+            auto it = absl::c_find_if(options.columns, [&](const auto& col) {
+              return col.GetName() == col_name;
+            });
+            SDB_ASSERT(it != options.columns.end());
+            out.referenced_columns.push_back(it->GetId());
+          }
+        } else {
+          auto& conn_ctx = GetSereneDBContext(transaction.GetContext());
+          auto snapshot = conn_ctx.EnsureCatalogSnapshot();
+          auto referenced = snapshot->GetRelation(
+            GetDatabaseId(), fk.info.schema.empty() ? name : fk.info.schema,
+            fk.info.table);
+          if (!referenced ||
+              referenced->GetType() != catalog::ObjectType::Table) {
+            throw duckdb::CatalogException(
+              "referenced table \"%s\" does not exist", fk.info.table);
+          }
+          auto& ref_table = basics::downCast<catalog::Table>(*referenced);
+          out.referenced_table = ref_table.GetId();
+          for (auto& col_name : fk.pk_columns) {
+            auto it = absl::c_find_if(
+              ref_table.Columns(),
+              [&](const auto& col) { return col.GetName() == col_name; });
+            if (it == ref_table.Columns().end()) {
+              throw duckdb::CatalogException(
+                "column \"%s\" named in foreign key does not exist", col_name);
+            }
+            out.referenced_columns.push_back(it->GetId());
+          }
+        }
+        options.foreign_keys.push_back(std::move(out));
         break;
       }
       default:
@@ -278,8 +390,7 @@ duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateTable(
     }
   }
 
-  auto& catalog_impl =
-    SerenedServer::Instance().getFeature<catalog::CatalogFeature>().Global();
+  auto& catalog_impl = catalog::GetCatalog();
   auto database_id = GetDatabaseId();
 
   bool if_not_exists =
@@ -308,9 +419,7 @@ duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateIndex(
   auto& sdb_table_entry = RequireBaseTable(table);
   auto sdb_table = sdb_table_entry.GetSereneDBTable();
 
-  auto& catalog_feature =
-    SerenedServer::Instance().getFeature<catalog::CatalogFeature>();
-  auto& catalog_impl = catalog_feature.Global();
+  auto& catalog_impl = catalog::GetCatalog();
   auto snapshot = catalog_impl.GetCatalogSnapshot();
   auto database_id = GetDatabaseId();
 
@@ -344,7 +453,7 @@ duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateIndex(
       auto col_name = col_ref.GetColumnName();
       const catalog::Column* cat_col = nullptr;
       for (const auto& col : columns) {
-        if (col.name == col_name) {
+        if (col.GetName() == col_name) {
           cat_col = &col;
           break;
         }
@@ -353,10 +462,7 @@ duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateIndex(
         throw duckdb::CatalogException("column \"%s\" not found in table",
                                        col_name);
       }
-      idx_columns.push_back(catalog::CreateIndexColumn{
-        .catalog_column = cat_col,
-        .name = cat_col->name,
-      });
+      idx_columns.emplace_back(cat_col, cat_col->GetName());
     } else {
       throw duckdb::CatalogException(
         "Expression-based index columns are not supported");
@@ -368,32 +474,36 @@ duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateIndex(
 
   Result create_result;
   if (index_type == catalog::ObjectType::InvertedIndex) {
-    search::InvertedIndexShardOptions shard_options;
-    auto it = info.options.find("commit_interval");
-    if (it != info.options.end()) {
-      shard_options.base.commit_interval_ms = it->second.GetValue<int64_t>();
-    }
-    it = info.options.find("consolidation_interval");
-    if (it != info.options.end()) {
-      shard_options.base.consolidation_interval_ms =
-        it->second.GetValue<int64_t>();
-    }
-    it = info.options.find("cleanup_interval_step");
-    if (it != info.options.end()) {
-      shard_options.base.cleanup_interval_step = it->second.GetValue<int64_t>();
-    }
-    std::optional<catalog::ScorerOptions> wand_scorer;
-    it = info.options.find("optimize_top_k");
-    if (it != info.options.end()) {
-      auto value = it->second.DefaultCastAs(duckdb::LogicalType::VARCHAR)
-                     .GetValue<std::string>();
-      wand_scorer =
-        catalog::ParseScorerExpression(transaction.GetContext(), value);
+    auto& context = transaction.GetContext();
+    auto find_with = [&](std::string_view key) -> const duckdb::Value* {
+      auto it = info.options.find(key);
+      return it != info.options.end() ? &it->second : nullptr;
+    };
+    auto resolve_uint = [&](std::string_view key) -> uint32_t {
+      if (auto* v = find_with(key)) {
+        return v->GetValue<uint32_t>();
+      }
+      duckdb::Value v;
+      auto r = context.TryGetCurrentSetting(std::string{key}, v);
+      SDB_ASSERT(r, "missing DB-level default for setting '", key, "'");
+      return v.GetValue<uint32_t>();
+    };
+    catalog::InvertedIndexOptions options{
+      .row_group_size = resolve_uint("row_group_size"),
+      .norm_row_group_size = resolve_uint("norm_row_group_size"),
+      .refresh_interval_ms = resolve_uint("refresh_interval"),
+      .compaction_interval_ms = resolve_uint("compaction_interval"),
+      .cleanup_interval_step = resolve_uint("cleanup_interval_step"),
+    };
+    if (auto* v = find_with("optimize_top_k")) {
+      auto value =
+        v->DefaultCastAs(duckdb::LogicalType::VARCHAR).GetValue<std::string>();
+      options.topk_scorer = catalog::ParseScorerExpression(context, value);
     }
     create_result = catalog_impl.CreateInvertedIndex(
-      database_id, name, sdb_table->GetName(), info.index_name,
-      std::move(idx_columns), shard_options, /*operation_options=*/{},
-      std::move(wand_scorer));
+      context, database_id, name, sdb_table->GetName(), info.index_name,
+      std::move(idx_columns), std::move(options),
+      /*operation_options=*/{});
   } else {
     bool unique = (info.constraint_type == duckdb::IndexConstraintType::UNIQUE);
     create_result = catalog_impl.CreateSecondaryIndex(
@@ -417,39 +527,22 @@ duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateIndex(
   auto catalog_index =
     new_snapshot->GetRelation(database_id, name, info.index_name);
   if (catalog_index) {
-    auto shard = new_snapshot->GetIndexShard(catalog_index->GetId());
-    if (shard && shard->GetType() == catalog::ObjectType::InvertedIndexShard) {
-      auto& inverted_shard =
-        basics::downCast<search::InvertedIndexShard>(*shard);
-      inverted_shard.StartTasks();
+    auto inverted =
+      new_snapshot->GetObject<catalog::InvertedIndex>(catalog_index->GetId());
+    auto storage = inverted ? inverted->GetData() : nullptr;
+    if (storage) {
+      storage->StartTasks();
       // No backfill yet -- mark creation as finished so background commits
       // register the flush subscription and run periodically.
-      inverted_shard.FinishCreation();
+      storage->FinishCreation();
     }
   }
   return nullptr;
 }
 
-// Returns true if two MacroFunction parameter signatures are identical
-// (same number of params, same types in order).
-static bool MacroSignatureMatches(const duckdb::MacroFunction& a,
-                                  const duckdb::MacroFunction& b) {
-  if (a.types.size() != b.types.size()) {
-    return false;
-  }
-  for (size_t i = 0; i < a.types.size(); ++i) {
-    if (a.types[i] != b.types[i]) {
-      return false;
-    }
-  }
-  return true;
-}
-
 duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateFunction(
   duckdb::CatalogTransaction transaction, duckdb::CreateFunctionInfo& info) {
-  auto& catalog_feature =
-    SerenedServer::Instance().getFeature<catalog::CatalogFeature>();
-  auto& catalog_impl = catalog_feature.Global();
+  auto& catalog_impl = catalog::GetCatalog();
   auto database_id = GetDatabaseId();
 
   auto new_macro_info =
@@ -477,7 +570,7 @@ duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateFunction(
       // Find an existing overload with the same parameter signature.
       bool found = false;
       for (size_t i = 0; i < merged_info->macros.size(); ++i) {
-        if (MacroSignatureMatches(*merged_info->macros[i], *new_macro)) {
+        if (merged_info->macros[i]->types == new_macro->types) {
           if (!replace) {
             // Plain CREATE FUNCTION: duplicate signature is an error.
             throw duckdb::CatalogException(
@@ -496,12 +589,8 @@ duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateFunction(
       }
     }
 
-    // Use a fresh ObjectId -- the resolution table's replace=true will
-    // re-point the function name to the new ID. The old object becomes
-    // orphaned in the snapshot objects map (harmless, gets GC'd on
-    // next snapshot rotation).
     auto function = std::make_shared<catalog::PgSqlFunction>(
-      database_id, ObjectId{}, info.name, std::move(merged_info));
+      ObjectId{}, ObjectId{}, info.name, std::move(merged_info));
     // Always replace=true for the catalog layer since we're replacing
     // the whole PgSqlFunction with the merged version.
     auto r = catalog_impl.CreateFunction(database_id, name, function, true);
@@ -513,7 +602,7 @@ duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateFunction(
 
   // No existing function -- create new.
   auto function = std::make_shared<catalog::PgSqlFunction>(
-    database_id, ObjectId{}, info.name, std::move(new_macro_info));
+    ObjectId{}, ObjectId{}, info.name, std::move(new_macro_info));
   auto r = catalog_impl.CreateFunction(database_id, name, function, false);
 
   if (r.is(ERROR_SERVER_DUPLICATE_NAME)) {
@@ -530,16 +619,14 @@ duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateFunction(
 
 duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateView(
   duckdb::CatalogTransaction transaction, duckdb::CreateViewInfo& info) {
-  auto& catalog_feature =
-    SerenedServer::Instance().getFeature<catalog::CatalogFeature>();
-  auto& catalog_impl = catalog_feature.Global();
+  auto& catalog_impl = catalog::GetCatalog();
   auto database_id = GetDatabaseId();
 
   auto view_info =
     duckdb::unique_ptr_cast<duckdb::CreateInfo, duckdb::CreateViewInfo>(
       info.Copy());
   auto view = std::make_shared<catalog::PgSqlView>(
-    database_id, ObjectId{}, info.view_name, std::move(view_info));
+    ObjectId{}, ObjectId{}, info.view_name, std::move(view_info));
 
   bool replace =
     info.on_conflict == duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
@@ -593,11 +680,11 @@ duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateSequence(
   bool if_not_exists =
     info.on_conflict == duckdb::OnCreateConflict::IGNORE_ON_CONFLICT;
 
-  auto sequence = std::make_shared<catalog::Sequence>(
-    database_id, ObjectId{}, ObjectId{}, info.name, opts, ObjectId{});
+  opts.name = info.name;
+  auto sequence = std::make_shared<catalog::Sequence>(ObjectId{}, ObjectId{},
+                                                      std::move(opts));
 
-  auto& catalog_impl =
-    SerenedServer::Instance().getFeature<catalog::CatalogFeature>().Global();
+  auto& catalog_impl = catalog::GetCatalog();
   auto r =
     catalog_impl.CreateSequence(database_id, name, sequence, if_not_exists);
   if (r.is(ERROR_SERVER_DUPLICATE_NAME)) {
@@ -614,40 +701,41 @@ duckdb::optional_ptr<duckdb::CatalogEntry>
 SereneDBSchemaEntry::CreateTableFunction(
   duckdb::CatalogTransaction transaction,
   duckdb::CreateTableFunctionInfo& info) {
-  throw duckdb::NotImplementedException("CREATE TABLE FUNCTION through DuckDB");
+  THROW_SQL_ERROR(ERR_CODE(ERRCODE_FEATURE_NOT_SUPPORTED),
+                  ERR_MSG("CREATE TABLE FUNCTION is not supported"));
 }
 
 duckdb::optional_ptr<duckdb::CatalogEntry>
 SereneDBSchemaEntry::CreateCopyFunction(duckdb::CatalogTransaction transaction,
                                         duckdb::CreateCopyFunctionInfo& info) {
-  throw duckdb::NotImplementedException("CREATE COPY FUNCTION through DuckDB");
+  THROW_SQL_ERROR(ERR_CODE(ERRCODE_FEATURE_NOT_SUPPORTED),
+                  ERR_MSG("CREATE COPY FUNCTION is not supported"));
 }
 
 duckdb::optional_ptr<duckdb::CatalogEntry>
 SereneDBSchemaEntry::CreatePragmaFunction(
   duckdb::CatalogTransaction transaction,
   duckdb::CreatePragmaFunctionInfo& info) {
-  throw duckdb::NotImplementedException(
-    "CREATE PRAGMA FUNCTION through DuckDB");
+  THROW_SQL_ERROR(ERR_CODE(ERRCODE_FEATURE_NOT_SUPPORTED),
+                  ERR_MSG("CREATE PRAGMA FUNCTION is not supported"));
 }
 
 duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateCollation(
   duckdb::CatalogTransaction transaction, duckdb::CreateCollationInfo& info) {
-  throw duckdb::NotImplementedException("CREATE COLLATION through DuckDB");
+  THROW_SQL_ERROR(ERR_CODE(ERRCODE_FEATURE_NOT_SUPPORTED),
+                  ERR_MSG("CREATE COLLATION is not supported"));
 }
 
 duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateType(
   duckdb::CatalogTransaction transaction, duckdb::CreateTypeInfo& info) {
-  auto& catalog_feature =
-    SerenedServer::Instance().getFeature<catalog::CatalogFeature>();
-  auto& catalog_impl = catalog_feature.Global();
+  auto& catalog_impl = catalog::GetCatalog();
   auto database_id = GetDatabaseId();
 
   auto type_info =
     duckdb::unique_ptr_cast<duckdb::CreateInfo, duckdb::CreateTypeInfo>(
       info.Copy());
   auto type = std::make_shared<catalog::PgSqlType>(
-    database_id, ObjectId{}, info.name, std::move(type_info));
+    ObjectId{}, ObjectId{}, info.name, std::move(type_info));
   auto r = catalog_impl.CreateType(database_id, name, type);
 
   if (r.is(ERROR_SERVER_DUPLICATE_NAME)) {
@@ -704,15 +792,15 @@ void HandleRenameRelationError(Result r, std::string_view name,
 
 void SereneDBSchemaEntry::Alter(duckdb::CatalogTransaction transaction,
                                 duckdb::AlterInfo& info) {
-  auto& catalog_impl =
-    SerenedServer::Instance().getFeature<catalog::CatalogFeature>().Global();
+  auto& catalog_impl = catalog::GetCatalog();
   auto db = GetDatabaseId();
 
   if (info.type == duckdb::AlterType::ALTER_SCALAR_FUNCTION) {
     auto& fn_info = info.Cast<duckdb::AlterScalarFunctionInfo>();
     if (fn_info.alter_scalar_function_type !=
         duckdb::AlterScalarFunctionType::RENAME_SCALAR_FUNCTION) {
-      throw duckdb::NotImplementedException("ALTER FUNCTION through DuckDB");
+      THROW_SQL_ERROR(ERR_CODE(ERRCODE_FEATURE_NOT_SUPPORTED),
+                      ERR_MSG("only RENAME is supported for ALTER FUNCTION"));
     }
     auto& rename_info = fn_info.Cast<duckdb::RenameScalarFunctionInfo>();
 
@@ -744,7 +832,8 @@ void SereneDBSchemaEntry::Alter(duckdb::CatalogTransaction transaction,
   if (info.type == duckdb::AlterType::ALTER_VIEW) {
     auto& view_info = info.Cast<duckdb::AlterViewInfo>();
     if (view_info.alter_view_type != duckdb::AlterViewType::RENAME_VIEW) {
-      throw duckdb::NotImplementedException("ALTER VIEW through DuckDB");
+      THROW_SQL_ERROR(ERR_CODE(ERRCODE_FEATURE_NOT_SUPPORTED),
+                      ERR_MSG("only RENAME is supported for ALTER VIEW"));
     }
     auto& rename_info = view_info.Cast<duckdb::RenameViewInfo>();
     Result r =
@@ -755,7 +844,8 @@ void SereneDBSchemaEntry::Alter(duckdb::CatalogTransaction transaction,
   }
 
   if (info.type != duckdb::AlterType::ALTER_TABLE) {
-    throw duckdb::NotImplementedException("ALTER through DuckDB");
+    THROW_SQL_ERROR(ERR_CODE(ERRCODE_FEATURE_NOT_SUPPORTED),
+                    ERR_MSG("this ALTER operation is not supported"));
   }
 
   auto& table_info = info.Cast<duckdb::AlterTableInfo>();
@@ -769,7 +859,7 @@ void SereneDBSchemaEntry::Alter(duckdb::CatalogTransaction transaction,
         db, name, table_name,
         [&](const catalog::Table& table,
             std::shared_ptr<catalog::Table>& updated) {
-          return table.DropConstraint(updated, drop_info.constraint_name);
+          return table.DropCheckConstraint(updated, drop_info.constraint_name);
         });
 
       if (r.is(ERROR_SERVER_OBJECT_TYPE_MISMATCH)) {
@@ -898,8 +988,92 @@ void SereneDBSchemaEntry::Alter(duckdb::CatalogTransaction transaction,
       return;
     }
 
+    case duckdb::AlterTableType::ADD_COLUMN: {
+      auto& add_info = table_info.Cast<duckdb::AddColumnInfo>();
+      const auto& cd = add_info.new_column;
+      if (cd.Generated()) {
+        THROW_SQL_ERROR(ERR_CODE(ERRCODE_FEATURE_NOT_SUPPORTED),
+                        ERR_MSG("adding a generated column is not supported"));
+      }
+      catalog::Column column{ObjectId{}, catalog::NextId(), cd.Name(),
+                             cd.Type()};
+      if (cd.HasDefaultValue()) {
+        column.expr = std::make_shared<ColumnExpr>(cd.DefaultValue().Copy());
+      }
+      Result r = catalog_impl.ChangeTable(
+        db, name, table_name,
+        [&](const catalog::Table& table,
+            std::shared_ptr<catalog::Table>& updated) {
+          return table.AddColumn(updated, column,
+                                 add_info.if_column_not_exists);
+        });
+      if (r.is(ERROR_SERVER_DUPLICATE_NAME)) {
+        THROW_SQL_ERROR(ERR_CODE(ERRCODE_DUPLICATE_COLUMN),
+                        ERR_MSG("column \"", cd.Name(), "\" of relation \"",
+                                table_name, "\" already exists"));
+      }
+      if (r.is(ERROR_SERVER_DATA_SOURCE_NOT_FOUND)) {
+        THROW_SQL_ERROR(
+          ERR_CODE(ERRCODE_UNDEFINED_TABLE),
+          ERR_MSG("relation \"", table_name, "\" does not exist"));
+      }
+      if (!r.ok()) {
+        SDB_THROW(std::move(r));
+      }
+      return;
+    }
+
+    case duckdb::AlterTableType::REMOVE_COLUMN: {
+      auto& remove_info = table_info.Cast<duckdb::RemoveColumnInfo>();
+      Result r = catalog_impl.DropTableColumn(db, name, table_name,
+                                              remove_info.removed_column,
+                                              remove_info.if_column_exists);
+      if (r.is(ERROR_SERVER_DATA_SOURCE_NOT_FOUND)) {
+        THROW_SQL_ERROR(
+          ERR_CODE(ERRCODE_UNDEFINED_TABLE),
+          ERR_MSG("relation \"", table_name, "\" does not exist"));
+      }
+      if (r.is(ERROR_SERVER_ILLEGAL_NAME)) {
+        THROW_SQL_ERROR(
+          ERR_CODE(ERRCODE_UNDEFINED_COLUMN),
+          ERR_MSG("column \"", remove_info.removed_column, "\" of relation \"",
+                  table_name, "\" does not exist"));
+      }
+      if (!r.ok()) {
+        SDB_THROW(std::move(r));
+      }
+      return;
+    }
+
+    case duckdb::AlterTableType::ALTER_COLUMN_TYPE: {
+      auto& type_info = table_info.Cast<duckdb::ChangeColumnTypeInfo>();
+      std::string using_sql;
+      if (type_info.expression) {
+        using_sql = type_info.expression->ToString();
+      }
+      Result r = catalog_impl.ChangeColumnType(
+        db, name, table_name, type_info.column_name, type_info.target_type,
+        std::move(using_sql));
+      if (r.is(ERROR_SERVER_DATA_SOURCE_NOT_FOUND)) {
+        THROW_SQL_ERROR(
+          ERR_CODE(ERRCODE_UNDEFINED_TABLE),
+          ERR_MSG("relation \"", table_name, "\" does not exist"));
+      }
+      if (r.is(ERROR_SERVER_ILLEGAL_NAME)) {
+        THROW_SQL_ERROR(
+          ERR_CODE(ERRCODE_UNDEFINED_COLUMN),
+          ERR_MSG("column \"", type_info.column_name, "\" of relation \"",
+                  table_name, "\" does not exist"));
+      }
+      if (!r.ok()) {
+        SDB_THROW(std::move(r));
+      }
+      return;
+    }
+
     default:
-      throw duckdb::NotImplementedException("ALTER TABLE through DuckDB");
+      THROW_SQL_ERROR(ERR_CODE(ERRCODE_FEATURE_NOT_SUPPORTED),
+                      ERR_MSG("this ALTER TABLE operation is not supported"));
   }
 }
 

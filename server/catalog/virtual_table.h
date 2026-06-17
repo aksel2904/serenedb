@@ -36,10 +36,10 @@ struct MaterializedData {
   duckdb::idx_t row_count = 0;
 };
 
-class VirtualTableSnapshot : public SchemaObject {
+class VirtualTableSnapshot : public Object {
  public:
   std::shared_ptr<Object> Clone() const final { return nullptr; }
-  void WriteInternal(vpack::Builder&) const override {}
+  void Serialize(duckdb::Serializer&) const override {}
   virtual duckdb::LogicalType RowType() const noexcept = 0;
 
   // Returns a reference to lazily materialized data.
@@ -52,7 +52,7 @@ class VirtualTableSnapshot : public SchemaObject {
   }
 
  protected:
-  using SchemaObject::SchemaObject;
+  using Object::Object;
 
   const VirtualTable* _table = nullptr;
 };

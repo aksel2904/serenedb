@@ -14,7 +14,8 @@ if [[ -z "$TARBALL" ]]; then
 fi
 
 echo "=== Tarball RTA: $(basename "$TARBALL") ==="
-mkdir -p "${WORKSPACE}/logs"
+mkdir -p "${WORKSPACE}/out/logs"
+mkdir -p "${WORKSPACE}/out/test-tmp"
 
 export TARBALL_NAME="$(basename "$TARBALL")"
 export DOCKER_UID="$(id -u)"
@@ -25,7 +26,7 @@ PREFIX="tarball-rta-$$"
 COMPOSE_FILE="${CI_DIR}/docker-compose.tarball-rta.yml"
 
 cleanup() {
-	docker compose -p "$PREFIX" -f "$COMPOSE_FILE" logs serenedb 2>&1 >"${WORKSPACE}/logs/tarball-rta-serened.log" || true
+	docker compose -p "$PREFIX" -f "$COMPOSE_FILE" logs serenedb 2>&1 >"${WORKSPACE}/out/logs/tarball-rta-serened.log" || true
 	docker compose -p "$PREFIX" -f "$COMPOSE_FILE" down --volumes --remove-orphans 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
@@ -50,7 +51,7 @@ if [[ $test_rc -eq 0 && "${RTA_DRIVERS:-false}" == "true" ]]; then
 	DRIVERS_COMPOSE="${CI_DIR}/docker-compose.tarball-drivers-rta.yml"
 	docker compose -p "${PREFIX}-drv" -f "$DRIVERS_COMPOSE" \
 		up --attach tests --exit-code-from tests --remove-orphans \
-		2>&1 | tee "${WORKSPACE}/logs/tarball-rta-drivers.log" || test_rc=$?
+		2>&1 | tee "${WORKSPACE}/out/logs/tarball-rta-drivers.log" || test_rc=$?
 	docker compose -p "${PREFIX}-drv" -f "$DRIVERS_COMPOSE" \
 		down --volumes --remove-orphans >/dev/null 2>&1 || true
 fi

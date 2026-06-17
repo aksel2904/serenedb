@@ -37,10 +37,6 @@
 
 namespace {
 
-struct EmptyColumnProvider : irs::ColumnProvider {
-  const irs::ColumnReader* column(irs::field_id) const final { return nullptr; }
-};
-
 struct FreqScorerContext : public irs::ScoreOperator {
   FreqScorerContext(const irs::FreqBlockAttr* freq) : freq_source{freq} {}
 
@@ -322,10 +318,9 @@ Format15TestCase::WriteReadMeta(irs::Directory& dir, DocsView docs,
   irs::TermMetaImpl term_meta;
 
   {
-    const EmptyColumnProvider provider;
     const irs::FlushState state{
       .dir = &dir,
-      .columns = &provider,
+      .norms = &irs::SubReader::empty(),
       .name = "segment_name",
       .scorer = scorer,
       .doc_count = docs.back().first + 1,
@@ -364,7 +359,7 @@ Format15TestCase::WriteReadMeta(irs::Directory& dir, DocsView docs,
   reader->prepare(*in, state, features);
 
   irs::bstring in_data(in->Length() - in->Position(), 0);
-  in->ReadBytes(&in_data[0], in_data.size());
+  in->ReadData(&in_data[0], in_data.size());
   const auto* begin = in_data.c_str();
 
   irs::TermMetaImpl read_meta;

@@ -151,6 +151,26 @@ CREATE TEXT SEARCH DICTIONARY t_err13(
 db error: ERROR: invalid value for CREATE TEXT SEARCH DICTIONARY parameter "preserveoriginal": "aaa"
 
 
+# --- Malformed stopwords list (regression: empty / lone-quote tokens) ---
+
+statement ok
+CREATE TEXT SEARCH DICTIONARY t_stopwords_empty_tokens(
+    template = 'text',
+    locale = 'en_US.UTF-8',
+    stopwords = '"a",,"b"'
+)
+
+
+statement error
+CREATE TEXT SEARCH DICTIONARY t_stopwords_lone_quote(
+    template = 'text',
+    locale = 'en_US.UTF-8',
+    stopwords = '"a","'
+)
+----
+db error: ERROR: Invalid format of list of words(should be comma-separated and quoted)
+
+
 # --- Invalid integer value ---
 
 statement error
@@ -160,7 +180,7 @@ CREATE TEXT SEARCH DICTIONARY t_err14(
     maxgram = 3
 )
 ----
-db error: ERROR: invalid input syntax for type integer: "abc"
+db error: ERROR: invalid value for CREATE TEXT SEARCH DICTIONARY parameter "mingram": "abc"
 
 
 statement error
@@ -170,7 +190,7 @@ CREATE TEXT SEARCH DICTIONARY t_err15(
     maxgram = 'three'
 )
 ----
-db error: ERROR: invalid input syntax for type integer: "three"
+db error: ERROR: invalid value for CREATE TEXT SEARCH DICTIONARY parameter "maxgram": "three"
 
 
 statement error
@@ -181,7 +201,7 @@ CREATE TEXT SEARCH DICTIONARY t_err16(
     numhashes = 'two'
 )
 ----
-db error: ERROR: invalid input syntax for type integer: "two"
+db error: ERROR: invalid value for CREATE TEXT SEARCH DICTIONARY parameter "numhashes": "two"
 
 
 # --- Invalid threshold (out of range 0.0 to 1.0) ---
@@ -229,6 +249,61 @@ SELECT ts_lexize('t1', 'a QUICK Brown FoX');
 ----
 ts_lexize
 {a,QUICK,Brown,FoX}
+
+
+# --- ts_lexize array overload ---
+# Concatenates tokens from each element in input order.
+
+query
+SELECT ts_lexize('t1', ARRAY['a QUICK Brown', 'FoX jumps']);
+----
+ts_lexize
+{a,QUICK,Brown,FoX,jump}
+
+
+# Empty array -> empty result (no tokens to concatenate).
+query
+SELECT ts_lexize('t1', ARRAY[]::VARCHAR[]);
+----
+ts_lexize
+{}
+
+
+# Single-element array equals the scalar form.
+query
+SELECT ts_lexize('t1', ARRAY['a QUICK Brown FoX']);
+----
+ts_lexize
+{a,QUICK,Brown,FoX}
+
+
+# NULL elements are skipped (treated as empty contribution).
+query
+SELECT ts_lexize('t1', ARRAY['Alpha Beta', NULL, 'Gamma']);
+----
+ts_lexize
+{Alpha,Beta,Gamma}
+
+
+# NULL array yields NULL output (per SPECIAL_HANDLING).
+query
+SELECT ts_lexize('t1', NULL::VARCHAR[]) IS NULL;
+----
+?column?
+t
+
+
+# NULL dict name yields NULL output.
+query
+SELECT ts_lexize(NULL::VARCHAR, ARRAY['Hello']) IS NULL;
+----
+?column?
+t
+
+
+# Non-existent dict raises -- same error as the scalar overload.
+statement error
+SELECT ts_lexize('does_not_exist', ARRAY['Hello']);
 
 
 # --- case = upper ---
@@ -1700,7 +1775,7 @@ CREATE TEXT SEARCH DICTIONARY wildcard_bad_ngram1(
     tokenizer_delimiter = ' '
 )
 ----
-db error: ERROR: ngramsize must be at least 2
+db error: ERROR: "ngramsize" must be at least 2
 HINT: N-gram size for wildcard prefix indexing (minimum 2)
 
 
@@ -1714,7 +1789,7 @@ CREATE TEXT SEARCH DICTIONARY wildcard_bad_ngram0(
     tokenizer_delimiter = ' '
 )
 ----
-db error: ERROR: ngramsize must be at least 2
+db error: ERROR: "ngramsize" must be at least 2
 HINT: N-gram size for wildcard prefix indexing (minimum 2)
 
 
@@ -1728,7 +1803,7 @@ CREATE TEXT SEARCH DICTIONARY wildcard_bad_ngram_str(
     tokenizer_delimiter = ' '
 )
 ----
-db error: ERROR: invalid input syntax for type integer: "three"
+db error: ERROR: invalid value for CREATE TEXT SEARCH DICTIONARY parameter "ngramsize": "three"
 
 
 # --- Invalid: option not applicable to wildcard ---
@@ -1889,7 +1964,7 @@ CREATE TEXT SEARCH DICTIONARY t_gp_err3(
     maxcells = 'many'
 )
 ----
-db error: ERROR: invalid input syntax for type integer: "many"
+db error: ERROR: invalid value for CREATE TEXT SEARCH DICTIONARY parameter "maxcells": "many"
 
 
 # --- Error: invalid boolean for optimizeforspace ---
@@ -2014,7 +2089,7 @@ CREATE TEXT SEARCH DICTIONARY t_gj_err2(
 )
 ----
 db error: ERROR: invalid value in "coding" parameter
-HINT: Encoding format: s2point, s2latlngf64, s2latlngu32
+HINT: Encoding format: source, s2point, s2latlngf64, s2latlngu32
 
 
 # --- Error: vpack coding is not exposed via SQL ---
@@ -2026,7 +2101,7 @@ CREATE TEXT SEARCH DICTIONARY t_gj_err_vpack(
 )
 ----
 db error: ERROR: invalid value in "coding" parameter
-HINT: Encoding format: s2point, s2latlngf64, s2latlngu32
+HINT: Encoding format: source, s2point, s2latlngf64, s2latlngu32
 
 
 # --- Error: option not applicable to geojson ---
@@ -2050,7 +2125,7 @@ CREATE TEXT SEARCH DICTIONARY t_gj_err4(
 )
 
 
-# --- Valid: geojson with defaults (type=shape, coding=s2point) ---
+# --- Valid: geojson with defaults (type=shape, coding=source) ---
 
 statement ok
 CREATE TEXT SEARCH DICTIONARY geojson_basic(
@@ -2238,7 +2313,7 @@ Text Search Dictionary:
       optimizeforspace (boolean) [default: false] - Optimize S2 index for space rather than speed
   geojson:
     type (string) [default: shape] - GeoJson shape type: shape, centroid, point
-    coding (string) [default: s2point] - Encoding format: s2point, s2latlngf64, s2latlngu32
+    coding (string) [default: source] - Encoding format: source, s2point, s2latlngf64, s2latlngu32
     options:
       maxcells (integer) [default: 20] - Maximum number of S2 cells
       minlevel (integer) [default: 4] - Minimum S2 cell level (0-30)
@@ -2251,3 +2326,6 @@ Text Search Dictionary:
     synonyms[required] (string) [default: none] - Inline Solr-format synonyms file content: one rule per line, comma-separated terms; `=>` separates LHS from RHS for one-way mappings
   wordnet_synonyms:
     synonyms[required] (string) [default: none] - Inline WordNet Prolog database content: one `s(synset,w_num,'word',ss_type,sense_number,tag_count).` record per line
+  sparse_ngram:
+    maxngramlength (integer) [default: 16] - Maximum emitted n-gram length (minimum 3)
+    covering (boolean) [default: false] - Emit the minimal covering n-gram chain (query side) instead of all sparse n-grams (index side)

@@ -116,22 +116,15 @@ struct SubReader final : irs::SubReader {
   uint64_t CountMappedMemory() const final { return 0; }
 
   const irs::SegmentInfo& Meta() const noexcept final { return info; }
-  const irs::ColumnReader* column(std::string_view) const final {
-    return nullptr;
-  }
   const irs::DocumentMask* docs_mask() const noexcept final { return nullptr; }
-  irs::ColumnIterator::ptr columns() const final {
-    return irs::ColumnIterator::empty();
-  }
-  const irs::ColumnReader* column(irs::field_id) const final { return nullptr; }
   irs::DocIterator::ptr docs_iterator() const final {
     return irs::DocIterator::empty();
   }
-  const irs::TermReader* field(std::string_view) const final { return nullptr; }
-  irs::FieldIterator::ptr fields() const final {
-    return irs::FieldIterator::empty();
+  const irs::TermReader* field(irs::field_id) const final { return nullptr; }
+  std::span<const irs::field_id> field_ids() const noexcept final { return {}; }
+  irs::NormReader::ptr norms(irs::field_id field) const final {
+    return nullptr;
   }
-  const irs::ColumnReader* sort() const final { return nullptr; }
 
   irs::SegmentInfo info;
 };

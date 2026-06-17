@@ -27,16 +27,20 @@
 #include <duckdb/common/types/string.hpp>
 #include <duckdb/main/client_context.hpp>
 #include <duckdb/main/config.hpp>
+#include <limits>
 #include <magic_enum/magic_enum.hpp>
 #include <string>
 
 #include "basics/containers/trivial_map.h"
 #include "basics/debugging.h"
-#include "basics/logger/logger.h"
+#include "basics/serializer.h"
 #include "basics/static_strings.h"
+#include "connector/duckdb_client_state.h"
+#include "pg/connection_context.h"
+#include "pg/errcodes.h"
+#include "pg/sql_exception_macro.h"
 #include "query/config.h"
 #include "rest/version.h"
-#include "vpack/serializer.h"
 
 namespace sdb {
 
@@ -44,36 +48,40 @@ using duckdb::LogicalTypeId;
 
 namespace {
 
-template<vpack::detail::FixedString Name>
+template<basics::detail::FixedString Name>
 void Readonly(duckdb::ClientContext&, duckdb::SetScope, duckdb::Value&) {
   throw duckdb::InvalidInputException{"parameter \"%s\" cannot be changed",
                                       std::string_view{Name}.data()};
 }
 
-// Check for settings that is writable in principle. It is just us who not yet
-// support writing. So be honest here - if client actually does not change
-// anything, we accept it. If change is real - we error out.
-template<vpack::detail::FixedString Name>
+// Settings that are writable in principle but where serened doesn't yet honor
+// the change. Emit a NOTICE so clients that care can see the SET is a no-op
+// on the server side; the value still flows into DuckDB session state so
+// SHOW round-trips what the client set.
+template<basics::detail::FixedString Name>
 void NoOverwrite(duckdb::ClientContext& ctx, duckdb::SetScope,
                  duckdb::Value& value) {
   constexpr std::string_view kName{Name};
   duckdb::Value current;
-  if (ctx.TryGetCurrentSetting(std::string{kName}, current)) {
-    bool equal = false;
-    if (current.type().id() == duckdb::LogicalTypeId::VARCHAR &&
-        value.type().id() == duckdb::LogicalTypeId::VARCHAR &&
-        !current.IsNull() && !value.IsNull()) {
-      equal = absl::EqualsIgnoreCase(current.ToString(), value.ToString());
-    } else {
-      equal = duckdb::Value::NotDistinctFrom(current, value);
-    }
-    if (equal) {
-      return;
-    }
+  if (!ctx.TryGetCurrentSetting(std::string{kName}, current)) {
+    return;
   }
-  throw duckdb::InvalidInputException{
-    "parameter \"%s\" cannot be changed from \"%s\" to \"%s\"", kName.data(),
-    current.ToString(), value.ToString()};
+  bool equal = false;
+  if (current.type().id() == duckdb::LogicalTypeId::VARCHAR &&
+      value.type().id() == duckdb::LogicalTypeId::VARCHAR &&
+      !current.IsNull() && !value.IsNull()) {
+    equal = absl::EqualsIgnoreCase(current.ToString(), value.ToString());
+  } else {
+    equal = duckdb::Value::NotDistinctFrom(current, value);
+  }
+  if (equal) {
+    return;
+  }
+  connector::GetSereneDBContext(ctx).AddNotice(SQL_ERROR_DATA(
+    ERR_CODE(ERRCODE_WARNING),
+    ERR_MSG(
+      "parameter \"", kName,
+      "\" is accepted for compatibility but is not enforced by serened")));
 }
 
 // PostgreSQL drivers supply client_encoding in many forms (UTF8, UTF-8, utf_8,
@@ -166,53 +174,17 @@ constexpr std::pair<std::string_view, VariableDescription>
       },
     },
 #endif
+    // Logging knobs (level, type filters, storage, on/off) live in duckdb's
+    // built-in settings: logging_level / enable_logging / enabled_log_types
+    // / disabled_log_types / logging_storage / logging_mode. The previous
+    // sdb_log_level extension option was dropped in favour of those.
     {
-      log::kLogLevelVariable,
-      {
-        LogicalTypeId::VARCHAR,
-        "Sets the server log level. "
-        "Use 'topic=level' format, e.g. 'all=trace', 'requests=debug'. "
-        "Valid levels: fatal, error, warning, info, debug, trace. "
-        "Valid topics: all, authentication, authorization, communication, "
-        "config, crash, engines, flush, fuerte, general, httpclient, "
-        "iresearch, memory, replication, requests, rocksdb, search, ssl, "
-        "startup, statistics, syscall, threads.",
-        [] { return duckdb::Value{log::LogLevelString()}; },
-        [](duckdb::ClientContext&, duckdb::SetScope, duckdb::Value& value) {
-          log::SetLogLevel(value.ToString());
-          value = duckdb::Value(log::LogLevelString());
-        },
-        [](duckdb::ClientContext&, duckdb::SetScope) { log::ResetLogLevels(); },
-        duckdb::SetScope::GLOBAL,
-      },
-    },
-    {
-      "sdb_write_conflict_policy",
-      {
-        LogicalTypeId::VARCHAR,
-        "Sets the write conflict policy. Valid values are "
-        "'emit_error' (the default), 'do_nothing' (skip conflicted rows) and "
-        "'replace'.",
-        [] { return duckdb::Value{"emit_error"}; },
-        [](duckdb::ClientContext&, duckdb::SetScope, duckdb::Value& value) {
-          if (!magic_enum::enum_cast<WriteConflictPolicy>(
-                 value.ToString(), magic_enum::case_insensitive)
-                 .has_value()) {
-            throw duckdb::InvalidInputException(
-              "invalid value for parameter \"sdb_write_conflict_policy\": "
-              "\"%s\"",
-              value.ToString());
-          }
-        },
-      },
-    },
-    {
-      "sdb_read_your_own_writes",
+      "sdb_strict_ddl",
       {
         LogicalTypeId::BOOLEAN,
-        "Controls whether queries can see uncommitted writes from the current "
-        "transaction.",
-        [] { return duckdb::Value::BOOLEAN(true); },
+        "When enabled, DDL inside a transaction block fails instead of "
+        "committing immediately (DDL is not transactional).",
+        [] { return duckdb::Value::BOOLEAN(false); },
       },
     },
     {
@@ -260,6 +232,80 @@ constexpr std::pair<std::string_view, VariableDescription>
         "DESC LIMIT k` into the inverted-index scan, so WAND (Block-Max "
         "top-K) pruning never engages. Default: false (optimization on).",
         [] { return duckdb::Value::BOOLEAN(false); },
+        [](duckdb::ClientContext&, duckdb::SetScope, duckdb::Value&) {},
+      },
+    },
+    {
+      "row_group_size",
+      {
+        LogicalTypeId::UINTEGER,
+        "Default column row-group size for INCLUDEd in newly created inverted "
+        "indexes. "
+        "Per-column (row_group_size = ...) and per-index WITH (row_group_size "
+        "= ...) override. Reads from existing indexes are unaffected. "
+        "Default: 122'880.",
+        [] { return duckdb::Value::UINTEGER(DEFAULT_ROW_GROUP_SIZE); },
+        [](duckdb::ClientContext&, duckdb::SetScope, duckdb::Value& value) {
+          const auto n = value.GetValue<uint32_t>();
+          if (n == 0) {
+            throw duckdb::InvalidInputException{
+              "invalid value for parameter \"row_group_size\": \"%s\"",
+              value.ToString()};
+          }
+        },
+      },
+    },
+    {
+      "norm_row_group_size",
+      {
+        LogicalTypeId::UINTEGER,
+        "Default column row-group size for norm columns of text-indexed fields "
+        "(Norm feature) in newly created inverted indexes. "
+        "Per-column (row_group_size = ...) and per-index WITH (row_group_size "
+        "= ...) override. Reads from existing indexes are unaffected. "
+        "Default: 122'880.",
+        [] { return duckdb::Value::UINTEGER(122'880); },
+        [](duckdb::ClientContext&, duckdb::SetScope, duckdb::Value& value) {
+          const auto n = value.GetValue<uint32_t>();
+          if (n == 0) {
+            throw duckdb::InvalidInputException{
+              "invalid value for parameter \"norm_row_group_size\": \"%s\"",
+              value.ToString()};
+          }
+        },
+      },
+    },
+    {
+      "refresh_interval",
+      {
+        LogicalTypeId::UINTEGER,
+        "Background refresh interval (ms) for newly created inverted indexes. "
+        "Per-index WITH (refresh_interval = ...) overrides. 0 disables the "
+        "refresh task. Default: 1000.",
+        [] { return duckdb::Value::UINTEGER(1000); },
+        [](duckdb::ClientContext&, duckdb::SetScope, duckdb::Value&) {},
+      },
+    },
+    {
+      "compaction_interval",
+      {
+        LogicalTypeId::UINTEGER,
+        "Background compaction interval (ms) for newly created inverted "
+        "indexes. Per-index WITH (compaction_interval = ...) overrides. "
+        "0 disables the compaction task. Default: 1000.",
+        [] { return duckdb::Value::UINTEGER(1000); },
+        [](duckdb::ClientContext&, duckdb::SetScope, duckdb::Value&) {},
+      },
+    },
+    {
+      "cleanup_interval_step",
+      {
+        LogicalTypeId::UINTEGER,
+        "Number of commit ticks between background unreferenced-file cleanup "
+        "passes for newly created inverted indexes. Per-index WITH "
+        "(cleanup_interval_step = ...) overrides. 0 disables cleanup. "
+        "Default: 1.",
+        [] { return duckdb::Value::UINTEGER(1); },
         [](duckdb::ClientContext&, duckdb::SetScope, duckdb::Value&) {},
       },
     },
@@ -359,6 +405,15 @@ constexpr std::pair<std::string_view, VariableDescription>
       },
     },
     {
+      "server_version_num",
+      {
+        LogicalTypeId::INTEGER,
+        "Shows the server version as an integer.",
+        [] { return duckdb::Value::INTEGER(180003); },
+        Readonly<"server_version_num">,
+      },
+    },
+    {
       "standard_conforming_strings",
       {
         LogicalTypeId::BOOLEAN,
@@ -377,12 +432,31 @@ constexpr std::pair<std::string_view, VariableDescription>
       },
     },
     {
+      "statement_timeout",
+      {
+        LogicalTypeId::VARCHAR,
+        "Aborts any statement that takes more than the specified number of "
+        "milliseconds. Accepted for compatibility but not currently enforced.",
+        [] { return duckdb::Value{"0"}; },
+        NoOverwrite<"statement_timeout">,
+      },
+    },
+    {
       "session_authorization",
       {
         LogicalTypeId::VARCHAR,
         "Sets the current session's user name.",
         [] { return duckdb::Value{std::string{StaticStrings::kDefaultUser}}; },
-        Readonly<"session_authorization">,
+        NoOverwrite<"session_authorization">,
+      },
+    },
+    {
+      "role",
+      {
+        LogicalTypeId::VARCHAR,
+        "Sets the current role.",
+        [] { return duckdb::Value{std::string{StaticStrings::kDefaultUser}}; },
+        NoOverwrite<"role">,
       },
     },
     {

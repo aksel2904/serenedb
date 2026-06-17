@@ -153,7 +153,6 @@ class LazyFilterBitsetIterator : public DocIterator, private util::Noncopyable {
   }
 
   doc_id_t LazySeek(doc_id_t target) final {
-    SDB_ASSERT(target >= value());
     // TODO: maybe optimize?
     return seek(target);
   }
@@ -266,6 +265,11 @@ Filter& ProxyFilter::cache_filter(IResourceManager& memory,
                                   Filter::ptr&& real) {
   _cache = std::make_shared<ProxyQueryCache>(memory, std::move(real));
   SDB_ASSERT(_cache->real_filter);
+  return *_cache->real_filter;
+}
+
+const Filter& ProxyFilter::inner() const noexcept {
+  SDB_ASSERT(_cache && _cache->real_filter);
   return *_cache->real_filter;
 }
 
