@@ -300,10 +300,24 @@ Filter::Query::ptr FixedPrepareCollect(const PrepareContext& ctx,
 
   size_t term_idx = 0;
   PosAttr::value_t look_back = 0;
+  // Per-slot term-group ids: a slot gets the index of the first slot holding
+  // the same term, so equal ids == same term.
+  std::vector<bytes_view> seen_terms;
+  seen_terms.reserve(phrase_size);
   for (const auto& term : options) {
     pos_itr->offs_max = term.offs_max;
     pos_itr->offs_min = term.offs_min;
     pos_itr->lead_offset = look_back += term.offs_max;
+    const bytes_view term_bytes{std::get<ByTermOptions>(term.part).term};
+    uint32_t group = static_cast<uint32_t>(seen_terms.size());
+    for (uint32_t k = 0; k < seen_terms.size(); ++k) {
+      if (seen_terms[k] == term_bytes) {
+        group = k;
+        break;
+      }
+    }
+    seen_terms.push_back(term_bytes);
+    pos_itr->term_group = group;
     term_stats.Finish(stats_buf, term_idx, &field_stats);
     ++pos_itr;
     ++term_idx;

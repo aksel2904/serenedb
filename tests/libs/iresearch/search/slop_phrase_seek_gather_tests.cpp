@@ -27,9 +27,6 @@
 // identical data via the gGatherOverride seam and assert the results are
 // bit-for-bit equal, plus unit-test BuildWindows directly.
 //
-// NOTE: phrase_iterator.hpp must precede slop_phrase_dp.hpp - the latter
-// uses FixedTermPosition / VariadicTermPosition from the former and does
-// not include it.
 
 #include "filter_test_case_base.hpp"
 #include "iresearch/analysis/token_attributes.hpp"
@@ -44,7 +41,7 @@ namespace {
 
 namespace dp = irs::detail::slop_dp;
 
-constexpr std::string_view kField = "phrase_anl";
+constexpr irs::field_id kField = tests::FieldIdFor("phrase_anl");
 
 // Restores the gather override to kAuto on scope exit so a forced mode
 // never leaks into another test.
@@ -135,11 +132,9 @@ class SlopSeekGatherTestCase : public tests::FilterTestCaseBase {
   }
 };
 
-// ---------------------------------------------------------------------------
 // BuildWindows: pure unit tests. Highest-certainty coverage of the merge
 // logic, which is the genuinely new algorithmic bit (overlap handling is
 // load-bearing because forward-only seek cannot re-read).
-// ---------------------------------------------------------------------------
 
 TEST(SlopBuildWindows, single) {
   std::vector<dp::Window> out;
@@ -189,11 +184,9 @@ TEST(SlopBuildWindows, touching_then_gap) {
   ASSERT_EQ(102u, out[1].second);
 }
 
-// ---------------------------------------------------------------------------
 // Equivalence: drive read-all vs seek-gather over the standard sequential
 // corpus for a representative set of sloppy queries. Reuses the same query
 // shapes as the existing sloppy tests.
-// ---------------------------------------------------------------------------
 
 TEST_P(SlopSeekGatherTestCase, equivalence_fixed) {
   {
@@ -219,7 +212,7 @@ TEST_P(SlopSeekGatherTestCase, equivalence_fixed) {
 
   for (const auto& s : specs) {
     irs::ByPhrase q;
-    *q.mutable_field() = kField;
+    *q.mutable_field_id() = kField;
     for (auto t : s.terms) {
       q.mutable_options()->push_back<irs::ByTermOptions>().term = Term(t);
     }
@@ -241,7 +234,7 @@ TEST_P(SlopSeekGatherTestCase, equivalence_explicit_gap) {
 
   // "quick __ moved": expected step 2 between slots.
   irs::ByPhrase q;
-  *q.mutable_field() = kField;
+  *q.mutable_field_id() = kField;
   q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("quick");
   q.mutable_options()->push_back<irs::ByTermOptions>(/*offs=*/1).term =
     Term("moved");
@@ -262,7 +255,7 @@ TEST_P(SlopSeekGatherTestCase, equivalence_variadic) {
 
   // prefix qui* + fox -> VariadicPhraseQuery path.
   irs::ByPhrase q;
-  *q.mutable_field() = kField;
+  *q.mutable_field_id() = kField;
   q.mutable_options()->push_back<irs::ByPrefixOptions>().term = Term("qui");
   q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("fox");
   q.mutable_options()->set_slop(1);
@@ -272,11 +265,9 @@ TEST_P(SlopSeekGatherTestCase, equivalence_variadic) {
   AssertExecuteEquivalent(prepared, rdr, "qui* fox s1 (variadic)");
 }
 
-// ---------------------------------------------------------------------------
 // Offsets equivalence: ExecuteWithOffsets must emit identical per-match
 // offsets under both gather strategies (covers _offs correctness after a
 // multi-step forward seek).
-// ---------------------------------------------------------------------------
 
 TEST_P(SlopSeekGatherTestCase, equivalence_offsets_fixed) {
   {
@@ -287,7 +278,7 @@ TEST_P(SlopSeekGatherTestCase, equivalence_offsets_fixed) {
   auto rdr = open_reader();
 
   irs::ByPhrase q;
-  *q.mutable_field() = kField;
+  *q.mutable_field_id() = kField;
   q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("quick");
   q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("fox");
   q.mutable_options()->set_slop(1);
@@ -320,7 +311,7 @@ TEST_P(SlopSeekGatherTestCase, equivalence_offsets_variadic) {
   auto rdr = open_reader();
 
   irs::ByPhrase q;
-  *q.mutable_field() = kField;
+  *q.mutable_field_id() = kField;
   q.mutable_options()->push_back<irs::ByPrefixOptions>().term = Term("qui");
   q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("fox");
   q.mutable_options()->set_slop(1);
@@ -344,16 +335,13 @@ TEST_P(SlopSeekGatherTestCase, equivalence_offsets_variadic) {
   ASSERT_EQ(read_all, seek);
 }
 
-// ---------------------------------------------------------------------------
 // Skewed inline data: builds a document with a 1:N in-doc frequency ratio
 // so the natural heuristic (kAuto) actually selects seek-gather, and an
 // adjacent slop-0 hit must still be found. The large ratio keeps the test
 // robust if kSeekGatherSkew is raised. The kAuto vs kForceReadAll equality
 // cross-checks the gate decision against the safe path.
-// ---------------------------------------------------------------------------
 
 TEST_P(SlopSeekGatherTestCase, skewed_engages_and_matches) {
-  // rarexyz @1, commonxyz @2..21 (20 occurrences). df ratio 1:20.
   static constexpr char kData[] =
     R"([{"name":"SK","phrase":"rarexyz commonxyz commonxyz commonxyz )"
     R"(commonxyz commonxyz commonxyz commonxyz commonxyz commonxyz commonxyz )"
@@ -366,7 +354,7 @@ TEST_P(SlopSeekGatherTestCase, skewed_engages_and_matches) {
   auto rdr = open_reader();
 
   irs::ByPhrase q;
-  *q.mutable_field() = kField;
+  *q.mutable_field_id() = kField;
   q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("rarexyz");
   q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("commonxyz");
   q.mutable_options()->set_slop(1);
@@ -388,11 +376,9 @@ TEST_P(SlopSeekGatherTestCase, skewed_engages_and_matches) {
   ASSERT_EQ(read_all, automatic);
 }
 
-// ---------------------------------------------------------------------------
 // Overlapping windows: two occurrences of the rare term close enough that
 // their slop windows merge, exercising the merged-window forward sweep in
 // the seek-gather collectors.
-// ---------------------------------------------------------------------------
 
 TEST_P(SlopSeekGatherTestCase, overlapping_windows_equivalent) {
   // rareq appears twice (@1 and @4); with slop large enough the two
@@ -408,7 +394,7 @@ TEST_P(SlopSeekGatherTestCase, overlapping_windows_equivalent) {
   auto rdr = open_reader();
 
   irs::ByPhrase q;
-  *q.mutable_field() = kField;
+  *q.mutable_field_id() = kField;
   q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("rareq");
   q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("commonq");
   q.mutable_options()->set_slop(
@@ -426,3 +412,123 @@ INSTANTIATE_TEST_SUITE_P(slop_seek_gather_test, SlopSeekGatherTestCase,
                                             ::testing::Values(tests::FormatInfo{
                                               "1_5simd"})),
                          SlopSeekGatherTestCase::to_string);
+
+// Phase 2 unit tests: n>=3 same-position matching in the slop DP matcher.
+//
+// Paste into tests/libs/iresearch/search/slop_phrase_seek_gather_tests.cpp,
+// inside the existing anonymous namespace (next to the SlopBuildWindows tests).
+// `namespace dp = irs::detail::slop_dp;` is already declared there.
+//
+// These drive detail::slop_dp::Run directly with synthetic per-slot position
+// lists and term-group ids, encoding the empirically-verified Elasticsearch
+// n>=3 spec (index "foo qux" with synonym foo,bar -> foo@0, bar@0, qux@1):
+//
+//   foo bar qux : slop 0 -> 0 ; slop >=1 -> 1   (distinct terms share pos 0)
+//   foo foo qux : any slop  -> 0                 (one occurrence, two slots)
+//
+// term-group ids: equal ids == same term.
+//   foo bar qux -> {0, 1, 2}   (no repeat)
+//   foo foo qux -> {0, 0, 2}   (foo repeated)
+//
+// Slot position lists for the doc foo@0, bar@0, qux@1:
+//   slot "foo" -> {0}   slot "bar" -> {0}   slot "qux" -> {1}
+// (for foo foo qux the second "foo" slot reads foo's postings too -> {0})
+
+// --- RunForLead path (narrow window <= 64) ----------------------------------
+
+TEST(SlopOverlapMatcher, n3_distinct_terms_share_position) {
+  dp::DpScratch scratch;
+  const std::vector<std::vector<irs::PosAttr::value_t>> slot_pos = {
+    {0}, {0}, {1}};
+  const std::vector<irs::PosAttr::value_t> expected_steps = {1, 1};
+  const std::vector<uint32_t> groups = {0, 1, 2};  // foo, bar, qux
+
+  // slop 0: same position is not adjacency -> no match.
+  {
+    auto r = dp::Run(slot_pos, /*slop=*/0, expected_steps, scratch,
+                     /*early_exit=*/false, groups);
+    EXPECT_FALSE(r.any);
+  }
+  // slop >= 1: foo@0 -> bar@0 (delta 0, cost 1) -> qux@1 (delta 1, cost 0) = 1.
+  for (const irs::PosAttr::value_t slop : {1u, 2u, 5u}) {
+    auto r = dp::Run(slot_pos, slop, expected_steps, scratch,
+                     /*early_exit=*/false, groups);
+    EXPECT_TRUE(r.any) << "slop=" << slop;
+    EXPECT_EQ(1u, r.freq) << "slop=" << slop;
+    EXPECT_EQ(1u, r.best_distance) << "slop=" << slop;
+  }
+}
+
+TEST(SlopOverlapMatcher, n3_repeated_term_never_matches) {
+  dp::DpScratch scratch;
+  const std::vector<std::vector<irs::PosAttr::value_t>> slot_pos = {
+    {0}, {0}, {1}};
+  const std::vector<irs::PosAttr::value_t> expected_steps = {1, 1};
+  const std::vector<uint32_t> groups = {0, 0, 2};  // foo, foo, qux
+
+  // The single foo occurrence (pos 0) cannot fill both foo slots, at any slop.
+  for (const irs::PosAttr::value_t slop : {0u, 1u, 5u}) {
+    auto r = dp::Run(slot_pos, slop, expected_steps, scratch,
+                     /*early_exit=*/false, groups);
+    EXPECT_FALSE(r.any) << "slop=" << slop;
+  }
+}
+
+//  CountFromLead path (wide window > kMaxWindowPositions == 128)
+// A wide qux slot pushes the merged window past 128 unique positions, so Run
+// falls back to the CountFromLead DFS. Verifies the same group-aware
+// uniqueness holds on the overflow path.
+
+TEST(SlopOverlapMatcher, n3_overflow_distinct_terms_share_position) {
+  dp::DpScratch scratch;
+  std::vector<irs::PosAttr::value_t> qux;
+  for (irs::PosAttr::value_t p = 1; p <= 130; ++p) {
+    qux.push_back(
+      p);  // 130 positions -> window has 131 unique -> CountFromLead
+  }
+  const std::vector<std::vector<irs::PosAttr::value_t>> slot_pos = {
+    {0}, {0}, std::move(qux)};
+  const std::vector<irs::PosAttr::value_t> expected_steps = {1, 1};
+  const std::vector<uint32_t> groups = {0, 1, 2};  // foo, bar, qux
+
+  auto r = dp::Run(slot_pos, /*slop=*/200, expected_steps, scratch,
+                   /*early_exit=*/false, groups);
+  EXPECT_TRUE(r.any);
+  EXPECT_EQ(1u, r.best_distance);
+}
+
+TEST(SlopOverlapMatcher, n3_overflow_repeated_term_never_matches) {
+  dp::DpScratch scratch;
+  std::vector<irs::PosAttr::value_t> qux;
+  for (irs::PosAttr::value_t p = 1; p <= 130; ++p) {
+    qux.push_back(p);
+  }
+  const std::vector<std::vector<irs::PosAttr::value_t>> slot_pos = {
+    {0}, {0}, std::move(qux)};
+  const std::vector<irs::PosAttr::value_t> expected_steps = {1, 1};
+  const std::vector<uint32_t> groups = {0, 0, 2};  // foo, foo, qux
+
+  auto r = dp::Run(slot_pos, /*slop=*/200, expected_steps, scratch,
+                   /*early_exit=*/false, groups);
+  EXPECT_FALSE(r.any);
+}
+
+//  Guard: empty groups (variadic / opt-out) keeps strict uniqueness
+// With no group info Run must fall back to per-position uniqueness, i.e. the
+// pre-fix behavior: two slots cannot share a position.
+
+TEST(SlopOverlapMatcher, n3_empty_groups_enforces_position_uniqueness) {
+  dp::DpScratch scratch;
+  const std::vector<std::vector<irs::PosAttr::value_t>> slot_pos = {
+    {0}, {0}, {1}};
+  const std::vector<irs::PosAttr::value_t> expected_steps = {1, 1};
+
+  // No groups argument -> default empty -> strict uniqueness -> foo@0/bar@0
+  // collision dropped -> no match at any slop.
+
+  for (const irs::PosAttr::value_t slop : {0u, 1u, 5u}) {
+    auto r = dp::Run(slot_pos, slop, expected_steps, scratch,
+                     /*early_exit=*/false);
+    EXPECT_FALSE(r.any) << "slop=" << slop;
+  }
+}

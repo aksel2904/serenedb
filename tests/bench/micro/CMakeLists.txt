@@ -31,6 +31,15 @@ add_bench(sloppy_phrase_vs_disjunction)
 add_bench(filter_prepare)
 add_bench(consecutive_run_length)
 
+target_compile_options(
+    serenedb-bench-micro-sloppy_phrase_vs_disjunction
+    PRIVATE -fno-lto
+)
+target_link_options(
+    serenedb-bench-micro-sloppy_phrase_vs_disjunction
+    PRIVATE -fno-lto
+)
+
 target_include_directories(
     serenedb-bench-micro-regexp_vs_wildcard
     SYSTEM

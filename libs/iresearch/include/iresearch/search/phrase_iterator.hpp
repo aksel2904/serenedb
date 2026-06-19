@@ -96,6 +96,11 @@ struct TermInterval {
   PosAttr::value_t offs_max{};
   PosAttr::value_t offs_min{};
   PosAttr::value_t lead_offset{};
+  // Per-slot term-group id (fixed phrase): equal ids == same term. Lets the
+  // slop matcher allow two DIFFERENT terms at one index position (synonyms)
+  // while still forbidding one occurrence / a repeated term from filling two
+  // slots. 0 for all slots when unused (variadic).
+  uint32_t term_group{};
 };
 
 // position attribute + desired offset in the phrase

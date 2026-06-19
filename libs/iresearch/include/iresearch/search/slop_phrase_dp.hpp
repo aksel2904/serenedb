@@ -34,17 +34,22 @@
 
 // Sloppy phrase frequency over per-slot position lists.
 //
-// Matching: a bitmask DP (Run/RunForLead) walks a window around each
-// candidate lead position and yields freq + best_distance; a separate
-// DFS (EnumerateAll) lists every valid tuple for highlighting. The DP
-// chain always runs in phrase order (slots 0..n-1); StepCost is
-// directional, so the order is fixed.
+// Matching: for each candidate lead position Run runs a pruned DFS
+// (CountFromLead) over the remaining slots in phrase order (slots
+// 0..n-1) and accumulates freq + best_distance. StepCost is directional,
+// so the slot order is fixed. The DFS walks only the slop-reachable
+// [lo, hi] slice of each slot and prunes on the running cost, so its work
+// is proportional to the valid (and near-valid) tuples; it never
+// materialises a per-lead window. The n == 2 case has a dedicated fast
+// path. EnumerateAll is a separate DFS that lists every valid tuple for
+// highlighting; CountFromLead mirrors its pruning so the scored freq
+// matches the enumerated tuple count exactly.
 //
 // Gather: positions can be collected two ways. read-all reads every
 // slot fully. seek-gather reads only the rarest slot fully, then seeks
 // the other slots into the slop-reachable windows around it
 // (BuildWindows); by the coverage lemma |p_a - p_b| <= slop +
-// sum_expected this drops no match, so the DP is identical either way -
+// sum_expected this drops no match, so matching is identical either way -
 // only fewer positions reach it. ResolveSeekGather picks the path
 // (kSeekGatherSkew heuristic, overridable by the gGatherOverride test
 // seam). Note the window is anchored on the rarest slot, not slot 0.
@@ -53,12 +58,6 @@
 // bit-for-bit; expected_step > 1 supports per-slot positional gaps
 // requested via push_back(term, offs). Interval gaps (offs_min !=
 // offs_max) combined with slop are rejected upstream by SDB_ENSURE.
-//
-// When the window exceeds kMaxWindowPositions the bitmask DP cannot
-// run for that lead. Run then falls back to CountFromLead, a DFS that
-// enumerates the lead's valid tuples directly: slower, but correct. It
-// mirrors EnumerateAll's pruning so freq/best_distance stay exact
-// instead of dropping the lead.
 
 namespace irs {
 
@@ -74,7 +73,8 @@ namespace detail::slop_dp {
 // expected == 1 (regular phrase term, adjacent to previous):
 //   delta >= 2  -> delta - 1   (forward gap)
 //   delta <= -1 -> -delta + 1  (reversal)
-//   delta in {0, 1} -> 0       (delta == 0 dropped by uniqueness)
+//   delta == 0  -> 1
+//   delta == 1  -> 0
 //
 // expected > 1 (push_back(term, offs) requested a gap):
 //   delta == expected           -> 0
@@ -90,7 +90,10 @@ constexpr PosAttr::value_t StepCost(int64_t delta,
     if (delta <= -1) {
       return static_cast<PosAttr::value_t>(-delta + 1);
     }
-    return 0;
+    if (delta == 0) {
+      return 1;  // same position: one move to separate the two slots
+    }
+    return 0;  // delta == 1: already adjacent
   }
   const int64_t exp = static_cast<int64_t>(expected);
   if (delta == exp) {
@@ -105,66 +108,18 @@ constexpr PosAttr::value_t StepCost(int64_t delta,
   return static_cast<PosAttr::value_t>(exp - delta + 1);
 }
 
-inline constexpr size_t kMaxWindowPositions = 128;
-
-struct Mask64 {
-  uint64_t v = 0;
-  bool Test(unsigned bit) const noexcept { return (v >> bit) & 1ULL; }
-  void Set(unsigned bit) noexcept { v |= (1ULL << bit); }
-  bool operator==(const Mask64&) const = default;
-};
-
-struct Mask128 {
-  uint64_t lo = 0;
-  uint64_t hi = 0;
-  bool Test(unsigned bit) const noexcept {
-    return bit < 64 ? ((lo >> bit) & 1ULL) : ((hi >> (bit - 64)) & 1ULL);
-  }
-  void Set(unsigned bit) noexcept {
-    if (bit < 64) {
-      lo |= (1ULL << bit);
-    } else {
-      hi |= (1ULL << (bit - 64));
-    }
-  }
-  bool operator==(const Mask128&) const = default;
-};
-
-template<typename Mask>
-struct DpEntry {
-  PosAttr::value_t cost;
-  Mask mask;
-  uint64_t count;
-};
-
 struct DpResult {
   uint64_t freq = 0;
   PosAttr::value_t best_distance = 0;
   bool any = false;
 };
 
-// Per-mask scratch buffers for a single RunForLead invocation. Kept
-// alive in DpScratch so the inner vectors' capacity is reused across
-// leads and across documents instead of being reallocated on each
-// call (Match runs once per candidate doc, RunForLead once per lead).
-// Only buckets in [0, Wsize) are ever read or written; capacity left
-// over from a wider window is harmless and never touched.
-template<typename Mask>
-struct LeadScratch {
-  std::vector<std::vector<unsigned>> slot_bits;
-  std::vector<std::vector<PosAttr::value_t>> slot_pos_in_win;
-  std::vector<std::vector<DpEntry<Mask>>> prev_layer;
-  std::vector<std::vector<DpEntry<Mask>>> cur_layer;
-};
-
-// Reusable scratch passed from the Frequency object into Run. Holds
-// both mask variants because Run dispatches Mask64/Mask128 per lead
-// within a single document depending on window size.
+// Reusable scratch passed from the Frequency object into Run. Holds the
+// per-lead DFS chain; its capacity is reused across leads and documents
+// instead of being reallocated on each call (Match runs once per
+// candidate doc, Run walks every lead).
 struct DpScratch {
-  std::vector<PosAttr::value_t> window_positions;
-  std::vector<PosAttr::value_t> chain;  // overflow fallback chain
-  LeadScratch<Mask64> lead64;
-  LeadScratch<Mask128> lead128;
+  std::vector<PosAttr::value_t> chain;
 };
 
 // Disjoint, ascending [lo, hi] gather interval (inclusive).
@@ -178,7 +133,7 @@ using Window = std::pair<PosAttr::value_t, PosAttr::value_t>;
 // slop, where windows widen toward full coverage and erode the win
 // measured: 8 is conservative, leaves win on the table on
 // moderately-skewed real data; calibration pending
-inline constexpr uint64_t kSeekGatherSkew = 8;
+inline constexpr uint64_t kSeekGatherSkew = 3;
 
 // Test seam for the gather strategy. Production always leaves this at
 // kAuto; gGatherOverride is never written outside tests. Tests flip it
@@ -237,132 +192,16 @@ inline void BuildWindows(const std::vector<PosAttr::value_t>& lead_pos,
   }
 }
 
-template<typename Mask>
-inline void RunForLead(
-  const std::vector<std::vector<PosAttr::value_t>>& slot_pos,
-  PosAttr::value_t slop, const std::vector<PosAttr::value_t>& expected_steps,
-  const std::vector<PosAttr::value_t>& window_positions, unsigned p0_bit,
-  LeadScratch<Mask>& scratch, DpResult& res, bool early_exit) {
-  const size_t n = slot_pos.size();
-  const size_t Wsize = window_positions.size();
-
-  auto& slot_bits = scratch.slot_bits;
-  auto& slot_pos_in_win = scratch.slot_pos_in_win;
-  slot_bits.resize(n);
-  slot_pos_in_win.resize(n);
-  const PosAttr::value_t win_lo = window_positions.front();
-  const PosAttr::value_t win_hi = window_positions.back();
-  for (size_t i = 0; i < n; ++i) {
-    const auto& sp = slot_pos[i];
-    auto begin = std::lower_bound(sp.begin(), sp.end(), win_lo);
-    auto end = std::upper_bound(sp.begin(), sp.end(), win_hi);
-    slot_bits[i].clear();
-    slot_pos_in_win[i].clear();
-    slot_bits[i].reserve(static_cast<size_t>(end - begin));
-    slot_pos_in_win[i].reserve(static_cast<size_t>(end - begin));
-    for (auto it = begin; it != end; ++it) {
-      auto wit =
-        std::lower_bound(window_positions.begin(), window_positions.end(), *it);
-      slot_bits[i].push_back(
-        static_cast<unsigned>(wit - window_positions.begin()));
-      slot_pos_in_win[i].push_back(*it);
-    }
-  }
-
-  auto& prev_layer = scratch.prev_layer;
-  auto& cur_layer = scratch.cur_layer;
-  if (prev_layer.size() < Wsize) {
-    prev_layer.resize(Wsize);
-  }
-  if (cur_layer.size() < Wsize) {
-    cur_layer.resize(Wsize);
-  }
-  for (size_t b = 0; b < Wsize; ++b) {
-    prev_layer[b].clear();
-  }
-
-  Mask init_mask;
-  init_mask.Set(p0_bit);
-  prev_layer[p0_bit].push_back({0, init_mask, 1});
-
-  auto add_or_insert = [](std::vector<DpEntry<Mask>>& bucket,
-                          PosAttr::value_t cost, const Mask& mask,
-                          uint64_t count) {
-    for (auto& e : bucket) {
-      if (e.cost == cost && e.mask == mask) {
-        e.count += count;
-        return;
-      }
-    }
-    bucket.push_back({cost, mask, count});
-  };
-
-  for (size_t i = 1; i < n; ++i) {
-    const PosAttr::value_t expected = expected_steps[i - 1];
-    for (size_t b = 0; b < Wsize; ++b) {
-      cur_layer[b].clear();
-    }
-    for (unsigned p_prev_bit = 0; p_prev_bit < Wsize; ++p_prev_bit) {
-      const auto& prev_bucket = prev_layer[p_prev_bit];
-      if (prev_bucket.empty()) {
-        continue;
-      }
-      const PosAttr::value_t p_prev = window_positions[p_prev_bit];
-      const auto& bits_i = slot_bits[i];
-      const auto& pos_i = slot_pos_in_win[i];
-      for (size_t k = 0; k < bits_i.size(); ++k) {
-        const unsigned p_bit = bits_i[k];
-        const PosAttr::value_t p = pos_i[k];
-        const int64_t delta =
-          static_cast<int64_t>(p) - static_cast<int64_t>(p_prev);
-        const PosAttr::value_t step = StepCost(delta, expected);
-        for (const auto& e : prev_bucket) {
-          const PosAttr::value_t new_cost = e.cost + step;
-          if (new_cost > slop) {
-            continue;
-          }
-          if (e.mask.Test(p_bit)) {
-            continue;
-          }
-          Mask new_mask = e.mask;
-          new_mask.Set(p_bit);
-          add_or_insert(cur_layer[p_bit], new_cost, new_mask, e.count);
-        }
-      }
-    }
-    std::swap(prev_layer, cur_layer);
-    if (early_exit && i == n - 1) {
-      for (size_t b = 0; b < Wsize; ++b) {
-        if (!prev_layer[b].empty()) {
-          res.any = true;
-          return;
-        }
-      }
-    }
-  }
-
-  for (size_t b = 0; b < Wsize; ++b) {
-    for (const auto& e : prev_layer[b]) {
-      res.freq += e.count;
-      if (!res.any || e.cost < res.best_distance) {
-        res.best_distance = e.cost;
-      }
-      res.any = true;
-    }
-  }
-}
-
 // Counts a single lead's valid tuples and accumulates freq +
-// best_distance into 'res'. Used when the window exceeds
-// kMaxWindowPositions and the bitmask DP cannot run. Mirrors
-// DfsEnumerate's pruning so the reported frequency matches
-// EnumerateAll's tuple count. Stops at the first tuple under
+// best_distance into 'res'. This is the n >= 3 matcher: Run calls it for
+// every lead. Mirrors DfsEnumerate's pruning so the scored frequency
+// matches EnumerateAll's tuple count. Stops at the first tuple under
 // early_exit.
 inline void CountFromLead(
   const std::vector<std::vector<PosAttr::value_t>>& slots,
   PosAttr::value_t slop, const std::vector<PosAttr::value_t>& expected_steps,
   std::vector<PosAttr::value_t>& chain, size_t i, PosAttr::value_t cost_so_far,
-  DpResult& res, bool early_exit) {
+  DpResult& res, bool early_exit, bool enforce_uniqueness = true) {
   const size_t n = slots.size();
   if (i == n) {
     ++res.freq;
@@ -392,10 +231,12 @@ inline void CountFromLead(
   for (auto it = begin; it != end; ++it) {
     const PosAttr::value_t p = *it;
     bool dup = false;
-    for (size_t k = 0; k < i; ++k) {
-      if (chain[k] == p) {
-        dup = true;
-        break;
+    if (enforce_uniqueness) {
+      for (size_t k = 0; k < i; ++k) {
+        if (chain[k] == p) {
+          dup = true;
+          break;
+        }
       }
     }
     if (dup) {
@@ -408,7 +249,7 @@ inline void CountFromLead(
     }
     chain[i] = p;
     CountFromLead(slots, slop, expected_steps, chain, i + 1, cost_so_far + step,
-                  res, early_exit);
+                  res, early_exit, enforce_uniqueness);
     if (early_exit && res.any) {
       return;
     }
@@ -418,7 +259,8 @@ inline void CountFromLead(
 inline DpResult Run(const std::vector<std::vector<PosAttr::value_t>>& slot_pos,
                     PosAttr::value_t slop,
                     const std::vector<PosAttr::value_t>& expected_steps,
-                    DpScratch& scratch, bool early_exit) {
+                    DpScratch& scratch, bool early_exit,
+                    const std::vector<uint32_t>& groups = {}) {
   DpResult res{};
   const size_t n = slot_pos.size();
   if (n < 2) {
@@ -438,47 +280,89 @@ inline DpResult Run(const std::vector<std::vector<PosAttr::value_t>>& slot_pos,
     sum_expected += e;
   }
   const PosAttr::value_t W = slop + sum_expected;
-  auto& window_positions = scratch.window_positions;
 
+  // Fast path for the common two-term phrase: pick the slot with fewer
+  // positions as the lead, then for each lead position binary-search the
+  // other slot's slop-reachable window. Iterating the smaller slot
+  // minimises the number of searches - a large win on phrases with one
+  // very common term (e.g. "the X"), especially under seek-gather, where
+  // the dense slot is gathered into windows around the rare one yet would
+  // otherwise still drive the lead loop. The step cost is directional
+  // (delta = pos[slot 1] - pos[slot 0] in phrase order); it is formed with
+  // the correct sign regardless of which slot is iterated, so freq and
+  // best_distance are identical to leading from slot 0. The +-W window is
+  // symmetric, so the same bound covers the other slot either way.
+  if (n == 2) {
+    const PosAttr::value_t expected = expected_steps[0];
+    const bool lead0 = slot_pos[0].size() <= slot_pos[1].size();
+    const auto& lead = lead0 ? slot_pos[0] : slot_pos[1];
+    const auto& other = lead0 ? slot_pos[1] : slot_pos[0];
+    // Same index position may fill both slots only for distinct terms
+    // (different groups); dropped when groups are absent or the terms match.
+    const bool same_pos_ok = !groups.empty() && groups[0] != groups[1];
+    for (const PosAttr::value_t pl : lead) {
+      const PosAttr::value_t win_lo = (pl > W) ? (pl - W) : 0;
+      const PosAttr::value_t win_hi =
+        (pl > std::numeric_limits<PosAttr::value_t>::max() - W)
+          ? std::numeric_limits<PosAttr::value_t>::max()
+          : (pl + W);
+      auto begin = std::lower_bound(other.begin(), other.end(), win_lo);
+      auto end = std::upper_bound(other.begin(), other.end(), win_hi);
+      for (auto it = begin; it != end; ++it) {
+        const PosAttr::value_t po = *it;
+        if (po == pl && !same_pos_ok) {
+          continue;
+        }
+        const int64_t delta =
+          lead0 ? (static_cast<int64_t>(po) - static_cast<int64_t>(pl))
+                : (static_cast<int64_t>(pl) - static_cast<int64_t>(po));
+        const PosAttr::value_t step = StepCost(delta, expected);
+        if (step > slop) {
+          continue;
+        }
+        if (early_exit) {
+          res.any = true;
+          return res;
+        }
+        ++res.freq;
+        if (!res.any || step < res.best_distance) {
+          res.best_distance = step;
+        }
+        res.any = true;
+      }
+    }
+    return res;
+  }
+
+  // Same index position may be shared by slots of DIFFERENT terms (e.g.
+  // synonyms at increment 0), but one occurrence / a repeated term must not
+  // fill two slots. Enforce strict per-position uniqueness only when groups
+  // are absent (variadic / opt-out) or a term repeats; otherwise distinct
+  // terms are free to share a position (cost via StepCost == 1, so excluded
+  // at slop 0). Matches ES match_phrase over synonym-expanded positions.
+  bool enforce_uniqueness = groups.empty();
+  if (!enforce_uniqueness) {
+    for (size_t a = 0; a < groups.size() && !enforce_uniqueness; ++a) {
+      for (size_t b = a + 1; b < groups.size(); ++b) {
+        if (groups[a] == groups[b]) {
+          enforce_uniqueness = true;
+          break;
+        }
+      }
+    }
+  }
+
+  // n >= 3: enumerate each lead's valid tuples with the pruned DFS.
+  // CountFromLead walks only the slop-reachable [lo, hi] slice of each
+  // slot and prunes on the running cost, so it never materialises a
+  // window; W above bounds that reachable range and serves the n == 2
+  // fast path.
+  auto& chain = scratch.chain;
+  chain.resize(n);
   for (PosAttr::value_t p0 : slot_pos[0]) {
-    const PosAttr::value_t win_lo = (p0 > W) ? (p0 - W) : 0;
-    const PosAttr::value_t win_hi =
-      (p0 > std::numeric_limits<PosAttr::value_t>::max() - W)
-        ? std::numeric_limits<PosAttr::value_t>::max()
-        : (p0 + W);
-    window_positions.clear();
-    for (const auto& sp : slot_pos) {
-      auto begin = std::lower_bound(sp.begin(), sp.end(), win_lo);
-      auto end = std::upper_bound(sp.begin(), sp.end(), win_hi);
-      window_positions.insert(window_positions.end(), begin, end);
-    }
-    std::sort(window_positions.begin(), window_positions.end());
-    window_positions.erase(
-      std::unique(window_positions.begin(), window_positions.end()),
-      window_positions.end());
-
-    auto p0_it =
-      std::lower_bound(window_positions.begin(), window_positions.end(), p0);
-    const unsigned p0_bit =
-      static_cast<unsigned>(p0_it - window_positions.begin());
-
-    if (window_positions.size() <= 64) {
-      RunForLead<Mask64>(slot_pos, slop, expected_steps, window_positions,
-                         p0_bit, scratch.lead64, res, early_exit);
-    } else if (window_positions.size() <= kMaxWindowPositions) {
-      RunForLead<Mask128>(slot_pos, slop, expected_steps, window_positions,
-                          p0_bit, scratch.lead128, res, early_exit);
-    } else {
-      // Window too wide for the bitmask DP: enumerate this lead's valid
-      // tuples directly so freq/best_distance stay correct instead of
-      // dropping the lead.
-      auto& chain = scratch.chain;
-      chain.resize(n);
-      chain[0] = p0;
-      CountFromLead(slot_pos, slop, expected_steps, chain, 1, 0, res,
-                    early_exit);
-    }
-
+    chain[0] = p0;
+    CountFromLead(slot_pos, slop, expected_steps, chain, 1, 0, res, early_exit,
+                  enforce_uniqueness);
     if (early_exit && res.any) {
       return res;
     }
@@ -637,6 +521,15 @@ class SlopPhraseFrequencyDP {
     const size_t n = _pos.size();
     // Reuse inner vector capacity across calls; n is fixed for the iterator.
     _slot_pos.resize(n);
+
+    if (_term_groups.size() != n) {
+      _term_groups.clear();
+      _term_groups.reserve(n);
+      for (const auto& p : _pos) {
+        _term_groups.push_back(p.second.term_group);
+      }
+    }
+
     for (auto& s : _slot_pos) {
       s.clear();
     }
@@ -737,8 +630,9 @@ class SlopPhraseFrequencyDP {
       }
     }
 
-    auto res = detail::slop_dp::Run(_slot_pos, _max_slop, _expected_steps,
-                                    _dp_scratch, /*early_exit=*/!HasFreq);
+    auto res =
+      detail::slop_dp::Run(_slot_pos, _max_slop, _expected_steps, _dp_scratch,
+                           /*early_exit=*/!HasFreq, _term_groups);
     if (!res.any) {
       return false;
     }
@@ -850,6 +744,8 @@ class SlopPhraseFrequencyDP {
   PosAttr::value_t _best_distance = 0;
   uint32_t _start_offset{0};
   uint32_t _end_offset{0};
+
+  std::vector<uint32_t> _term_groups;
 };
 
 // Variadic sloppy phrase frequency. Replaces SlopVariadicPhraseFrequency.
