@@ -27,12 +27,13 @@
 // identical data via the gGatherOverride seam and assert bit-for-bit equal
 // results, plus unit-test BuildWindows directly.
 //
-// n == 2 phrases route to the merge-join in production and never reach
-// gather, so every gather-equivalence check on a two-term query runs under
-// PairJoinGuard - otherwise both sides would run the join and the comparison
-// would be a tautology. Join-vs-legacy equivalence is asserted separately by
-// the pair_join_equivalence_* tests. The SlopOverlapMatcher tests at the end
-// pin the n >= 3 same-position (term-group) semantics of dp::Run.
+// n == 2 phrases - fixed and variadic alike - route to the merge-join in
+// production and never reach gather, so every gather-equivalence check on a
+// two-term query runs under PairJoinGuard - otherwise both sides would run
+// the join and the comparison would be a tautology. Join-vs-legacy
+// equivalence is asserted separately by the pair_join_equivalence_* tests.
+// The SlopOverlapMatcher tests at the end pin the n >= 3 same-position
+// (term-group) semantics of dp::Run.
 //
 
 #include "filter_test_case_base.hpp"
@@ -134,9 +135,9 @@ class SlopSeekGatherTestCase : public tests::FilterTestCaseBase {
  protected:
   // Runs the prepared query under read-all and seek-gather and asserts
   // identical doc ids (ctx is forwarded to the failure message). PairJoinGuard
-  // keeps n == 2 queries on the gather path this helper exercises (production
-  // would route them to the join, making the comparison vacuous); it is a
-  // no-op for n >= 3 and variadic queries.
+  // keeps n == 2 queries - fixed and variadic alike - on the gather path this
+  // helper exercises (production would route them to the join, making the
+  // comparison vacuous); it is a no-op for n >= 3.
   void AssertExecuteEquivalent(const irs::Filter::Query::ptr& prepared,
                                const irs::DirectoryReader& rdr,
                                std::string_view ctx) {
@@ -349,13 +350,17 @@ TEST_P(SlopSeekGatherTestCase, equivalence_offsets_variadic) {
     dynamic_cast<const irs::VariadicPhraseQuery*>(prepared.get());
   ASSERT_NE(nullptr, phrase_query);
 
+  // n == 2: without the guard both runs would take the variadic join and
+  // never consult the gather gate at all (see file header).
   std::vector<OffsetMatch> read_all;
   std::vector<OffsetMatch> seek;
   {
+    PairJoinGuard pj;
     GatherModeGuard g{dp::GatherOverride::kForceReadAll};
     read_all = CollectOffsets(*phrase_query, rdr);
   }
   {
+    PairJoinGuard pj;
     GatherModeGuard g{dp::GatherOverride::kForceSeek};
     seek = CollectOffsets(*phrase_query, rdr);
   }
@@ -513,6 +518,112 @@ TEST_P(SlopSeekGatherTestCase, pair_join_equivalence_offsets) {
   auto prepared = q.prepare({.index = rdr});
   const auto* phrase_query =
     dynamic_cast<const irs::FixedPhraseQuery*>(prepared.get());
+  ASSERT_NE(nullptr, phrase_query);
+
+  const auto join = CollectOffsets(*phrase_query, rdr);
+  std::vector<OffsetMatch> legacy;
+  {
+    PairJoinGuard pj;
+    legacy = CollectOffsets(*phrase_query, rdr);
+  }
+  ASSERT_FALSE(join.empty());
+  ASSERT_EQ(legacy, join);
+}
+
+// Variadic pair-join equivalence: an n == 2 variadic phrase (a term set per
+// slot, here from prefix expansion) routes to the same merge-join through
+// MergedPosStream. Same join-vs-legacy discipline as the fixed test.
+// Duplicate positions inside a slot (same-position synonyms) cannot occur
+// on this corpus; that case is pinned by the merged-stream fuzz oracle.
+TEST_P(SlopSeekGatherTestCase, pair_join_equivalence_variadic) {
+  {
+    tests::JsonDocGenerator gen(resource("phrase_sequential.json"),
+                                &tests::PayloadedJsonFieldFactory);
+    add_segment(gen);
+  }
+  auto rdr = open_reader();
+
+  struct Slot {
+    bool prefix;
+    std::string_view term;
+  };
+  struct Spec {
+    std::string_view ctx;
+    Slot first;
+    Slot second;
+    size_t gap_offs;  // extra offset before the second term (0 == none)
+    irs::PosAttr::value_t slop;
+  };
+  const Spec specs[] = {
+    {"qui* fox s1", {true, "qui"}, {false, "fox"}, 0, 1},
+    {"qui* moved s3", {true, "qui"}, {false, "moved"}, 0, 3},
+    {"fox qui* s3 (reversal)", {false, "fox"}, {true, "qui"}, 0, 3},
+    {"qui* __ moved s1 (gap)", {true, "qui"}, {false, "moved"}, 1, 1},
+  };
+
+  for (const auto& s : specs) {
+    irs::ByPhrase q;
+    *q.mutable_field_id() = kField;
+    auto& opts = *q.mutable_options();
+    if (s.first.prefix) {
+      opts.push_back<irs::ByPrefixOptions>().term = Term(s.first.term);
+    } else {
+      opts.push_back<irs::ByTermOptions>().term = Term(s.first.term);
+    }
+    if (s.second.prefix) {
+      opts.push_back<irs::ByPrefixOptions>(s.gap_offs).term =
+        Term(s.second.term);
+    } else {
+      opts.push_back<irs::ByTermOptions>(s.gap_offs).term = Term(s.second.term);
+    }
+    opts.set_slop(s.slop);
+
+    auto prepared = q.prepare({.index = rdr});
+    ASSERT_NE(nullptr, prepared) << s.ctx;
+
+    const auto join = CollectDocs(prepared, rdr);
+    std::vector<irs::doc_id_t> legacy_readall;
+    std::vector<irs::doc_id_t> legacy_seek;
+    {
+      PairJoinGuard pj;
+      GatherModeGuard g{dp::GatherOverride::kForceReadAll};
+      legacy_readall = CollectDocs(prepared, rdr);
+    }
+    {
+      PairJoinGuard pj;
+      GatherModeGuard g{dp::GatherOverride::kForceSeek};
+      legacy_seek = CollectDocs(prepared, rdr);
+    }
+    ASSERT_EQ(legacy_readall, join)
+      << "variadic pair join diverged from read-all: " << s.ctx;
+    ASSERT_EQ(legacy_seek, join)
+      << "variadic pair join diverged from seek-gather: " << s.ctx;
+    ASSERT_FALSE(join.empty()) << "expected matches for: " << s.ctx;
+  }
+}
+
+// Offsets path through the variadic join: per-match offsets resolved by the
+// merged streams must be identical to the generic gather path's. Exact
+// comparison is safe here: with no same-position tokens in the corpus no
+// slot holds duplicate positions, the one case where the two paths may
+// legitimately source offsets from different equal-position terms.
+TEST_P(SlopSeekGatherTestCase, pair_join_equivalence_offsets_variadic) {
+  {
+    tests::JsonDocGenerator gen(resource("phrase_sequential.json"),
+                                &tests::PayloadedJsonFieldFactory);
+    add_segment(gen);
+  }
+  auto rdr = open_reader();
+
+  irs::ByPhrase q;
+  *q.mutable_field_id() = kField;
+  q.mutable_options()->push_back<irs::ByPrefixOptions>().term = Term("qui");
+  q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("fox");
+  q.mutable_options()->set_slop(1);
+
+  auto prepared = q.prepare({.index = rdr});
+  const auto* phrase_query =
+    dynamic_cast<const irs::VariadicPhraseQuery*>(prepared.get());
   ASSERT_NE(nullptr, phrase_query);
 
   const auto join = CollectOffsets(*phrase_query, rdr);

@@ -21,6 +21,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <tuple>
@@ -163,10 +164,11 @@ inline bool ResolveSeekGather(bool heuristic) noexcept {
   return heuristic;
 }
 
-// Test seam for the n == 2 fused merge-join (JoinPair). Production leaves
-// this false; tests set it to route n == 2 through the generic gather + Run
-// path and assert join-vs-generic equivalence over identical data (the join
-// bypasses gather, so this is the only way to run both).
+// Test seam for the n == 2 fused merge-join (JoinPair), fixed and variadic.
+// Production leaves this false; tests set it to route n == 2 through the
+// generic gather + Run path and assert join-vs-generic equivalence over
+// identical data (the join bypasses gather, so this is the only way to run
+// both).
 inline bool gPairJoinDisabled = false;
 
 // (start, end) offsets of one token occurrence.
@@ -372,6 +374,144 @@ SLOP_PROF_NOINLINE DpResult JoinPair(
   }
   return res;
 }
+
+// Merged position stream over one variadic slot's sub-iterators: a k-way
+// merge of the per-term position lists with duplicate positions collapsed,
+// exposing the next()/value()/seek() contract JoinPair expects from a single
+// slot. Duplicates must collapse because the gather path does the same
+// (finalize_slot's sort + unique keys on position alone): two terms of the
+// set at one position yield one slot position, hence one counted pair. Which
+// duplicate's offsets survive is unspecified in the gather path (unstable
+// sort); the stream deterministically keeps the first sub-iterator in visit
+// order.
+//
+// Offsets are copied into stream-owned storage on every reposition: the
+// active sub-iterator changes as the merge advances, so no single sub's
+// OffsAttr pointer stays correct. JoinPair reads offsets immediately after
+// positioning, which the refresh-on-move exactly covers.
+//
+// Linear scans over the subs: a slot's term set is a handful of synonyms,
+// where a heap costs more than it saves.
+//
+// Templated on the sub-iterator type so the fuzz oracle can drive it over
+// mocks; production always uses the PosAttr default.
+template<bool Offs, typename SubPos = PosAttr>
+class MergedPosStream {
+ public:
+  void Clear() {
+    _subs.clear();
+    _cur = pos_limits::invalid();
+  }
+
+  // Registers one sub-iterator of the current document, rewound and primed
+  // at its first position. Exhausted (empty) subs are dropped up front.
+  void Add(SubPos* pos, const OffsAttr* offs) {
+    SDB_ASSERT(pos);
+    pos->reset();
+    Sub s{.pos = pos, .offs = offs, .val = pos_limits::eof()};
+    if (pos->next()) {
+      const auto v = pos->value();
+      if (!pos_limits::eof(v)) {
+        s.val = v;
+      }
+    }
+    if (!pos_limits::eof(s.val)) {
+      _subs.push_back(s);
+    }
+  }
+
+  bool Empty() const noexcept { return _subs.empty(); }
+
+  PosAttr::value_t value() const noexcept { return _cur; }
+
+  bool next() {
+    if (pos_limits::valid(_cur)) {
+      if (pos_limits::eof(_cur)) {
+        return false;
+      }
+      // Consume every sub entry sitting on the current position; this is
+      // where duplicates collapse into the one merged position already
+      // emitted. The inner loop also skips repeats within one sub - real
+      // postings are strictly increasing, but one compare buys not having
+      // to assume it.
+      for (auto& s : _subs) {
+        while (s.val == _cur) {
+          AdvanceSub(s);
+        }
+      }
+    }
+    return Reposition();
+  }
+
+  PosAttr::value_t seek(PosAttr::value_t target) {
+    if (pos_limits::valid(_cur) && _cur >= target) {
+      return _cur;  // forward-only, like the underlying iterators
+    }
+    for (auto& s : _subs) {
+      if (s.val < target) {
+        const auto v = s.pos->seek(target);
+        s.val =
+          (!pos_limits::valid(v) || pos_limits::eof(v)) ? pos_limits::eof() : v;
+      }
+    }
+    Reposition();
+    return _cur;
+  }
+
+  // Stable pointer to the current position's offsets, refreshed on every
+  // reposition; {0, 0} when the winning sub carries no offsets.
+  const OffsAttr* GetOffs() const noexcept { return &_offs; }
+
+ private:
+  struct Sub {
+    SubPos* pos;
+    // Null when the sub-iterator carries no offsets.
+    const OffsAttr* offs;
+    // Cached pos->value(); pos_limits::eof() once exhausted.
+    PosAttr::value_t val;
+  };
+
+  static void AdvanceSub(Sub& s) {
+    if (!s.pos->next()) {
+      s.val = pos_limits::eof();
+      return;
+    }
+    const auto v = s.pos->value();
+    s.val = pos_limits::eof(v) ? pos_limits::eof() : v;
+  }
+
+  // Emits the minimum over the subs' cached positions (exhausted subs sit
+  // at eof and never win) and captures the winner's offsets.
+  bool Reposition() {
+    auto min = pos_limits::eof();
+    for (const auto& s : _subs) {
+      min = std::min(min, s.val);
+    }
+    _cur = min;
+    if (pos_limits::eof(_cur)) {
+      return false;
+    }
+    if constexpr (Offs) {
+      for (const auto& s : _subs) {
+        if (s.val == _cur) {
+          if (s.offs) {
+            _offs.start = s.offs->start;
+            _offs.end = s.offs->end;
+          } else {
+            _offs.start = 0;
+            _offs.end = 0;
+          }
+          break;
+        }
+      }
+    }
+    return true;
+  }
+
+  std::vector<Sub> _subs;
+  PosAttr::value_t _cur = pos_limits::invalid();
+  OffsAttr _offs;
+};
 
 // Merge [pos - W, pos + W] over the lead slot's already-sorted
 // positions into disjoint ascending windows. lo is clamped to
@@ -984,6 +1124,12 @@ class SlopVariadicPhraseFrequencyDP {
     }
 
     const size_t n = _pos.size();
+    // Two-slot phrases bypass gather + Run entirely: the fused merge-join
+    // consumes the merged per-slot position streams directly.
+    if (n == 2 && !detail::slop_dp::gPairJoinDisabled) {
+      return MatchPair();
+    }
+
     // Reuse inner vectors' capacity (see SlopPhraseFrequencyDP::Match)
     _slot_pos.resize(n);
     for (auto& s : _slot_pos) {
@@ -1162,6 +1308,27 @@ class SlopVariadicPhraseFrequencyDP {
     return true;
   }
 
+  struct BindCtx {
+    detail::slop_dp::MergedPosStream<kHasOffsets>* stream;
+  };
+
+  // Registers one sub-iterator of the current document into the slot's
+  // merged stream (n == 2 join path).
+  static bool BindOneSubIter(void* ctx, Adapter& adapter) {
+    SDB_ASSERT(ctx);
+    auto& c = *reinterpret_cast<BindCtx*>(ctx);
+    auto* p = adapter.position;
+    if (!p) {
+      return true;
+    }
+    const OffsAttr* offs = nullptr;
+    if constexpr (kHasOffsets) {
+      offs = adapter.offset;
+    }
+    c.stream->Add(p, offs);
+    return true;
+  }
+
   struct WindowCtx {
     std::vector<PosEntry>* out;
     const std::vector<detail::slop_dp::Window>* windows;
@@ -1224,6 +1391,72 @@ class SlopVariadicPhraseFrequencyDP {
     }
   }
 
+  // n == 2 path: merges each slot's sub-iterators into one position stream
+  // and runs JoinPair over the two streams, mapping its result onto the
+  // generic outputs (_phrase_freq, _best_distance, _matches). Anchor = rarer
+  // slot by the disjunction's doc-level cost estimate (a compound iterator
+  // has no exact per-doc count); ties keep slot 0, as Run does.
+  bool MatchPair() {
+    for (size_t i = 0; i < 2; ++i) {
+      auto& stream = _merged[i];
+      stream.Clear();
+      BindCtx ctx{&stream};
+      _pos[i].first->visit(&ctx, BindOneSubIter);
+      if (stream.Empty()) {
+        return false;
+      }
+    }
+
+    const bool anchor_is_slot0 =
+      CostAttr::extract(*_pos[0].first) <= CostAttr::extract(*_pos[1].first);
+    auto& anchor = _merged[anchor_is_slot0 ? 0 : 1];
+    auto& partner = _merged[anchor_is_slot0 ? 1 : 0];
+
+    const OffsAttr* anchor_offs = nullptr;
+    const OffsAttr* partner_offs = nullptr;
+    if constexpr (kHasOffsets) {
+      anchor_offs = anchor.GetOffs();
+      partner_offs = partner.GetOffs();
+    }
+
+    std::vector<detail::slop_dp::PairMatch>* collect = nullptr;
+    if constexpr (kHasOffsets && HasFreq) {
+      collect = &_pair_matches;
+    }
+
+    // A variadic slot is a term set with no per-term group identity, so
+    // strict position uniqueness stays on - matching the gather + Run
+    // path's empty groups and the Lucene oracle.
+    const auto res = detail::slop_dp::JoinPair<kHasOffsets, HasFreq>(
+      anchor, partner, anchor_offs, partner_offs, anchor_is_slot0, _max_slop,
+      _expected_steps[0], /*enforce_uniqueness=*/true, _pair_scratch, collect);
+    if (!res.any) {
+      return false;
+    }
+
+    if constexpr (HasFreq) {
+      _phrase_freq = static_cast<uint32_t>(res.freq);
+      _best_distance = res.best_distance;
+      if constexpr (kHasOffsets) {
+        // Same single-pass invariant as the generic path: the join emits
+        // exactly one PairMatch per counted pair.
+        SDB_ASSERT(static_cast<uint32_t>(_pair_matches.size()) == _phrase_freq);
+        _matches.reserve(_pair_matches.size());
+        for (const auto& m : _pair_matches) {
+          _matches.push_back({m.start_offset, m.end_offset});
+        }
+        if (!_matches.empty()) {
+          _start_offset = _matches[0].start;
+          _end_offset = _matches[0].end;
+          _match_idx = 1;
+        }
+      }
+    } else {
+      _phrase_freq = 1;
+    }
+    return true;
+  }
+
   // See SlopPhraseFrequencyDP::BuildMatches
   void BuildMatches() {
     if constexpr (!kHasOffsets || !HasFreq) {
@@ -1267,6 +1500,10 @@ class SlopVariadicPhraseFrequencyDP {
   // Valid tuples from the matcher pass, sorted by leftmost (kHasOffsets &&
   // HasFreq only).
   std::vector<detail::slop_dp::EnumeratedMatch> _enumerated;
+  // n == 2 fused merge-join state.
+  std::array<detail::slop_dp::MergedPosStream<kHasOffsets>, 2> _merged;
+  detail::slop_dp::PairScratch _pair_scratch;
+  std::vector<detail::slop_dp::PairMatch> _pair_matches;
   std::vector<OffsetPair> _matches;
   size_t _match_idx = 0;
   uint32_t _phrase_freq = 0;

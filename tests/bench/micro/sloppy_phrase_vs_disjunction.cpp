@@ -753,11 +753,10 @@ void AppendFixedPhrase(irs::Or& or_filter, std::string_view first,
     .term = irs::ViewCast<irs::byte_type>(second);
 }
 
-// Builds the disjunction that matches the same chains as MakeSlopPhrase
-// for two terms with expected step 1:
-//   forward  phrases for gaps in [1, slop+1]
-//   reversed phrases for gaps in [1, slop-1]
-// Reversed phrases have cost = gap + 1, so the loop bound is slop-1.
+// Builds the disjunction matching the same chains as MakeSlopPhrase for two
+// terms with expected step 1: forward phrases for gaps in [1, slop+1] and
+// reversed phrases for gaps in [1, slop-1] (reversed cost = gap + 1, so the
+// bound is slop-1).
 irs::Or MakeDisjunctionEquivalent(std::string_view t0, std::string_view t1,
                                   irs::PosAttr::value_t slop) {
   irs::Or q;
@@ -925,10 +924,10 @@ template<typename MakeFn>
 }
 
 // Variadic n == 2: dense "the" x a two-term synonym set. A non-simple slot
-// routes prepare() to VariadicPhraseQuery, which still runs gather + Run (the
-// merge-join covers only the fixed adapter). Closest unclosed relative of the
-// skewed the_commission shape; exists to decide whether the join needs a
-// variadic port.
+// routes prepare() to VariadicPhraseQuery, which runs the fused merge-join
+// over per-slot merged position streams (same join as the fixed pair, fed
+// by MergedPosStream). Variadic counterpart of the skewed the_commission
+// shape.
 irs::ByPhrase MakeSlopPhraseVariadic2(irs::PosAttr::value_t slop) {
   irs::ByPhrase q;
   *q.mutable_field_id() = kFieldId;
@@ -951,9 +950,10 @@ irs::Or MakeDisjunctionEquivalentVariadic2(irs::PosAttr::value_t slop) {
   return q;
 }
 
-// ExecuteWithOffsets is a FixedPhraseQuery method; slop only (no
-// disjunction analogue). Drains pos->next() per matched doc.
-template<typename MakeFn>
+// ExecuteWithOffsets exists on FixedPhraseQuery and VariadicPhraseQuery
+// (PhraseQueryT selects which); slop only, no disjunction analogue. Drains
+// pos->next() per matched doc.
+template<typename PhraseQueryT = irs::FixedPhraseQuery, typename MakeFn>
 [[gnu::noinline]] void BenchExecuteWithOffsets(benchmark::State& state,
                                                const irs::DirectoryReader& rdr,
                                                MakeFn make) {
@@ -963,10 +963,9 @@ template<typename MakeFn>
     state.SkipWithError("prepare returned null");
     return;
   }
-  const auto* phrase_query =
-    dynamic_cast<const irs::FixedPhraseQuery*>(prepared.get());
+  const auto* phrase_query = dynamic_cast<const PhraseQueryT*>(prepared.get());
   if (!phrase_query) {
-    state.SkipWithError("expected FixedPhraseQuery, got different prepared");
+    state.SkipWithError("prepared query has unexpected type");
     return;
   }
 
@@ -1208,9 +1207,10 @@ void RegisterAll() {
       ->ReportAggregatesOnly(true);
   }
 
-  // Variadic n == 2 (gather + Run path; no fused join). Watch this
-  // against its baseline: if the gap here mirrors the old fixed-pair
-  // the_commission loss, the join needs a variadic port.
+  // Variadic n == 2, routed through the merged-stream fused join. The
+  // remaining slop-1 gap against the expansion baseline is doc-level
+  // disjunction machinery, not matching. ExecOffs additionally covers the
+  // stream's refresh-on-move offset capture.
   for (auto slop : kSlopValues) {
     const std::string suffix = "_var2_the_commission_council_slop" +
                                std::to_string(static_cast<unsigned>(slop));
@@ -1228,6 +1228,15 @@ void RegisterAll() {
         BenchExecuteOnly(state, GetCorpus().reader, [slop] {
           return MakeDisjunctionEquivalentVariadic2(slop);
         });
+      })
+      ->Repetitions(kRepetitions)
+      ->ReportAggregatesOnly(true);
+    benchmark::RegisterBenchmark(
+      ("SlopPhraseExecOffs" + suffix).c_str(),
+      [slop](benchmark::State& state) {
+        BenchExecuteWithOffsets<irs::VariadicPhraseQuery>(
+          state, GetCorpus().reader,
+          [slop] { return MakeSlopPhraseVariadic2(slop); });
       })
       ->Repetitions(kRepetitions)
       ->ReportAggregatesOnly(true);
