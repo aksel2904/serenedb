@@ -8860,6 +8860,43 @@ class OverlapDocGenerator : public tests::DocGeneratorBase {
   bool _done{false};
 };
 
+// Same as OverlapField, but also indexes offsets so the doc can be
+// queried via ExecuteWithOffsets.
+class OverlapFieldWithOffsets : public OverlapField {
+ public:
+  OverlapFieldWithOffsets(std::string_view name, irs::field_id field_id)
+    : OverlapField(name, field_id) {
+    index_features = irs::IndexFeatures::Freq | irs::IndexFeatures::Pos |
+                     irs::IndexFeatures::Offs;
+  }
+};
+
+class OverlapDocGeneratorWithOffsets : public tests::DocGeneratorBase {
+ public:
+  explicit OverlapDocGeneratorWithOffsets(irs::field_id field_id)
+    : _field_id(field_id) {}
+
+  const tests::Document* next() final {
+    if (_done) {
+      return nullptr;
+    }
+    _done = true;
+    _doc.indexed.clear();
+    _doc.stored.clear();
+    _doc.insert(
+      std::make_shared<OverlapFieldWithOffsets>("phrase_anl", _field_id),
+      /*indexed=*/true, /*stored=*/false);
+    return &_doc;
+  }
+
+  void reset() final { _done = false; }
+
+ private:
+  irs::field_id _field_id;
+  tests::Document _doc;
+  bool _done{false};
+};
+
 }  // namespace tests
 namespace {
 
@@ -8895,7 +8932,7 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_overlap_same_position) {
   }
   auto rdr = open_reader(irs::tests::DefaultReaderOptions());
 
-  //   Already-correct contract (passes today, must keep passing)
+  // Contract that predates the same-position fix (must keep passing).
 
   // slop 0: same position is not adjacency -> no match (matches ES).
   EXPECT_EQ(0u, MatchCount(rdr, kPhraseAnl, "foo", "bar", 0));
@@ -8905,12 +8942,54 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_overlap_same_position) {
   EXPECT_EQ(0u, MatchCount(rdr, kPhraseAnl, "foo", "foo", 0));
   EXPECT_EQ(0u, MatchCount(rdr, kPhraseAnl, "foo", "foo", 5));
 
-  //   case A: the bug. ES matches at slop >= 1; we currently drop it.
-  // These are the behavior we MUST reach. Until the matcher is fixed they
-  // fail. After the fix they must pass while everything above still holds.
+  // case A, the same-position fix: distinct terms sharing a position match at
+  // slop >= 1 (ES). slop 0 excludes them because same position costs 1.
   EXPECT_EQ(1u, MatchCount(rdr, kPhraseAnl, "foo", "bar", 1));
   EXPECT_EQ(1u, MatchCount(rdr, kPhraseAnl, "foo", "bar", 5));
   EXPECT_EQ(1u, MatchCount(rdr, kPhraseAnl, "bar", "foo", 1));
+}
+
+// Offsets path of the same-position fix: the matcher (Run with term
+// groups) accepts foo@P/bar@P at slop >= 1, and the highlight
+// enumeration must agree. Before the fix the enumeration pass enforced
+// strict position uniqueness unconditionally, dropped the tuple and
+// tripped the enumerated.size() == _phrase_freq assert in BuildMatches.
+TEST_P(PhraseFilterTestCase, sloppy_phrase_overlap_same_position_with_offsets) {
+  {
+    tests::OverlapDocGeneratorWithOffsets gen(kPhraseAnl);
+    add_segment(gen);
+  }
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
+
+  irs::ByPhrase q;
+  *q.mutable_field_id() = kPhraseAnl;
+  q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    irs::ViewCast<irs::byte_type>(std::string_view("foo"));
+  q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    irs::ViewCast<irs::byte_type>(std::string_view("bar"));
+  q.mutable_options()->set_slop(1);
+
+  auto prepared = q.prepare({.index = rdr});
+  auto* phrase_query =
+    dynamic_cast<const irs::FixedPhraseQuery*>(prepared.get());
+  ASSERT_NE(nullptr, phrase_query);
+
+  auto sub = rdr.begin();
+  auto docs = phrase_query->ExecuteWithOffsets(*sub);
+  ASSERT_NE(nullptr, docs);
+  auto* pos = irs::GetMutable<irs::PosAttr>(docs.get());
+  ASSERT_NE(nullptr, pos);
+  auto* offs = irs::get<irs::OffsAttr>(*pos);
+  ASSERT_NE(nullptr, offs);
+
+  ASSERT_TRUE(docs->next());
+  ASSERT_TRUE(pos->next())
+    << "matcher freq says a match exists, offsets enumeration dropped it";
+  // foo@P and bar@P both originate from the single source token "foo",
+  // so the single match spans exactly that token.
+  EXPECT_LT(offs->start, offs->end);
+  EXPECT_FALSE(pos->next());
+  ASSERT_FALSE(docs->next());
 }
 
 namespace tests {

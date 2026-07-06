@@ -18,32 +18,30 @@
 /// Copyright holder is SereneDB GmbH, Berlin, Germany
 ////////////////////////////////////////////////////////////////////////////////
 
-// Microbenchmark: SlopPhrase (DP) vs functionally-equivalent disjunction
-// of fixed phrases, on europarl text plus synthetic corpora.
+// Microbenchmark: SlopPhrase (DP) vs a functionally-equivalent disjunction of
+// fixed phrases, on europarl text plus synthetic corpora.
 //
-// For two terms [t0, t1] with slop=N and expected step 1, the
-// equivalent disjunction is built by MakeDisjunctionEquivalent.
+// For two terms with slop N and expected step 1, the equivalent disjunction
+// is built by MakeDisjunctionEquivalent.
 //
-// The slop-phrase Execute path is measured under three gather strategies
-// driven via the gGatherOverride seam (A3 - no production counter):
-//   _auto    : the production heuristic decides per document
-//   _seek    : force the seek-gather path on every document
-//   _readall : force the plain read-all path on every document
-// Comparing _seek vs _readall isolates the gather mechanism; _auto shows
-// what the heuristic actually picks; DisjunctionExec is the baseline.
+// Two-term phrases run the fused merge-join (JoinPair), which bypasses gather,
+// so the gGatherOverride seam can't reach them and n == 2 registers a single
+// Exec variant. For n >= 3 the Execute path is measured under three gather
+// strategies via the seam: _auto (production heuristic per document), _seek
+// (force seek-gather), _readall (force read-all). _seek vs _readall isolates
+// the gather mechanism, _auto shows what the heuristic picks, and
+// DisjunctionExec is the baseline.
 //
-// Corpora:
-//   europarl        - real text; balanced pairs + skewed "the commission"
-//                     (n=2), plus n=3 / n=4 dense-slot0 phrases.
-//   synthetic 60:1  - n=2 skew ceiling for seek-gather.
-//   dense3          - "aaa bbb ccc" repeated; every term dense, so the
-//                     n=3 phrase has many valid tuples. Stress for the
-//                     DFS matching path; slop 1..10 to find where DFS
-//                     stops winning vs bitmask-DP.
+// Corpora: europarl (real text - balanced pairs, skewed "the commission",
+// dense-dense "of the", reversal-heavy "union european", explicit-gap
+// "the __ union", a slop=50 wide-window n=2 stress, and n=3/n=4 dense-slot0
+// phrases); synthetic 60:1 (n=2 skew ceiling); dense3 ("aaa bbb ccc" repeated,
+// every term dense so the n=3 phrase has many valid tuples - DFS stress across
+// slop {1,2,5,10}); allsame ("aaa" repeated - n=2 repeated-term pair stresses
+// the join's uniqueness check, n=3/n=4 stress the DFS).
 //
-// Europarl dataset path comes from env SERENEDB_BENCH_EUROPARL, with a
-// fallback path relative to the current working directory. Aborts if the
-// file is missing.
+// Europarl path comes from env SERENEDB_BENCH_EUROPARL, with a fallback
+// relative to the working directory. Aborts if the file is missing.
 
 #include <benchmark/benchmark.h>
 #include <utf8.h>
@@ -73,6 +71,10 @@
 #include <vector>
 
 #include "basics/duckdb_engine.h"
+
+#ifdef SLOP_PROFILE
+#include <valgrind/callgrind.h>
+#endif
 
 namespace bench_sloppy {
 
@@ -315,15 +317,13 @@ constexpr size_t kDense3Docs = 200;
 constexpr int kDense3Reps = 40;
 
 // Adversarial single-term corpus: docs of "aaa" repeated, regularly spaced.
-// A repeated-term phrase ("aaa" in every slot) draws every slot from the
-// same dense position set -- the only structural case where the DP mask
-// merge can fire (equal-cost interior permutations collapse via count +=).
-// Distinct-term phrases provably cannot (mask == position set is unique per
-// tuple). Kept small: all-same freq is combinatorial at high slop.
+// A repeated-term phrase ("aaa" in every slot) draws every slot from the same
+// dense position set, stressing the matcher's uniqueness check. Kept small:
+// all-same freq is combinatorial at high slop.
 constexpr size_t kAllSameDocs = 64;
 constexpr int kAllSameReps = 24;
 
-// A3: drive the gather strategy explicitly so the benchmark can compare
+// Drive the gather strategy explicitly so the benchmark can compare
 // the seek-gather and read-all paths over identical data. Production
 // never writes gGatherOverride; this is benchmark/test-only.
 struct GatherModeGuard {
@@ -357,6 +357,14 @@ constexpr TermPair kTermPairs[] = {
   // Skewed: slot0 "the" is dense, "commission" is sparse, so the gate
   // engages and the DP would otherwise lead from the dense slot.
   {"the_commission", "the", "commission"},
+  // Dense-dense: both terms occur in nearly every document with high
+  // per-doc frequency. Worst case for the join's sliding partner
+  // buffer (windows overlap heavily, the buffer never drains).
+  {"of_the", "of", "the"},
+  // Reversed real bigram: forward occurrences are rare, so matches at
+  // higher slop come mostly through the reversal branch of StepCost
+  // (adjacent reversal costs 2).
+  {"union_european", "union", "european"},
 };
 
 constexpr irs::PosAttr::value_t kSlopValues[] = {1, 2, 5};
@@ -527,8 +535,7 @@ Corpus BuildSyntheticIndex() {
 // Builds a dense 3-term corpus: each doc is "aaa bbb ccc" repeated
 // kDense3Reps times, so every term occurs kDense3Reps times per doc.
 // The n=3 phrase "aaa bbb ccc" then has many valid tuples per doc,
-// growing with slop - this is the stress case for the DFS matching
-// path (which enumerates tuples) vs the bitmask DP (which aggregates).
+// growing with slop - the stress case for the DFS matching path.
 Corpus BuildDense3Index() {
   auto tmp_root =
     std::filesystem::temp_directory_path() / "serenedb-bench-sloppy-dense3";
@@ -715,6 +722,23 @@ irs::ByPhrase MakeTheEuropeanUnion(irs::PosAttr::value_t slop) {
   return MakeSlopPhrase3("the", "european", "union", slop);
 }
 
+// Two-term phrase with an explicit expected position delta 'gap' between
+// the terms (gap == 1 is a plain adjacent pair). push_back(offs) stores
+// offs+1, so pass gap-1, mirroring AppendFixedPhrase.
+irs::ByPhrase MakeSlopPhraseGap(std::string_view t0, std::string_view t1,
+                                irs::PosAttr::value_t gap,
+                                irs::PosAttr::value_t slop) {
+  SDB_ASSERT(gap >= 1);
+  irs::ByPhrase q;
+  *q.mutable_field_id() = kFieldId;
+  q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    irs::ViewCast<irs::byte_type>(t0);
+  q.mutable_options()->push_back<irs::ByTermOptions>(/*offs=*/gap - 1).term =
+    irs::ViewCast<irs::byte_type>(t1);
+  q.mutable_options()->set_slop(slop);
+  return q;
+}
+
 // push_back<ByTermOptions>(offs) sets offs_min=offs_max=offs+1, so to
 // request position delta g pass offs=g-1.
 void AppendFixedPhrase(irs::Or& or_filter, std::string_view first,
@@ -746,17 +770,14 @@ irs::Or MakeDisjunctionEquivalent(std::string_view t0, std::string_view t1,
   return q;
 }
 
-// General slop-phrase disjunction equivalent for n >= 2 terms. Enumerates
-// every distinct-position layout of the terms whose slot-order StepCost
-// (expected step 1) is <= slop, and ORs one exact phrase (queried in text
-// order with the layout's gaps) per layout. The OR matches exactly the
-// docs the sloppy phrase matches over distinct-position layouts; same-
-// position (synonym) arrangements are not represented, but real text has
-// none, so the reported docs= must equal the slop benchmark's docs= -- the
-// built-in correctness check. Enumeration is bounded: for expected==1,
-// |delta_i| <= StepCost_i + 1 and total variation >= span, so
-// span = sum(gaps) <= cost + (n-1) <= slop + n - 1. Reproduces the n==2
-// helper above exactly. Construction is untimed (runs in make()).
+// General slop-phrase disjunction equivalent for n >= 2 terms: enumerates
+// every distinct-position layout whose slot-order StepCost (expected step 1)
+// is <= slop and ORs one exact phrase per layout. Matches exactly the docs
+// the sloppy phrase matches over distinct-position layouts; same-position
+// (synonym) layouts aren't represented, but real text has none, so its docs=
+// must equal the slop benchmark's docs= - the built-in correctness check.
+// Enumeration is bounded: for expected==1, span = sum(gaps) <= slop + n - 1.
+// Reproduces the n==2 helper exactly. Untimed (runs in make()).
 void AppendSlopPhraseVariants(irs::Or& or_filter,
                               const std::vector<std::string_view>& terms,
                               irs::PosAttr::value_t slop) {
@@ -879,6 +900,11 @@ template<typename MakeFn>
   }
 
   size_t per_iter = 0;
+#ifdef SLOP_PROFILE
+  // Collect callgrind counts only over the timed loop (index build and
+  // make()/prepare() stay out); requires --collect-atstart=no.
+  CALLGRIND_TOGGLE_COLLECT;
+#endif
   for (auto _ : state) {
     per_iter = 0;
     for (const auto& sub : rdr) {
@@ -889,19 +915,49 @@ template<typename MakeFn>
     }
     benchmark::DoNotOptimize(per_iter);
   }
+#ifdef SLOP_PROFILE
+  CALLGRIND_TOGGLE_COLLECT;
+#endif
 
   state.SetItemsProcessed(static_cast<int64_t>(state.iterations()) *
                           static_cast<int64_t>(per_iter));
   state.counters["docs"] = static_cast<double>(per_iter);
 }
 
+// Variadic n == 2: dense "the" x a two-term synonym set. A non-simple slot
+// routes prepare() to VariadicPhraseQuery, which still runs gather + Run (the
+// merge-join covers only the fixed adapter). Closest unclosed relative of the
+// skewed the_commission shape; exists to decide whether the join needs a
+// variadic port.
+irs::ByPhrase MakeSlopPhraseVariadic2(irs::PosAttr::value_t slop) {
+  irs::ByPhrase q;
+  *q.mutable_field_id() = kFieldId;
+  q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    irs::ViewCast<irs::byte_type>(std::string_view("the"));
+  auto& st = q.mutable_options()->push_back<irs::ByTermsOptions>();
+  st.terms.emplace(
+    irs::ViewCast<irs::byte_type>(std::string_view("commission")));
+  st.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view("council")));
+  q.mutable_options()->set_slop(slop);
+  return q;
+}
+
+// Baseline for the variadic pair: the union of the per-synonym phrase
+// expansions ("the commission" variants OR "the council" variants).
+irs::Or MakeDisjunctionEquivalentVariadic2(irs::PosAttr::value_t slop) {
+  irs::Or q;
+  AppendSlopPhraseVariants(q, {"the", "commission"}, slop);
+  AppendSlopPhraseVariants(q, {"the", "council"}, slop);
+  return q;
+}
+
 // ExecuteWithOffsets is a FixedPhraseQuery method; slop only (no
 // disjunction analogue). Drains pos->next() per matched doc.
-void BenchExecuteWithOffsets(benchmark::State& state,
-                             const irs::DirectoryReader& rdr,
-                             std::string_view t0, std::string_view t1,
-                             irs::PosAttr::value_t slop) {
-  auto q = MakeSlopPhrase(t0, t1, slop);
+template<typename MakeFn>
+[[gnu::noinline]] void BenchExecuteWithOffsets(benchmark::State& state,
+                                               const irs::DirectoryReader& rdr,
+                                               MakeFn make) {
+  auto q = make();
   auto prepared = q.prepare({.index = rdr});
   if (!prepared) {
     state.SkipWithError("prepare returned null");
@@ -943,22 +999,22 @@ void BenchExecuteWithOffsets(benchmark::State& state,
   state.counters["matches"] = static_cast<double>(matches_per_iter);
 }
 
-// Registers the slop Execute benchmark under all three gather modes plus
-// the disjunction baseline for one (corpus, term pair, slop).
+// Registers the slop Execute benchmark plus the disjunction baseline for
+// one n == 2 (corpus, term pair, slop). Two-term phrases run the fused
+// merge-join, which bypasses gather - the gGatherOverride modes cannot
+// reach them, so exactly one Exec variant is registered (renamed from
+// the historical _auto/_seek/_readall triple).
 void RegisterExecVariants(const std::string& suffix, std::string_view t0,
                           std::string_view t1, irs::PosAttr::value_t slop,
                           const Corpus& (*corpus)()) {
-  for (const auto& m : kModes) {
-    benchmark::RegisterBenchmark(
-      ("SlopPhraseExec" + suffix + m.suffix).c_str(),
-      [t0, t1, slop, mode = m.mode, corpus](benchmark::State& state) {
-        BenchExecuteOnly(
-          state, corpus().reader,
-          [t0, t1, slop] { return MakeSlopPhrase(t0, t1, slop); }, mode);
-      })
-      ->Repetitions(kRepetitions)
-      ->ReportAggregatesOnly(true);
-  }
+  benchmark::RegisterBenchmark(
+    ("SlopPhraseExec" + suffix).c_str(),
+    [t0, t1, slop, corpus](benchmark::State& state) {
+      BenchExecuteOnly(state, corpus().reader,
+                       [t0, t1, slop] { return MakeSlopPhrase(t0, t1, slop); });
+    })
+    ->Repetitions(kRepetitions)
+    ->ReportAggregatesOnly(true);
 
   benchmark::RegisterBenchmark(
     ("DisjunctionExec" + suffix).c_str(),
@@ -978,21 +1034,27 @@ void RegisterAll() {
                                  "_slop" +
                                  std::to_string(static_cast<unsigned>(slop));
 
-      benchmark::RegisterBenchmark(
-        ("SlopPhrasePrepare" + suffix).c_str(),
-        [t0 = pair.term0, t1 = pair.term1, slop](benchmark::State& state) {
-          BenchPrepare(state, GetCorpus().reader,
-                       [t0, t1, slop] { return MakeSlopPhrase(t0, t1, slop); });
-        })
-        ->Repetitions(kRepetitions)
-        ->ReportAggregatesOnly(true);
+      // Prepare does not depend on slop; register it once per pair.
+      if (slop == kSlopValues[0]) {
+        benchmark::RegisterBenchmark(
+          ("SlopPhrasePrepare" + suffix).c_str(),
+          [t0 = pair.term0, t1 = pair.term1, slop](benchmark::State& state) {
+            BenchPrepare(state, GetCorpus().reader, [t0, t1, slop] {
+              return MakeSlopPhrase(t0, t1, slop);
+            });
+          })
+          ->Repetitions(kRepetitions)
+          ->ReportAggregatesOnly(true);
+      }
 
       RegisterExecVariants(suffix, pair.term0, pair.term1, slop, &GetCorpus);
 
       benchmark::RegisterBenchmark(
         ("SlopPhraseExecOffs" + suffix).c_str(),
         [t0 = pair.term0, t1 = pair.term1, slop](benchmark::State& state) {
-          BenchExecuteWithOffsets(state, GetCorpus().reader, t0, t1, slop);
+          BenchExecuteWithOffsets(state, GetCorpus().reader, [t0, t1, slop] {
+            return MakeSlopPhrase(t0, t1, slop);
+          });
         })
         ->Repetitions(kRepetitions)
         ->ReportAggregatesOnly(true);
@@ -1009,7 +1071,7 @@ void RegisterAll() {
     }
   }
 
-  // Synthetic 60:1 skew corpus (n=2): ceiling case for the seek-gather win.
+  // Synthetic 60:1 skew corpus (n=2): skew ceiling for the join.
   for (auto slop : kSlopValues) {
     const std::string suffix =
       "_synthetic_slop" + std::to_string(static_cast<unsigned>(slop));
@@ -1072,8 +1134,107 @@ void RegisterAll() {
       ->ReportAggregatesOnly(true);
   }
 
+  // n == 2 join stress: explicit gap "the __ union" (expected delta 2,
+  // dense anchor slot). No disjunction baseline - the equivalent OR
+  // needs a non-unit expected step the n==2 helper does not model.
+  for (auto slop : kSlopValues) {
+    const std::string suffix =
+      "_the_union_gap2_slop" + std::to_string(static_cast<unsigned>(slop));
+    benchmark::RegisterBenchmark(
+      ("SlopPhraseExec" + suffix).c_str(),
+      [slop](benchmark::State& state) {
+        BenchExecuteOnly(state, GetCorpus().reader, [slop] {
+          return MakeSlopPhraseGap("the", "union", 2, slop);
+        });
+      })
+      ->Repetitions(kRepetitions)
+      ->ReportAggregatesOnly(true);
+    benchmark::RegisterBenchmark(
+      ("SlopPhraseExecOffs" + suffix).c_str(),
+      [slop](benchmark::State& state) {
+        BenchExecuteWithOffsets(state, GetCorpus().reader, [slop] {
+          return MakeSlopPhraseGap("the", "union", 2, slop);
+        });
+      })
+      ->Repetitions(kRepetitions)
+      ->ReportAggregatesOnly(true);
+  }
+
+  // n == 2 join stress: slop=50 on the skewed pair. Windows are ~100
+  // positions wide, so the partner buffer stays full and front-trim /
+  // compaction run constantly. No disjunction baseline - the equivalent
+  // OR would need 100+ branches.
+  benchmark::RegisterBenchmark(
+    "SlopPhraseExec_the_commission_slop50",
+    [](benchmark::State& state) {
+      BenchExecuteOnly(state, GetCorpus().reader,
+                       [] { return MakeSlopPhrase("the", "commission", 50); });
+    })
+    ->Repetitions(kRepetitions)
+    ->ReportAggregatesOnly(true);
+  benchmark::RegisterBenchmark(
+    "SlopPhraseExecOffs_the_commission_slop50",
+    [](benchmark::State& state) {
+      BenchExecuteWithOffsets(state, GetCorpus().reader, [] {
+        return MakeSlopPhrase("the", "commission", 50);
+      });
+    })
+    ->Repetitions(kRepetitions)
+    ->ReportAggregatesOnly(true);
+
+  // n == 2 join stress: repeated-term pair on the all-"aaa" corpus.
+  // Anchor and partner walk the same posting; every buffered position
+  // collides with the anchor once, so the uniqueness check runs on the
+  // whole window. Offs variant counts every remaining pair per doc.
+  for (unsigned slop : {1u, 2u, 5u, 10u}) {
+    const std::string suffix = "_allsame2_slop" + std::to_string(slop);
+    auto make = [slop] {
+      return MakeSlopPhrase("aaa", "aaa",
+                            static_cast<irs::PosAttr::value_t>(slop));
+    };
+    benchmark::RegisterBenchmark(("SlopPhraseExec" + suffix).c_str(),
+                                 [make](benchmark::State& state) {
+                                   BenchExecuteOnly(
+                                     state, GetAllSameCorpus().reader, make);
+                                 })
+      ->Repetitions(kRepetitions)
+      ->ReportAggregatesOnly(true);
+    benchmark::RegisterBenchmark(("SlopPhraseExecOffs" + suffix).c_str(),
+                                 [make](benchmark::State& state) {
+                                   BenchExecuteWithOffsets(
+                                     state, GetAllSameCorpus().reader, make);
+                                 })
+      ->Repetitions(kRepetitions)
+      ->ReportAggregatesOnly(true);
+  }
+
+  // Variadic n == 2 (gather + Run path; no fused join). Watch this
+  // against its baseline: if the gap here mirrors the old fixed-pair
+  // the_commission loss, the join needs a variadic port.
+  for (auto slop : kSlopValues) {
+    const std::string suffix = "_var2_the_commission_council_slop" +
+                               std::to_string(static_cast<unsigned>(slop));
+    benchmark::RegisterBenchmark(
+      ("SlopPhraseExec" + suffix).c_str(),
+      [slop](benchmark::State& state) {
+        BenchExecuteOnly(state, GetCorpus().reader,
+                         [slop] { return MakeSlopPhraseVariadic2(slop); });
+      })
+      ->Repetitions(kRepetitions)
+      ->ReportAggregatesOnly(true);
+    benchmark::RegisterBenchmark(
+      ("DisjunctionExec" + suffix).c_str(),
+      [slop](benchmark::State& state) {
+        BenchExecuteOnly(state, GetCorpus().reader, [slop] {
+          return MakeDisjunctionEquivalentVariadic2(slop);
+        });
+      })
+      ->Repetitions(kRepetitions)
+      ->ReportAggregatesOnly(true);
+  }
+
   // Dense 3-term phrase "aaa bbb ccc" (every term dense): stress for the
-  // DFS matching path across slop 1..10. No disjunction baseline (no
+  // DFS matching path across slop {1,2,5,10}. No disjunction baseline (no
   // 3-term equivalent helper registered for this corpus).
   for (unsigned slop : {1u, 2u, 5u, 10u}) {
     const std::string suffix = "_dense3_slop" + std::to_string(slop);
@@ -1094,9 +1255,9 @@ void RegisterAll() {
     }
   }
 
-  // Adversarial repeated-term phrases on the single-term corpus: the only
-  // structural case where the old bitmask DP could merge equal-cost
-  // permutations. n=3 and n=4 on the all-"aaa" corpus, gather held at auto.
+  // Adversarial repeated-term phrases on the single-term corpus: n=3 and n=4
+  // "aaa" stress the DFS uniqueness handling (freq is combinatorial at high
+  // slop). Gather held at auto.
   for (unsigned slop : {1u, 2u, 5u, 10u}) {
     for (size_t terms : {size_t{3}, size_t{4}}) {
       const std::string suffix =
