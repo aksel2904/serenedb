@@ -813,28 +813,32 @@ class SlopPhraseFrequencyDP {
       return MatchPair();
     }
 
-    for (auto& s : _slot_pos) {
-      s.clear();
-    }
     if constexpr (Offs) {
       _slot_offs.resize(n);
-      for (auto& s : _slot_offs) {
-        s.clear();
-      }
     }
+
     // Per-slot gather. gather_all reads the whole posting; gather_windows
     // reads only positions inside the precomputed slop-reachable windows
-    // via forward seek. Both fill _slot_pos[i] (+ _slot_offs[i] when Offs).
+    // via forward seek. Both fill _slot_pos[i] (+ _slot_offs[i] when Offs);
+    // each path resets its own slot before filling it.
     const auto gather_all = [&](size_t i) {
       auto& it = *_pos[i].first;
       auto& positions = _slot_pos[i];
-      while (it.next()) {
-        const auto v = it.value();
-        if (pos_limits::eof(v)) {
-          break;
-        }
-        positions.push_back(v);
-        if constexpr (Offs) {
+      if constexpr (!Offs) {
+        // Gather is the first consumer of positions for this doc, so the
+        // whole per-doc posting is still pending and DocFreq is exact.
+        // No clear() first: resize from the previous size skips the
+        // value-initialization that a resize from zero would do, and
+        // ReadAll overwrites the slot in full anyway.
+        positions.resize(it.DocFreq());
+        const auto count = it.ReadAll(positions.data());
+        SDB_ASSERT(count == positions.size());
+      } else {
+        positions.clear();
+        _slot_offs[i].clear();
+        while (it.next()) {
+          const auto v = it.value();
+          positions.push_back(v);
           if (auto* o = irs::get<OffsAttr>(it); o) {
             _slot_offs[i].push_back({o->start, o->end});
           } else {
@@ -847,6 +851,11 @@ class SlopPhraseFrequencyDP {
     const auto gather_windows = [&](size_t i) {
       auto& it = *_pos[i].first;
       auto& positions = _slot_pos[i];
+
+      positions.clear();
+      if constexpr (Offs) {
+        _slot_offs[i].clear();
+      }
       for (const auto& [lo, hi] : _windows) {
         auto v = it.seek(lo);
         while (pos_limits::valid(v) && !pos_limits::eof(v) && v <= hi) {

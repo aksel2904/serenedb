@@ -96,6 +96,38 @@ class PositionImpl final : public PosAttr {
     return true;
   }
 
+  // Bulk-decodes all remaining positions of the current document into out,
+  // exactly mirroring repeated next() calls. Returns the number of values
+  // written. Attributes (offsets) are not maintained, so the offset-enabled
+  // gather keeps the scalar path.
+  uint32_t ReadAll(uint32_t* out) {
+    const uint32_t freq = _freq;
+    if (_pend_pos > freq) {
+      Skip(_pend_pos - freq);
+      _pend_pos = freq;
+    }
+    const auto count = static_cast<uint32_t>(_pend_pos);
+    auto value = _value;
+    for (auto left = _pend_pos; left != 0;) {
+      if (_buf_pos == doc_limits::kBlockSize) {
+        ReadBlock();
+        _buf_pos = 0;
+      }
+      const auto take = std::min(left, doc_limits::kBlockSize - _buf_pos);
+      for (uint64_t i = 0; i != take; ++i) {
+        value += _pos_deltas[_buf_pos + i];
+        out[i] = value;
+      }
+      SDB_ASSERT(pos_limits::valid(value));
+      out += take;
+      _buf_pos += take;
+      left -= take;
+    }
+    _value = value;
+    _pend_pos = 0;
+    return count;
+  }
+
   void reset() final {
     Clear();
     if (_cookie.pos_file_pointer != std::numeric_limits<uint64_t>::max()) {
