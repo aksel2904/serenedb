@@ -1207,10 +1207,8 @@ void RegisterAll() {
       ->ReportAggregatesOnly(true);
   }
 
-  // Variadic n == 2, routed through the merged-stream fused join. The
-  // remaining slop-1 gap against the expansion baseline is doc-level
-  // disjunction machinery, not matching. ExecOffs additionally covers the
-  // stream's refresh-on-move offset capture.
+  // Variadic n == 2, routed through the merged-stream fused join.
+  // ExecOffs additionally covers the stream's refresh-on-move offset capture.
   for (auto slop : kSlopValues) {
     const std::string suffix = "_var2_the_commission_council_slop" +
                                std::to_string(static_cast<unsigned>(slop));

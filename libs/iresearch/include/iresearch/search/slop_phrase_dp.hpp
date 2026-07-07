@@ -1338,6 +1338,29 @@ class SlopVariadicPhraseFrequencyDP {
     return true;
   }
 
+  struct SoloCtx {
+    PosAttr* pos{nullptr};
+    const OffsAttr* offs{nullptr};
+    uint32_t count{0};
+  };
+
+  // Counts the current document's sub-iterators and captures the last one.
+  // A slot with exactly one sub feeds JoinPair its raw position iterator;
+  // the merged-stream layer only pays off when there is something to merge.
+  static bool CaptureSoloSubIter(void* ctx, Adapter& adapter) {
+    SDB_ASSERT(ctx);
+    auto& c = *reinterpret_cast<SoloCtx*>(ctx);
+    if (!adapter.position) {
+      return true;
+    }
+    ++c.count;
+    c.pos = adapter.position;
+    if constexpr (kHasOffsets) {
+      c.offs = adapter.offset;
+    }
+    return true;
+  }
+
   struct WindowCtx {
     std::vector<PosEntry>* out;
     const std::vector<detail::slop_dp::Window>* windows;
@@ -1400,49 +1423,79 @@ class SlopVariadicPhraseFrequencyDP {
     }
   }
 
-  // n == 2 path: merges each slot's sub-iterators into one position stream
-  // and runs JoinPair over the two streams, mapping its result onto the
-  // generic outputs (_phrase_freq, _best_distance, _matches). Anchor = rarer
-  // slot by the disjunction's doc-level cost estimate (a compound iterator
-  // has no exact per-doc count); ties keep slot 0, as Run does.
+  // n == 2 path: feeds JoinPair with the two slots' positions and maps its
+  // result onto the generic outputs (_phrase_freq, _best_distance,
+  // _matches). When both slots hold a single sub-iterator in the current
+  // document (the common real-text case), the raw position iterators go
+  // straight into the join; otherwise each slot is merged first. Anchor =
+  // rarer slot by the disjunction's doc-level cost estimate (a compound
+  // iterator has no exact per-doc count); ties keep slot 0, as Run does.
   bool MatchPair() {
+    std::array<SoloCtx, 2> solo;
     for (size_t i = 0; i < 2; ++i) {
-      auto& stream = _merged[i];
-      stream.Clear();
-      BindCtx ctx{&stream};
-      _pos[i].first->visit(&ctx, BindOneSubIter);
-      if (stream.Empty()) {
+      _pos[i].first->visit(&solo[i], CaptureSoloSubIter);
+      if (solo[i].count == 0) {
         return false;
       }
     }
 
     const bool anchor_is_slot0 =
       CostAttr::extract(*_pos[0].first) <= CostAttr::extract(*_pos[1].first);
-    auto& anchor = _merged[anchor_is_slot0 ? 0 : 1];
-    auto& partner = _merged[anchor_is_slot0 ? 1 : 0];
 
-    const OffsAttr* anchor_offs = nullptr;
-    const OffsAttr* partner_offs = nullptr;
-    if constexpr (kHasOffsets) {
-      anchor_offs = anchor.GetOffs();
-      partner_offs = partner.GetOffs();
+    const size_t a = anchor_is_slot0 ? 0 : 1;
+    const size_t p = a ^ 1;
+
+    // Solo slots go into the join raw; only multi-sub slots pay for the
+    // merged stream. A stream bound from count > 0 subs cannot be empty.
+    for (size_t i = 0; i < 2; ++i) {
+      if (solo[i].count == 1) {
+        solo[i].pos->reset();
+        continue;
+      }
+      auto& stream = _merged[i];
+      stream.Clear();
+      BindCtx ctx{&stream};
+      _pos[i].first->visit(&ctx, BindOneSubIter);
+      SDB_ASSERT(!stream.Empty());
     }
 
-    std::vector<detail::slop_dp::PairMatch>* collect = nullptr;
+    const auto offs_of = [&](size_t i) -> const OffsAttr* {
+      if constexpr (kHasOffsets) {
+        return solo[i].count == 1 ? solo[i].offs : _merged[i].GetOffs();
+      } else {
+        return nullptr;
+      }
+    };
+    const OffsAttr* a_offs = offs_of(a);
+    const OffsAttr* p_offs = offs_of(p);
+
+    if (solo[a].count == 1 && solo[p].count == 1) {
+      return RunPair(*solo[a].pos, a_offs, *solo[p].pos, p_offs,
+                     anchor_is_slot0);
+    }
+    if (solo[a].count == 1) {
+      return RunPair(*solo[a].pos, a_offs, _merged[p], p_offs, anchor_is_slot0);
+    }
+    if (solo[p].count == 1) {
+      return RunPair(_merged[a], a_offs, *solo[p].pos, p_offs, anchor_is_slot0);
+    }
+    return RunPair(_merged[a], a_offs, _merged[p], p_offs, anchor_is_slot0);
+  }
+
+  std::vector<detail::slop_dp::PairMatch>* PairCollect() {
     if constexpr (kHasOffsets && HasFreq) {
-      collect = &_pair_matches;
+      return &_pair_matches;
+    } else {
+      return nullptr;
     }
+  }
 
-    // A variadic slot is a term set with no per-term group identity, so
-    // strict position uniqueness stays on - matching the gather + Run
-    // path's empty groups and the Lucene oracle.
-    const auto res = detail::slop_dp::JoinPair<kHasOffsets, HasFreq>(
-      anchor, partner, anchor_offs, partner_offs, anchor_is_slot0, _max_slop,
-      _expected_steps[0], /*enforce_uniqueness=*/true, _pair_scratch, collect);
+  // Maps a JoinPair result onto the generic outputs; shared by the raw and
+  // merged branches of MatchPair.
+  bool FinishPair(const detail::slop_dp::DpResult& res) {
     if (!res.any) {
       return false;
     }
-
     if constexpr (HasFreq) {
       _phrase_freq = static_cast<uint32_t>(res.freq);
       _best_distance = res.best_distance;
@@ -1464,6 +1517,16 @@ class SlopVariadicPhraseFrequencyDP {
       _phrase_freq = 1;
     }
     return true;
+  }
+
+  template<typename AnchorIt, typename PartnerIt>
+  bool RunPair(AnchorIt& anchor, const OffsAttr* anchor_offs,
+               PartnerIt& partner, const OffsAttr* partner_offs,
+               bool anchor_is_slot0) {
+    return FinishPair(detail::slop_dp::JoinPair<kHasOffsets, HasFreq>(
+      anchor, partner, anchor_offs, partner_offs, anchor_is_slot0, _max_slop,
+      _expected_steps[0], /*enforce_uniqueness=*/true, _pair_scratch,
+      PairCollect()));
   }
 
   // See SlopPhraseFrequencyDP::BuildMatches
