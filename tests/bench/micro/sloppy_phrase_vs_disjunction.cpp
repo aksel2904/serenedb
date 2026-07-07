@@ -954,9 +954,11 @@ irs::Or MakeDisjunctionEquivalentVariadic2(irs::PosAttr::value_t slop) {
 // (PhraseQueryT selects which); slop only, no disjunction analogue. Drains
 // pos->next() per matched doc.
 template<typename PhraseQueryT = irs::FixedPhraseQuery, typename MakeFn>
-[[gnu::noinline]] void BenchExecuteWithOffsets(benchmark::State& state,
-                                               const irs::DirectoryReader& rdr,
-                                               MakeFn make) {
+[[gnu::noinline]] void BenchExecuteWithOffsets(
+  benchmark::State& state, const irs::DirectoryReader& rdr, MakeFn make,
+  dp::GatherOverride mode = dp::GatherOverride::kAuto) {
+  GatherModeGuard guard{mode};
+
   auto q = make();
   auto prepared = q.prepare({.index = rdr});
   if (!prepared) {
@@ -1086,6 +1088,19 @@ void RegisterAll() {
         ("SlopPhraseExec" + suffix + m.suffix).c_str(),
         [slop, mode = m.mode](benchmark::State& state) {
           BenchExecuteOnly(
+            state, GetCorpus().reader,
+            [slop] { return MakeTheEuropeanUnion(slop); }, mode);
+        })
+        ->Repetitions(kRepetitions)
+        ->ReportAggregatesOnly(true);
+    }
+    // n >= 3 with offsets has no pair-join bypass, so this is the gather's
+    // Offs side; the mode variants cover both gather paths.
+    for (const auto& m : kModes) {
+      benchmark::RegisterBenchmark(
+        ("SlopPhraseExecOffs" + suffix + m.suffix).c_str(),
+        [slop, mode = m.mode](benchmark::State& state) {
+          BenchExecuteWithOffsets(
             state, GetCorpus().reader,
             [slop] { return MakeTheEuropeanUnion(slop); }, mode);
         })
@@ -1259,6 +1274,19 @@ void RegisterAll() {
         })
         ->Repetitions(kRepetitions)
         ->ReportAggregatesOnly(true);
+      benchmark::RegisterBenchmark(
+        ("SlopPhraseExecOffs" + suffix + m.suffix).c_str(),
+        [slop, mode = m.mode](benchmark::State& state) {
+          BenchExecuteWithOffsets(
+            state, GetDense3Corpus().reader,
+            [slop] {
+              return MakeSlopPhrase3("aaa", "bbb", "ccc",
+                                     static_cast<irs::PosAttr::value_t>(slop));
+            },
+            mode);
+        })
+        ->Repetitions(kRepetitions)
+        ->ReportAggregatesOnly(true);
     }
   }
 
@@ -1288,6 +1316,21 @@ void RegisterAll() {
 }  // namespace
 
 int main(int argc, char** argv) {
+  // --disable-offs-bulk-gather: route the offset gather through the scalar
+  // per-position loop (in-binary A/B against the bulk ReadAll path). Must be
+  // stripped from argv before benchmark::Initialize, which rejects unknown
+  // flags.
+  for (int i = 1; i < argc;) {
+    if (std::string_view{argv[i]} == "--disable-offs-bulk-gather") {
+      dp::gOffsBulkGatherDisabled = true;
+      for (int j = i; j + 1 < argc; ++j) {
+        argv[j] = argv[j + 1];
+      }
+      --argc;
+    } else {
+      ++i;
+    }
+  }
   benchmark::Initialize(&argc, argv);
   // iresearch indexes require a process-wide duckdb::DatabaseInstance,
   // wired into IndexWriterOptions::db / IndexReaderOptions::db. The

@@ -98,8 +98,8 @@ class PositionImpl final : public PosAttr {
 
   // Bulk-decodes all remaining positions of the current document into out,
   // exactly mirroring repeated next() calls. Returns the number of values
-  // written. Attributes (offsets) are not maintained, so the offset-enabled
-  // gather keeps the scalar path.
+  // written. Attributes (offsets) are not maintained; the offset-enabled
+  // gather uses the three-array overload below.
   uint32_t ReadAll(uint32_t* out) {
     const uint32_t freq = _freq;
     if (_pend_pos > freq) {
@@ -124,6 +124,48 @@ class PositionImpl final : public PosAttr {
       left -= take;
     }
     _value = value;
+    _pend_pos = 0;
+    return count;
+  }
+
+  // Bulk-decodes all remaining positions of the current document together
+  // with their offsets, exactly mirroring repeated next() calls. Returns
+  // the number of values written to each array.
+  uint32_t ReadAll(uint32_t* pos_out, uint32_t* start_out, uint32_t* end_out) {
+    static_assert(IteratorTraits::Offset());
+    const uint32_t freq = _freq;
+    if (_pend_pos > freq) {
+      Skip(_pend_pos - freq);
+      _pend_pos = freq;
+    }
+    const auto count = static_cast<uint32_t>(_pend_pos);
+    auto value = _value;
+    auto start = _offs.start;
+    auto end = _offs.end;
+    for (auto left = _pend_pos; left != 0;) {
+      if (_buf_pos == doc_limits::kBlockSize) {
+        ReadBlock();
+        _buf_pos = 0;
+      }
+      const auto take = std::min(left, doc_limits::kBlockSize - _buf_pos);
+      for (uint64_t i = 0; i != take; ++i) {
+        value += _pos_deltas[_buf_pos + i];
+        pos_out[i] = value;
+        start += _offs_start_deltas[_buf_pos + i];
+        start_out[i] = start;
+        end = start + _offs_lengths[_buf_pos + i];
+        end_out[i] = end;
+      }
+      SDB_ASSERT(pos_limits::valid(value));
+      pos_out += take;
+      start_out += take;
+      end_out += take;
+      _buf_pos += take;
+      left -= take;
+    }
+    _value = value;
+    _offs.start = start;
+    _offs.end = end;
     _pend_pos = 0;
     return count;
   }

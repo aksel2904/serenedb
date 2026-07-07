@@ -171,6 +171,12 @@ inline bool ResolveSeekGather(bool heuristic) noexcept {
 // both).
 inline bool gPairJoinDisabled = false;
 
+// Bench seam for the offset-enabled read-all gather. Production leaves this
+// false; the micro benchmark sets it (via a command-line flag) to route the
+// Offs gather through the scalar per-position loop instead of the bulk
+// ReadAll overload, giving an in-binary A/B of the two decode paths.
+inline bool gOffsBulkGatherDisabled = false;
+
 // (start, end) offsets of one token occurrence.
 struct PosOffset {
   uint32_t start;
@@ -814,36 +820,47 @@ class SlopPhraseFrequencyDP {
     }
 
     if constexpr (Offs) {
-      _slot_offs.resize(n);
+      _slot_offs_start.resize(n);
+      _slot_offs_end.resize(n);
     }
 
     // Per-slot gather. gather_all reads the whole posting; gather_windows
     // reads only positions inside the precomputed slop-reachable windows
-    // via forward seek. Both fill _slot_pos[i] (+ _slot_offs[i] when Offs);
-    // each path resets its own slot before filling it.
+    // via forward seek. Both fill _slot_pos[i] (+ _slot_offs_start[i] /
+    // _slot_offs_end[i] when Offs); each path resets its own slot before
+    // filling it.
     const auto gather_all = [&](size_t i) {
       auto& it = *_pos[i].first;
       auto& positions = _slot_pos[i];
+      // Gather is the first consumer of positions for this doc, so the
+      // whole per-doc posting is still pending and DocFreq is exact.
+      // No clear() first: resize from the previous size skips the
+      // value-initialization that a resize from zero would do, and
+      // ReadAll overwrites the slot in full anyway.
       if constexpr (!Offs) {
-        // Gather is the first consumer of positions for this doc, so the
-        // whole per-doc posting is still pending and DocFreq is exact.
-        // No clear() first: resize from the previous size skips the
-        // value-initialization that a resize from zero would do, and
-        // ReadAll overwrites the slot in full anyway.
         positions.resize(it.DocFreq());
         const auto count = it.ReadAll(positions.data());
         SDB_ASSERT(count == positions.size());
       } else {
-        positions.clear();
-        _slot_offs[i].clear();
-        while (it.next()) {
-          const auto v = it.value();
-          positions.push_back(v);
-          if (auto* o = irs::get<OffsAttr>(it); o) {
-            _slot_offs[i].push_back({o->start, o->end});
-          } else {
-            _slot_offs[i].push_back({0, 0});
+        auto& starts = _slot_offs_start[i];
+        auto& ends = _slot_offs_end[i];
+        if (detail::slop_dp::gOffsBulkGatherDisabled) [[unlikely]] {
+          positions.clear();
+          starts.clear();
+          ends.clear();
+          const OffsAttr* offs = irs::get<OffsAttr>(it);
+          while (it.next()) {
+            positions.push_back(it.value());
+            starts.push_back(offs ? offs->start : 0);
+            ends.push_back(offs ? offs->end : 0);
           }
+        } else {
+          positions.resize(it.DocFreq());
+          starts.resize(positions.size());
+          ends.resize(positions.size());
+          const auto count =
+            it.ReadAll(positions.data(), starts.data(), ends.data());
+          SDB_ASSERT(count == positions.size());
         }
       }
     };
@@ -853,19 +870,19 @@ class SlopPhraseFrequencyDP {
       auto& positions = _slot_pos[i];
 
       positions.clear();
+      [[maybe_unused]] const OffsAttr* offs = nullptr;
       if constexpr (Offs) {
-        _slot_offs[i].clear();
+        _slot_offs_start[i].clear();
+        _slot_offs_end[i].clear();
+        offs = irs::get<OffsAttr>(it);
       }
       for (const auto& [lo, hi] : _windows) {
         auto v = it.seek(lo);
         while (pos_limits::valid(v) && !pos_limits::eof(v) && v <= hi) {
           positions.push_back(v);
           if constexpr (Offs) {
-            if (auto* o = irs::get<OffsAttr>(it); o) {
-              _slot_offs[i].push_back({o->start, o->end});
-            } else {
-              _slot_offs[i].push_back({0, 0});
-            }
+            _slot_offs_start[i].push_back(offs ? offs->start : 0);
+            _slot_offs_end[i].push_back(offs ? offs->end : 0);
           }
           if (!it.next()) {
             break;
@@ -1057,8 +1074,8 @@ class SlopPhraseFrequencyDP {
     for (const auto& m : _enumerated) {
       const size_t li = find_index(m.leftmost_slot, m.leftmost);
       const size_t ri = find_index(m.rightmost_slot, m.rightmost);
-      _matches.push_back({_slot_offs[m.leftmost_slot][li].start,
-                          _slot_offs[m.rightmost_slot][ri].end});
+      _matches.push_back({_slot_offs_start[m.leftmost_slot][li],
+                          _slot_offs_end[m.rightmost_slot][ri]});
     }
     if (!_matches.empty()) {
       _start_offset = _matches[0].start;
@@ -1073,7 +1090,10 @@ class SlopPhraseFrequencyDP {
   // Window half-width slop + sum(expected_steps); cached for gather.
   PosAttr::value_t _window_half = 0;
   std::vector<std::vector<PosAttr::value_t>> _slot_pos;
-  std::vector<std::vector<OffsetPair>> _slot_offs;
+  // Per-slot offsets, parallel to _slot_pos, stored as separate start/end
+  // arrays so the bulk ReadAll overload can fill them directly.
+  std::vector<std::vector<uint32_t>> _slot_offs_start;
+  std::vector<std::vector<uint32_t>> _slot_offs_end;
   // Merged slop-reachable windows around the rarest slot's positions
   // (seek-gather path only). These scratch members are reused across Match().
   std::vector<detail::slop_dp::Window> _windows;
