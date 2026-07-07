@@ -250,7 +250,8 @@ SLOP_PROF_NOINLINE DpResult JoinPair(
   bool partner_primed = false;
   PosAttr::value_t pv = 0;
 
-  while (anchor.next()) {
+  bool anchor_live = anchor.next();
+  while (anchor_live) {
     const PosAttr::value_t pa = anchor.value();
     if (pos_limits::eof(pa)) {
       break;
@@ -314,6 +315,22 @@ SLOP_PROF_NOINLINE DpResult JoinPair(
     }
 
     if (head == buf.size()) {
+      if (partner_eof) {
+        // Nothing buffered and no partner positions left: no anchor
+        // position can match anymore.
+        break;
+      }
+      // Nothing buffered and the next partner position sits beyond this
+      // window (pv > hi). No anchor below pv - w can reach it, so gallop
+      // the anchor forward instead of stepping; the seeked position is
+      // reprocessed by the loop. lo and hi stay nondecreasing.
+      const PosAttr::value_t target = (pv > w) ? (pv - w) : pos_limits::min();
+      if (target > pa) {
+        const PosAttr::value_t av = anchor.seek(target);
+        anchor_live = pos_limits::valid(av) && !pos_limits::eof(av);
+      } else {
+        anchor_live = anchor.next();
+      }
       continue;
     }
 
@@ -367,6 +384,7 @@ SLOP_PROF_NOINLINE DpResult JoinPair(
                         (ls == 0 ? o0 : o1).start, (rs == 0 ? o0 : o1).end});
       }
     }
+    anchor_live = anchor.next();
   }
 
   if (out) {

@@ -322,6 +322,9 @@ constexpr int kDense3Reps = 40;
 // all-same freq is combinatorial at high slop.
 constexpr size_t kAllSameDocs = 64;
 constexpr int kAllSameReps = 24;
+constexpr size_t kFarApartDocs = 64;
+constexpr int kFarApartReps = 24;
+constexpr int kFarApartGap = 50;
 
 // Drive the gather strategy explicitly so the benchmark can compare
 // the seek-gather and read-all paths over identical data. Production
@@ -655,6 +658,76 @@ Corpus BuildAllSameIndex() {
                 .reader = std::move(rdr)};
 }
 
+// Never-matching dense pair corpus: each doc is kFarApartReps of "aaa",
+// then kFarApartGap of "ccc" filler, then kFarApartReps of "bbb". Both
+// query terms are dense in every document, but the blocks sit further
+// apart than any benchmarked slop window can bridge: the conjunction
+// admits every document while the position machinery finds nothing.
+Corpus BuildFarApartIndex() {
+  auto tmp_root =
+    std::filesystem::temp_directory_path() / "serenedb-bench-sloppy-farapart";
+  std::filesystem::remove_all(tmp_root);
+  std::filesystem::create_directories(tmp_root);
+
+  EnsureRegistered();
+
+  auto format = irs::formats::Get(std::string{kFormatName});
+  if (!format) {
+    Die("format 1_5simd not registered");
+  }
+
+  auto dir = std::make_unique<irs::MMapDirectory>(tmp_root);
+
+  irs::IndexWriterOptions writer_opts;
+  auto* db = &::sdb::DuckDBEngine::Instance().instance();
+  writer_opts.db = db;
+  writer_opts.reader_options.db = db;
+
+  auto writer =
+    irs::IndexWriter::Make(*dir, format, irs::kOmCreate, writer_opts);
+  if (!writer) {
+    Die("IndexWriter::Make returned null");
+  }
+
+  std::string body;
+  body.reserve(static_cast<size_t>(kFarApartReps * 2 + kFarApartGap) * 4);
+  for (int i = 0; i < kFarApartReps; ++i) {
+    body += "aaa ";
+  }
+  for (int i = 0; i < kFarApartGap; ++i) {
+    body += "ccc ";
+  }
+  for (int i = 0; i < kFarApartReps; ++i) {
+    body += "bbb ";
+  }
+
+  bench_sloppy::EuroparlBodyTemplate tpl;
+  for (size_t d = 0; d < kFarApartDocs; ++d) {
+    tpl.SetColumn(2, body);
+    auto trx = writer->GetBatch();
+    auto inserter = trx.Insert();
+    const auto& doc = tpl.Get();
+    if (!inserter.Insert(doc.indexed.begin(), doc.indexed.end())) {
+      Die("farapart Insert returned false");
+    }
+    trx.Commit();
+  }
+  writer->RefreshCommit();
+
+  std::fprintf(stderr,
+               "sloppy_phrase_vs_disjunction bench: indexed %zu farapart "
+               "documents (%d aaa, %d ccc, %d bbb)\n",
+               kFarApartDocs, kFarApartReps, kFarApartGap, kFarApartReps);
+
+  irs::IndexReaderOptions reader_opts2;
+  reader_opts2.db = db;
+  auto rdr2 = irs::DirectoryReader{*dir, format, reader_opts2};
+  return Corpus{.dir_path = std::move(tmp_root),
+                .dir = std::move(dir),
+                .format = std::move(format),
+                .reader = std::move(rdr2)};
+}
+
 const Corpus& GetCorpus() {
   static const Corpus corpus = BuildIndex();
   return corpus;
@@ -672,6 +745,11 @@ const Corpus& GetDense3Corpus() {
 
 const Corpus& GetAllSameCorpus() {
   static const Corpus corpus = BuildAllSameIndex();
+  return corpus;
+}
+
+const Corpus& GetFarApartCorpus() {
+  static const Corpus corpus = BuildFarApartIndex();
   return corpus;
 }
 
@@ -950,6 +1028,34 @@ irs::Or MakeDisjunctionEquivalentVariadic2(irs::PosAttr::value_t slop) {
   return q;
 }
 
+// Variadic n == 2 with a four-term synonym slot: the disjunction's
+// expansion count K doubles relative to the two-term set while the
+// bind/merge machinery must stay flat.
+irs::ByPhrase MakeSlopPhraseVariadic4(irs::PosAttr::value_t slop) {
+  irs::ByPhrase q;
+  *q.mutable_field_id() = kFieldId;
+  q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    irs::ViewCast<irs::byte_type>(std::string_view("the"));
+  auto& st = q.mutable_options()->push_back<irs::ByTermsOptions>();
+  st.terms.emplace(
+    irs::ViewCast<irs::byte_type>(std::string_view("commission")));
+  st.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view("council")));
+  st.terms.emplace(
+    irs::ViewCast<irs::byte_type>(std::string_view("parliament")));
+  st.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view("union")));
+  q.mutable_options()->set_slop(slop);
+  return q;
+}
+
+irs::Or MakeDisjunctionEquivalentVariadic4(irs::PosAttr::value_t slop) {
+  irs::Or q;
+  AppendSlopPhraseVariants(q, {"the", "commission"}, slop);
+  AppendSlopPhraseVariants(q, {"the", "council"}, slop);
+  AppendSlopPhraseVariants(q, {"the", "parliament"}, slop);
+  AppendSlopPhraseVariants(q, {"the", "union"}, slop);
+  return q;
+}
+
 // ExecuteWithOffsets exists on FixedPhraseQuery and VariadicPhraseQuery
 // (PhraseQueryT selects which); slop only, no disjunction analogue. Drains
 // pos->next() per matched doc.
@@ -973,6 +1079,11 @@ template<typename PhraseQueryT = irs::FixedPhraseQuery, typename MakeFn>
 
   size_t docs_per_iter = 0;
   size_t matches_per_iter = 0;
+#ifdef SLOP_PROFILE
+  // Collect callgrind counts only over the timed loop (index build and
+  // make()/prepare() stay out); requires --collect-atstart=no.
+  CALLGRIND_TOGGLE_COLLECT;
+#endif
   for (auto _ : state) {
     docs_per_iter = 0;
     matches_per_iter = 0;
@@ -995,6 +1106,9 @@ template<typename PhraseQueryT = irs::FixedPhraseQuery, typename MakeFn>
     benchmark::DoNotOptimize(docs_per_iter);
     benchmark::DoNotOptimize(matches_per_iter);
   }
+#ifdef SLOP_PROFILE
+  CALLGRIND_TOGGLE_COLLECT;
+#endif
 
   state.counters["docs"] = static_cast<double>(docs_per_iter);
   state.counters["matches"] = static_cast<double>(matches_per_iter);
@@ -1250,6 +1364,69 @@ void RegisterAll() {
         BenchExecuteWithOffsets<irs::VariadicPhraseQuery>(
           state, GetCorpus().reader,
           [slop] { return MakeSlopPhraseVariadic2(slop); });
+      })
+      ->Repetitions(kRepetitions)
+      ->ReportAggregatesOnly(true);
+  }
+
+  // Never-worse probes: corners where the disjunction's expansion count K
+  // is minimal while our per-document position machinery is at its widest.
+  //
+  // Dense pair that never matches: the conjunction admits every document
+  // and the join does full per-doc position work for zero matches, while
+  // each fixed expansion can fail fast.
+  for (auto slop : kSlopValues) {
+    RegisterExecVariants(
+      "_farapart2_slop" + std::to_string(static_cast<unsigned>(slop)), "aaa",
+      "bbb", slop, &GetFarApartCorpus);
+  }
+
+  // All-dense real-text 3-term phrase: minimal K for the disjunction, three
+  // dense postings for the gather.
+  for (auto slop : kSlopValues) {
+    const std::string suffix =
+      "_one_of_the3_slop" + std::to_string(static_cast<unsigned>(slop));
+    for (const auto& m : kModes) {
+      benchmark::RegisterBenchmark(
+        ("SlopPhraseExec" + suffix + m.suffix).c_str(),
+        [slop, mode = m.mode](benchmark::State& state) {
+          BenchExecuteOnly(
+            state, GetCorpus().reader,
+            [slop] { return MakeSlopPhrase3("one", "of", "the", slop); }, mode);
+        })
+        ->Repetitions(kRepetitions)
+        ->ReportAggregatesOnly(true);
+    }
+    benchmark::RegisterBenchmark(
+      ("DisjunctionExec" + suffix).c_str(),
+      [slop](benchmark::State& state) {
+        BenchExecuteOnly(state, GetCorpus().reader, [slop] {
+          return MakeDisjunctionEquivalentN({"one", "of", "the"}, slop);
+        });
+      })
+      ->Repetitions(kRepetitions)
+      ->ReportAggregatesOnly(true);
+  }
+
+  // Variadic pair with a four-term synonym slot: K doubles versus var2
+  // while the bind/merge machinery must stay flat.
+  for (auto slop : kSlopValues) {
+    const std::string suffix =
+      "_var4_the_syn4_slop" + std::to_string(static_cast<unsigned>(slop));
+    benchmark::RegisterBenchmark(
+      ("SlopPhraseExec" + suffix).c_str(),
+      [slop](benchmark::State& state) {
+        BenchExecuteOnly(state, GetCorpus().reader,
+                         [slop] { return MakeSlopPhraseVariadic4(slop); });
+      })
+      ->Repetitions(kRepetitions)
+      ->ReportAggregatesOnly(true);
+    benchmark::RegisterBenchmark(
+      ("DisjunctionExec" + suffix).c_str(),
+      [slop](benchmark::State& state) {
+        BenchExecuteOnly(state, GetCorpus().reader, [slop] {
+          return MakeDisjunctionEquivalentVariadic4(slop);
+        });
       })
       ->Repetitions(kRepetitions)
       ->ReportAggregatesOnly(true);
