@@ -714,10 +714,13 @@ int RunEdgeCases() {
   expect({.slots = {{}, {1}}, .expected_steps = {1}, .groups = {}, .slop = 5},
          false, 0, 0, "empty_slot");
   // Dense 3-term, small slop -- just exercise the n>=3 path against brute.
-  Check({.slots = {{1, 2, 3}, {1, 2, 3}, {1, 2, 3}},
-         .expected_steps = {1, 1},
-         .groups = {},
-         .slop = 2});
+  if (!Check({.slots = {{1, 2, 3}, {1, 2, 3}, {1, 2, 3}},
+              .expected_steps = {1, 1},
+              .groups = {},
+              .slop = 2})) {
+    std::printf("  (in edge case 'dense3_small_slop')\n");
+    ++failures;
+  }
 
   if (failures == 0) {
     std::printf("edge cases: OK\n");

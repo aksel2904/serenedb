@@ -58,11 +58,11 @@
 // push_back(term, offs). Interval gaps (offs_min != offs_max) with slop are
 // rejected upstream by SDB_ENSURE.
 
-// Profiling aid: with -DSLOP_PROFILE, force the matcher (Run) and window
-// builder (BuildWindows) out of line so a profiler can split "build windows"
-// vs "match" vs position decode (iterator next/seek, already out of line).
-// Both run once per candidate doc, so the perturbation is negligible. Never
-// defined in production.
+// Profiling aid: with -DSLOP_PROFILE, force the matcher (Run), the window
+// builder (BuildWindows) and the pair join (JoinPair) out of line so a
+// profiler can split "build windows" vs "match" vs position decode (iterator
+// next/seek, already out of line). Each runs once per candidate doc, so the
+// perturbation is negligible. Never defined in production.
 #ifdef SLOP_PROFILE
 #define SLOP_PROF_NOINLINE [[gnu::noinline]]
 #else
@@ -117,9 +117,9 @@ struct DpResult {
   bool any = false;
 };
 
-// Scratch passed from the Frequency object into Run: the DFS chain, whose
-// capacity is reused across anchor positions and documents instead of
-// reallocated per call.
+// Scratch passed from the Frequency object into Run: the DFS chain and slot
+// visitation order, whose capacity is reused across anchor positions and
+// documents instead of reallocated per call.
 struct DpScratch {
   std::vector<PosAttr::value_t> chain;
   std::vector<uint32_t> order;
@@ -548,12 +548,13 @@ SLOP_PROF_NOINLINE inline void BuildWindows(
   const std::vector<PosAttr::value_t>& lead_pos, PosAttr::value_t w,
   std::vector<Window>& out) {
   out.clear();
+  // Cap hi below eof: no real position is ever eof, so nothing is lost,
+  // and the gather loops can bound-check with a bare v <= hi - an
+  // exhausted iterator (v == eof) can never pass it.
+  constexpr PosAttr::value_t kMaxPos = pos_limits::eof() - 1;
   for (const PosAttr::value_t p : lead_pos) {
     const PosAttr::value_t lo = (p > w) ? (p - w) : pos_limits::min();
-    const PosAttr::value_t hi =
-      (p > std::numeric_limits<PosAttr::value_t>::max() - w)
-        ? std::numeric_limits<PosAttr::value_t>::max()
-        : (p + w);
+    const PosAttr::value_t hi = (p > kMaxPos - w) ? kMaxPos : (p + w);
     if (!out.empty() && lo <= out.back().second) {
       // Overlaps the previous window: extend it. Forward-only seek
       // cannot re-read, so the gather windows must stay disjoint.
@@ -895,8 +896,10 @@ class SlopPhraseFrequencyDP {
         offs = irs::get<OffsAttr>(it);
       }
       for (const auto& [lo, hi] : _windows) {
+        // seek(lo >= min) returns a real position or eof, and hi < eof
+        // (BuildWindows caps it), so the bound check alone suffices.
         auto v = it.seek(lo);
-        while (pos_limits::valid(v) && !pos_limits::eof(v) && v <= hi) {
+        while (v <= hi) {
           positions.push_back(v);
           if constexpr (Offs) {
             _slot_offs_start[i].push_back(offs ? offs->start : 0);
@@ -1422,8 +1425,9 @@ class SlopVariadicPhraseFrequencyDP {
     }
     p->reset();
     for (const auto& [lo, hi] : *c.windows) {
+      // Same bound-only check as the fixed gather_windows: hi < eof.
       auto v = p->seek(lo);
-      while (pos_limits::valid(v) && !pos_limits::eof(v) && v <= hi) {
+      while (v <= hi) {
         PosEntry e{.pos = v};
         if constexpr (kHasOffsets) {
           if (offs) {
@@ -1433,7 +1437,6 @@ class SlopVariadicPhraseFrequencyDP {
         }
         c.out->push_back(e);
         if (!p->next()) {
-          v = pos_limits::eof();
           break;
         }
         v = p->value();

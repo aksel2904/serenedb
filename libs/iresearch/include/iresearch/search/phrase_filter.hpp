@@ -123,8 +123,8 @@ class ByPhraseOptions {
     }
     _is_simple_term_only &= std::is_same_v<PhrasePart, ByTermOptions>;
     _phrase.push_back(PhrasePartInfo{.part = std::forward<PhrasePart>(t),
-                                     .offs_max = offs_max,
-                                     .offs_min = offs_min});
+                                     .offs_min = offs_min,
+                                     .offs_max = offs_max});
     return std::get<std::decay_t<PhrasePart>>(_phrase.back().part);
   }
 

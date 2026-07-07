@@ -164,6 +164,13 @@ DocIterator::ptr FixedPhraseQuery::ExecuteWithOffsets(
     return DocIterator::empty();
   }
 
+  SDB_ENSURE(
+    this->slop == 0 || !absl::c_any_of(this->positions,
+                                       [](const auto& pos) {
+                                         return pos.offs_max != pos.offs_min;
+                                       }),
+    sdb::ERROR_BAD_PARAMETER, "slop and intervals are mutually exclusive");
+
   if (this->slop > 0) {
     auto* reader = phrase_state->reader;
     SDB_ASSERT(reader);
@@ -450,6 +457,13 @@ DocIterator::ptr VariadicPhraseQuery::ExecuteWithOffsets(
   if (kRequireOffs != (reader->meta().index_features & kRequireOffs)) {
     return DocIterator::empty();
   }
+
+  SDB_ENSURE(
+    this->slop == 0 || !absl::c_any_of(this->positions,
+                                       [](const auto& pos) {
+                                         return pos.offs_max != pos.offs_min;
+                                       }),
+    sdb::ERROR_BAD_PARAMETER, "slop and intervals are mutually exclusive");
 
   if (this->slop > 0) {
     using SlopIterator = PhraseIterator<

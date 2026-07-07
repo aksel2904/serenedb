@@ -210,6 +210,17 @@ TEST(SlopBuildWindows, touching_then_gap) {
   ASSERT_EQ(102u, out[1].second);
 }
 
+TEST(SlopBuildWindows, hi_capped_below_eof) {
+  // p + w overflowing toward eof must cap hi at eof() - 1: the gather
+  // loops compare positions with a bare v <= hi, and eof may never pass.
+  std::vector<dp::Window> out;
+  const irs::PosAttr::value_t p = irs::pos_limits::eof() - 2;
+  dp::BuildWindows({p}, /*w=*/5, out);
+  ASSERT_EQ(1u, out.size());
+  ASSERT_EQ(p - 5, out[0].first);
+  ASSERT_EQ(irs::pos_limits::eof() - 1, out[0].second);
+}
+
 // Equivalence: drive read-all vs seek-gather over the standard sequential
 // corpus for a representative set of sloppy queries. Reuses the same query
 // shapes as the existing sloppy tests.
@@ -463,6 +474,7 @@ TEST_P(SlopSeekGatherTestCase, pair_join_equivalence_fixed) {
     {"quick fox s1", {"quick", "fox"}, 0, 1},
     {"quick moved s3", {"quick", "moved"}, 0, 3},
     {"fox brown s2 (reversal)", {"fox", "brown"}, 0, 2},
+    {"fox fox s1 (repeated term)", {"fox", "fox"}, 0, 1},
     {"quick __ moved s1 (gap)", {"quick", "moved"}, 1, 1},
   };
 
@@ -634,6 +646,61 @@ TEST_P(SlopSeekGatherTestCase, pair_join_equivalence_offsets_variadic) {
   }
   ASSERT_FALSE(join.empty());
   ASSERT_EQ(legacy, join);
+}
+
+// Per-doc solo dispatch in the variadic join: a slot whose current document
+// holds exactly one live sub-iterator feeds JoinPair raw, others go through
+// the merged stream. The sequential corpus never puts two live subs in BOTH
+// slots of one document, so the merged x merged branch (and the dispatch
+// counting itself) is pinned here on an inline corpus. No same-position
+// tokens, so exact offsets comparison is safe (see
+// pair_join_equivalence_offsets_variadic).
+TEST_P(SlopSeekGatherTestCase, pair_join_solo_dispatch_equivalence) {
+  // qui* -> {quick, quilt}, fo* -> {fox, forward}; the per-doc live sub
+  // counts walk all four dispatch branches across the documents.
+  static constexpr char kData[] =
+    R"([{"name":"MM","phrase":"quick quilt fox forward"},)"
+    R"({"name":"RR","phrase":"quick fox"},)"
+    R"({"name":"MR","phrase":"quick quilt fox"},)"
+    R"({"name":"RM","phrase":"quick fox forward"}])";
+  {
+    tests::JsonDocGenerator gen(kData, &tests::PayloadedJsonFieldFactory);
+    add_segment(gen);
+  }
+  auto rdr = open_reader();
+
+  for (const irs::PosAttr::value_t slop : {1u, 3u}) {
+    irs::ByPhrase q;
+    *q.mutable_field_id() = kField;
+    q.mutable_options()->push_back<irs::ByPrefixOptions>().term = Term("qui");
+    q.mutable_options()->push_back<irs::ByPrefixOptions>().term = Term("fo");
+    q.mutable_options()->set_slop(slop);
+
+    auto prepared = q.prepare({.index = rdr});
+    ASSERT_NE(nullptr, prepared);
+    const auto ctx = "qui* fo* s" + std::to_string(slop);
+
+    const auto join = CollectDocs(prepared, rdr);
+    std::vector<irs::doc_id_t> legacy;
+    {
+      PairJoinGuard pj;
+      legacy = CollectDocs(prepared, rdr);
+    }
+    ASSERT_EQ(legacy, join) << "solo dispatch diverged from gather: " << ctx;
+    ASSERT_FALSE(join.empty()) << "expected matches for: " << ctx;
+
+    const auto* phrase_query =
+      dynamic_cast<const irs::VariadicPhraseQuery*>(prepared.get());
+    ASSERT_NE(nullptr, phrase_query) << ctx;
+    const auto join_offs = CollectOffsets(*phrase_query, rdr);
+    std::vector<OffsetMatch> legacy_offs;
+    {
+      PairJoinGuard pj;
+      legacy_offs = CollectOffsets(*phrase_query, rdr);
+    }
+    ASSERT_EQ(legacy_offs, join_offs) << ctx;
+    ASSERT_FALSE(join_offs.empty()) << ctx;
+  }
 }
 
 static constexpr auto kTestDirs = tests::GetDirectories<tests::kTypesDefault>();

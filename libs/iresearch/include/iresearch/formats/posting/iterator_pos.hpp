@@ -101,6 +101,7 @@ class PositionImpl final : public PosAttr {
   // written. Attributes (offsets) are not maintained; the offset-enabled
   // gather uses the three-array overload below.
   uint32_t ReadAll(uint32_t* out) {
+    static_assert(!IteratorTraits::Offset());
     const uint32_t freq = _freq;
     if (_pend_pos > freq) {
       Skip(_pend_pos - freq);
