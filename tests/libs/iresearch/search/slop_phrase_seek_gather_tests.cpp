@@ -77,6 +77,19 @@ class PairJoinGuard {
   PairJoinGuard& operator=(const PairJoinGuard&) = delete;
 };
 
+// Routes the offset-enabled read-all gather through the scalar
+// per-position loop for the duration of the scope (the production
+// default is the bulk three-array ReadAll). Same discipline as
+// GatherModeGuard: never leaks past the scope.
+class OffsBulkScalarGuard {
+ public:
+  OffsBulkScalarGuard() noexcept { dp::gOffsBulkGatherDisabled = true; }
+  ~OffsBulkScalarGuard() { dp::gOffsBulkGatherDisabled = false; }
+
+  OffsBulkScalarGuard(const OffsBulkScalarGuard&) = delete;
+  OffsBulkScalarGuard& operator=(const OffsBulkScalarGuard&) = delete;
+};
+
 irs::bytes_view Term(std::string_view s) {
   return irs::ViewCast<irs::byte_type>(s);
 }
@@ -700,6 +713,106 @@ TEST_P(SlopSeekGatherTestCase, pair_join_solo_dispatch_equivalence) {
     }
     ASSERT_EQ(legacy_offs, join_offs) << ctx;
     ASSERT_FALSE(join_offs.empty()) << ctx;
+  }
+}
+
+// Multi-block postings: every corpus above keeps a term's positions within
+// a single 128-entry block, so the bulk ReadAll refill, its backlog Skip,
+// and the block-skipping side of seek-gather never run in CI (benches are
+// the only consumers). This corpus gives the dense term hundreds of
+// positions per document - several position blocks - plus a document the
+// conjunction skips, so the pending-position catch-up crosses blocks too.
+// All decode paths must agree: join vs gather for the pair, read-all vs
+// seek for n == 3, and bulk vs scalar offset gather.
+TEST_P(SlopSeekGatherTestCase, equivalence_multi_block_postings) {
+  const auto repeat = [](std::string_view tok, size_t n) {
+    std::string s;
+    for (size_t i = 0; i != n; ++i) {
+      s += tok;
+      s += ' ';
+    }
+    return s;
+  };
+  // aaa: 281 + 150 + 131 = 562 positions in the segment, crossing block
+  // boundaries inside every document; D2 holds no bbb/xxx, so the phrase
+  // conjunction skips it and the next document starts with a backlog.
+  const std::string json =
+    std::string{R"([{"name":"D1","phrase":"xxx bbb )"} + repeat("aaa", 140) +
+    "bbb " + repeat("aaa", 140) + R"(xxx bbb aaa"},{"name":"D2","phrase":")" +
+    repeat("aaa", 150) + R"("},{"name":"D3","phrase":"xxx bbb )" +
+    repeat("aaa", 130) + R"(xxx bbb aaa"}])";
+  {
+    tests::JsonDocGenerator gen(json.c_str(),
+                                &tests::PayloadedJsonFieldFactory);
+    add_segment(gen);
+  }
+  auto rdr = open_reader();
+
+  const auto make = [&](std::vector<std::string_view> terms,
+                        irs::PosAttr::value_t slop) {
+    irs::ByPhrase q;
+    *q.mutable_field_id() = kField;
+    for (const auto t : terms) {
+      q.mutable_options()->push_back<irs::ByTermOptions>().term = Term(t);
+    }
+    q.mutable_options()->set_slop(slop);
+    return q.prepare({.index = rdr});
+  };
+
+  // Pair: production join vs both gather modes.
+  {
+    auto prepared = make({"bbb", "aaa"}, 1);
+    ASSERT_NE(nullptr, prepared);
+    const auto join = CollectDocs(prepared, rdr);
+    ASSERT_EQ(2u, join.size());  // D1 and D3
+    {
+      PairJoinGuard pj;
+      GatherModeGuard g{dp::GatherOverride::kForceReadAll};
+      ASSERT_EQ(join, CollectDocs(prepared, rdr));
+    }
+    {
+      PairJoinGuard pj;
+      GatherModeGuard g{dp::GatherOverride::kForceSeek};
+      ASSERT_EQ(join, CollectDocs(prepared, rdr));
+    }
+  }
+
+  // Triple: read-all (bulk ReadAll with refills) vs seek (scalar windowed
+  // decode with SkipBlock) vs the production heuristic.
+  {
+    auto prepared = make({"xxx", "bbb", "aaa"}, 1);
+    ASSERT_NE(nullptr, prepared);
+    std::vector<irs::doc_id_t> read_all;
+    {
+      GatherModeGuard g{dp::GatherOverride::kForceReadAll};
+      read_all = CollectDocs(prepared, rdr);
+    }
+    ASSERT_EQ(2u, read_all.size());  // D1 and D3
+    {
+      GatherModeGuard g{dp::GatherOverride::kForceSeek};
+      ASSERT_EQ(read_all, CollectDocs(prepared, rdr));
+    }
+    ASSERT_EQ(read_all, CollectDocs(prepared, rdr));  // kAuto
+
+    // Offsets: bulk three-array ReadAll vs its scalar loop vs seek.
+    const auto* phrase_query =
+      dynamic_cast<const irs::FixedPhraseQuery*>(prepared.get());
+    ASSERT_NE(nullptr, phrase_query);
+    std::vector<OffsetMatch> bulk;
+    {
+      GatherModeGuard g{dp::GatherOverride::kForceReadAll};
+      bulk = CollectOffsets(*phrase_query, rdr);
+    }
+    ASSERT_FALSE(bulk.empty());
+    {
+      GatherModeGuard g{dp::GatherOverride::kForceReadAll};
+      OffsBulkScalarGuard scalar;
+      ASSERT_EQ(bulk, CollectOffsets(*phrase_query, rdr));
+    }
+    {
+      GatherModeGuard g{dp::GatherOverride::kForceSeek};
+      ASSERT_EQ(bulk, CollectOffsets(*phrase_query, rdr));
+    }
   }
 }
 
