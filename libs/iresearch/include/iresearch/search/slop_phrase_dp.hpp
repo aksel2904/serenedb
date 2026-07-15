@@ -577,13 +577,13 @@ struct EnumeratedMatch {
   uint32_t rightmost_slot;
 };
 
-// Same index position may be shared by slots of DIFFERENT terms (e.g.
-// synonyms at increment 0), but one occurrence / a repeated term must
-// not fill two slots. Strict per-position uniqueness is enforced when
-// groups are absent (variadic / opt-out) or a term repeats; otherwise
-// distinct terms are free to share a position (cost via StepCost == 1,
-// so excluded at slop 0). Matches ES match_phrase over synonym-expanded
-// positions.
+// Gate for the duplicate-position check: true when groups are absent
+// (variadic / opt-out; the check is then global) or when some group
+// holds two or more slots (the check is then scoped per group, see
+// CountFromAnchor). ES-verified rule: uniqueness applies only between
+// slots of one group (a connectivity component of query term sets);
+// slots of different groups may share a position, the delta-0 step
+// costing 1 via StepCost, so excluded at slop 0.
 inline bool EnforceUniqueness(const std::vector<uint32_t>& groups) noexcept {
   if (groups.empty()) {
     return true;
@@ -603,12 +603,16 @@ inline bool EnforceUniqueness(const std::vector<uint32_t>& groups) noexcept {
 // completed chain is also emitted as one EnumeratedMatch per tuple, so
 // res.freq == out->size() by construction. early_exit stops at the first
 // tuple (never combined with 'out').
+// With enforce_uniqueness a candidate position is rejected when an
+// already-placed slot of the SAME group sits on it; empty groups widen
+// the check to all placed slots (strict global).
 inline void CountFromAnchor(
   const std::vector<std::vector<PosAttr::value_t>>& slots,
   PosAttr::value_t slop, const std::vector<PosAttr::value_t>& expected_steps,
   std::vector<PosAttr::value_t>& chain, const std::vector<uint32_t>& order,
   uint32_t anchor, size_t d, PosAttr::value_t cost_so_far, DpResult& res,
-  bool early_exit, bool enforce_uniqueness, std::vector<EnumeratedMatch>* out) {
+  bool early_exit, const std::vector<uint32_t>& groups, bool enforce_uniqueness,
+  std::vector<EnumeratedMatch>* out) {
   const size_t n = slots.size();
   if (d == n) {
     ++res.freq;
@@ -679,7 +683,8 @@ inline void CountFromAnchor(
     if (enforce_uniqueness) {
       bool dup = false;
       for (size_t k = 0; k < d; ++k) {
-        if (chain[order[k]] == p) {
+        if (chain[order[k]] == p &&
+            (groups.empty() || groups[order[k]] == groups[slot])) {
           dup = true;
           break;
         }
@@ -698,7 +703,7 @@ inline void CountFromAnchor(
     chain[slot] = p;
     CountFromAnchor(slots, slop, expected_steps, chain, order, anchor, d + 1,
                     static_cast<PosAttr::value_t>(cost_so_far + step), res,
-                    early_exit, enforce_uniqueness, out);
+                    early_exit, groups, enforce_uniqueness, out);
     if (early_exit && res.any) {
       return;
     }
@@ -726,6 +731,7 @@ SLOP_PROF_NOINLINE inline DpResult Run(
     }
   }
   SDB_ASSERT(expected_steps.size() == n - 1);
+  SDB_ASSERT(groups.empty() || groups.size() == n);
 
   const bool enforce_uniqueness = EnforceUniqueness(groups);
 
@@ -759,7 +765,7 @@ SLOP_PROF_NOINLINE inline DpResult Run(
   for (PosAttr::value_t pa : slot_pos[anchor]) {
     chain[anchor] = pa;
     CountFromAnchor(slot_pos, slop, expected_steps, chain, order, anchor, 1, 0,
-                    res, early_exit, enforce_uniqueness, out);
+                    res, early_exit, groups, enforce_uniqueness, out);
     if (early_exit && res.any) {
       return res;
     }

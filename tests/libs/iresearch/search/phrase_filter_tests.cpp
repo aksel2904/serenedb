@@ -8994,6 +8994,246 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_overlap_same_position_with_offsets) {
 
 namespace tests {
 
+// Explicit token stream for the ES-verified repeat corpus: foo@1, then
+// bar and foo sharing position 2 (bar at increment 1, foo riding at
+// increment 0). Offsets mimic the source text "foo woof": foo@1 = [0,3),
+// both position-2 tokens = [4,9).
+class RepeatOverlapStream final
+  : public irs::analysis::TypedAnalyzer<RepeatOverlapStream>,
+    private irs::util::Noncopyable {
+ public:
+  static constexpr std::string_view type_name() noexcept {
+    return "repeat_overlap_stream";
+  }
+
+  irs::Attribute* GetMutable(irs::TypeInfo::type_id type) noexcept final {
+    return irs::GetMutable(_attrs, type);
+  }
+
+  bool next() final {
+    if (_i >= kTokens.size()) {
+      return false;
+    }
+    const auto& t = kTokens[_i++];
+    std::get<irs::IncAttr>(_attrs).value = t.inc;
+    std::get<irs::TermAttr>(_attrs).value =
+      irs::ViewCast<irs::byte_type>(t.term);
+    auto& offs = std::get<irs::OffsAttr>(_attrs);
+    offs.start = t.start;
+    offs.end = t.end;
+    return true;
+  }
+
+  bool reset(std::string_view) final {
+    _i = 0;
+    return true;
+  }
+
+ private:
+  struct Token {
+    std::string_view term;
+    uint32_t inc;
+    uint32_t start;
+    uint32_t end;
+  };
+
+  static constexpr std::array<Token, 3> kTokens{{
+    {"foo", 1, 0, 3},
+    {"bar", 1, 4, 9},
+    {"foo", 0, 4, 9},
+  }};
+
+  using Attributes = std::tuple<irs::IncAttr, irs::OffsAttr, irs::TermAttr>;
+  Attributes _attrs;
+  size_t _i{0};
+};
+
+class RepeatOverlapField : public tests::FieldBase {
+ public:
+  RepeatOverlapField(std::string_view name, irs::field_id field_id) {
+    this->Name(std::string(name));
+    this->id = field_id;
+    index_features = irs::IndexFeatures::Freq | irs::IndexFeatures::Pos;
+  }
+
+  irs::Tokenizer& GetTokens() const final {
+    _stream.reset({});
+    return _stream;
+  }
+
+ private:
+  bool Write(irs::DataOutput&) const final { return false; }
+
+  mutable RepeatOverlapStream _stream;
+};
+
+class RepeatOverlapDocGenerator : public tests::DocGeneratorBase {
+ public:
+  explicit RepeatOverlapDocGenerator(irs::field_id field_id)
+    : _field_id(field_id) {}
+
+  const tests::Document* next() final {
+    if (_done) {
+      return nullptr;
+    }
+    _done = true;
+    _doc.indexed.clear();
+    _doc.stored.clear();
+    _doc.insert(std::make_shared<RepeatOverlapField>("phrase_anl", _field_id),
+                /*indexed=*/true, /*stored=*/false);
+    return &_doc;
+  }
+
+  void reset() final { _done = false; }
+
+ private:
+  irs::field_id _field_id;
+  tests::Document _doc;
+  bool _done{false};
+};
+
+// Same corpus with offsets indexed, for the ExecuteWithOffsets path.
+class RepeatOverlapFieldWithOffsets : public RepeatOverlapField {
+ public:
+  RepeatOverlapFieldWithOffsets(std::string_view name, irs::field_id field_id)
+    : RepeatOverlapField(name, field_id) {
+    index_features = irs::IndexFeatures::Freq | irs::IndexFeatures::Pos |
+                     irs::IndexFeatures::Offs;
+  }
+};
+
+class RepeatOverlapDocGeneratorWithOffsets : public tests::DocGeneratorBase {
+ public:
+  explicit RepeatOverlapDocGeneratorWithOffsets(irs::field_id field_id)
+    : _field_id(field_id) {}
+
+  const tests::Document* next() final {
+    if (_done) {
+      return nullptr;
+    }
+    _done = true;
+    _doc.indexed.clear();
+    _doc.stored.clear();
+    _doc.insert(
+      std::make_shared<RepeatOverlapFieldWithOffsets>("phrase_anl", _field_id),
+      /*indexed=*/true, /*stored=*/false);
+    return &_doc;
+  }
+
+  void reset() final { _done = false; }
+
+ private:
+  irs::field_id _field_id;
+  tests::Document _doc;
+  bool _done{false};
+};
+
+}  // namespace tests
+namespace {
+
+// Returns the number of docs matched by phrase {t0, t1, t2} at the given slop.
+size_t MatchCount3(const irs::IndexReader& rdr, irs::field_id field,
+                   std::string_view t0, std::string_view t1,
+                   std::string_view t2, irs::PosAttr::value_t slop) {
+  irs::ByPhrase q;
+  *q.mutable_field_id() = field;
+  q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    irs::ViewCast<irs::byte_type>(t0);
+  q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    irs::ViewCast<irs::byte_type>(t1);
+  q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    irs::ViewCast<irs::byte_type>(t2);
+  q.mutable_options()->set_slop(slop);
+
+  auto prepared = q.prepare({.index = rdr});
+  size_t count = 0;
+  for (auto sub = rdr.begin(); sub != rdr.end(); ++sub) {
+    auto docs = prepared->execute({.segment = *sub});
+    while (docs->next()) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+}  // namespace
+
+// ES-verified (exp 1 of ES_verify_slop_uniqueness): phrase "foo bar foo"
+// against foo@1 + {bar,foo}@2. The two foo slots form one group and take
+// positions 1 and 2; bar shares position 2 with the second foo legally
+// (different group). Before the per-group check the global rule barred
+// every tuple.
+TEST_P(PhraseFilterTestCase, sloppy_phrase_repeat_same_position) {
+  {
+    tests::RepeatOverlapDocGenerator gen(kPhraseAnl);
+    add_segment(gen);
+  }
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
+
+  // Corpus-shape controls; if the one-way synonym mapping did not apply,
+  // these fail first and point at the analyzer, not the matcher.
+  EXPECT_EQ(1u, MatchCount(rdr, kPhraseAnl, "foo", "bar", 0));
+  EXPECT_EQ(1u, MatchCount(rdr, kPhraseAnl, "foo", "foo", 0));
+
+  // The pinned divergence: 0 at slop 0 (delta-0 costs 1), 1 doc from
+  // slop 1 on (tuple foo@1, bar@2, foo@2 of cost 1).
+  EXPECT_EQ(0u, MatchCount3(rdr, kPhraseAnl, "foo", "bar", "foo", 0));
+  EXPECT_EQ(1u, MatchCount3(rdr, kPhraseAnl, "foo", "bar", "foo", 1));
+  EXPECT_EQ(1u, MatchCount3(rdr, kPhraseAnl, "foo", "bar", "foo", 2));
+}
+
+// Offsets path of the same fix: Run's collector must emit exactly freq
+// tuples under the per-group rule (BuildMatches asserts equality). One
+// tuple at slop 1 (cost 1), a second from slop 3 on (reversed foo pair,
+// cost 3).
+TEST_P(PhraseFilterTestCase, sloppy_phrase_repeat_same_position_with_offsets) {
+  {
+    tests::RepeatOverlapDocGeneratorWithOffsets gen(kPhraseAnl);
+    add_segment(gen);
+  }
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
+
+  const auto run = [&](irs::PosAttr::value_t slop, size_t want_matches) {
+    irs::ByPhrase q;
+    *q.mutable_field_id() = kPhraseAnl;
+    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+      irs::ViewCast<irs::byte_type>(std::string_view("foo"));
+    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+      irs::ViewCast<irs::byte_type>(std::string_view("bar"));
+    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+      irs::ViewCast<irs::byte_type>(std::string_view("foo"));
+    q.mutable_options()->set_slop(slop);
+
+    auto prepared = q.prepare({.index = rdr});
+    auto* phrase_query =
+      dynamic_cast<const irs::FixedPhraseQuery*>(prepared.get());
+    ASSERT_NE(nullptr, phrase_query);
+
+    auto sub = rdr.begin();
+    auto docs = phrase_query->ExecuteWithOffsets(*sub);
+    ASSERT_NE(nullptr, docs);
+    auto* pos = irs::GetMutable<irs::PosAttr>(docs.get());
+    ASSERT_NE(nullptr, pos);
+    auto* offs = irs::get<irs::OffsAttr>(*pos);
+    ASSERT_NE(nullptr, offs);
+
+    ASSERT_TRUE(docs->next());
+    size_t matches = 0;
+    while (pos->next()) {
+      EXPECT_EQ(0u, offs->start);
+      EXPECT_EQ(9u, offs->end);
+      ++matches;
+    }
+    EXPECT_EQ(want_matches, matches);
+    ASSERT_FALSE(docs->next());
+  };
+
+  run(1, 1);
+  run(3, 2);
+}
+
+namespace tests {
+
 // "foo" indexed under synonym foo,fooa -> foo@0 (inc 1) + fooa@0 (inc 0).
 // A prefix slot "fo*" matches both.
 class OverlapPrefixField : public tests::FieldBase {

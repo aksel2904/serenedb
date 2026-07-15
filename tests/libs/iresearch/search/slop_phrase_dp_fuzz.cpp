@@ -58,26 +58,15 @@ struct Case {
   value_t slop{0};
 };
 
-// Reimplemented (not calling dp::EnforceUniqueness) so it can't inherit a
-// bug: positions distinct unless every slot has a distinct group.
-bool Strict(const std::vector<uint32_t>& groups) {
-  if (groups.empty()) {
-    return true;
-  }
-  for (size_t a = 0; a < groups.size(); ++a) {
-    for (size_t b = a + 1; b < groups.size(); ++b) {
-      if (groups[a] == groups[b]) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-bool AllDistinct(const std::vector<value_t>& chain) {
+// Per-group duplicate rule (Lucene, ES-verified): a shared position is
+// illegal only between slots of the same group; empty groups mean
+// globally strict. Reimplemented (not calling into dp::) so it can't
+// inherit a bug.
+bool GroupDistinct(const std::vector<value_t>& chain,
+                   const std::vector<uint32_t>& groups) {
   for (size_t a = 0; a < chain.size(); ++a) {
     for (size_t b = a + 1; b < chain.size(); ++b) {
-      if (chain[a] == chain[b]) {
+      if (chain[a] == chain[b] && (groups.empty() || groups[a] == groups[b])) {
         return false;
       }
     }
@@ -86,8 +75,8 @@ bool AllDistinct(const std::vector<value_t>& chain) {
 }
 
 // Counts valid tuples; cost is computed only at a full tuple, so none of
-// Run's window/pruning leaks in. force_strict forces uniqueness on.
-dp::DpResult BruteRun(const Case& c, bool force_strict) {
+// Run's window/pruning leaks in.
+dp::DpResult BruteRun(const Case& c) {
   dp::DpResult res{};
   const size_t n = c.slots.size();
   if (n < 2) {
@@ -98,12 +87,11 @@ dp::DpResult BruteRun(const Case& c, bool force_strict) {
       return res;
     }
   }
-  const bool strict = force_strict || Strict(c.groups);
 
   std::vector<value_t> chain(n);
   auto rec = [&](auto&& self, size_t i) -> void {
     if (i == n) {
-      if (strict && !AllDistinct(chain)) {
+      if (!GroupDistinct(chain, c.groups)) {
         return;
       }
       // 64-bit so it never wraps; counts iff total cost <= slop.
@@ -325,7 +313,7 @@ bool Check(const Case& c) {
   // early_exit cannot collect (Run asserts !(early_exit && out)).
   const dp::DpResult run_exit = dp::Run(c.slots, c.slop, c.expected_steps,
                                         scratch, /*early_exit=*/true, c.groups);
-  const dp::DpResult ref = BruteRun(c, /*force_strict=*/false);
+  const dp::DpResult ref = BruteRun(c);
 
   bool ok = true;
 
@@ -679,7 +667,7 @@ int RunEdgeCases() {
   int failures = 0;
   auto expect = [&](const Case& c, bool want_any, uint64_t want_freq,
                     value_t want_best, const char* name) {
-    const dp::DpResult ref = BruteRun(c, false);
+    const dp::DpResult ref = BruteRun(c);
     if (!Check(c)) {
       std::printf("  (in edge case '%s')\n", name);
       ++failures;
@@ -710,6 +698,26 @@ int RunEdgeCases() {
   expect(
     {.slots = {{1}, {1}}, .expected_steps = {1}, .groups = {0, 1}, .slop = 1},
     true, 1, 1, "samepos_distinct_groups");
+  // ES-verified (b): repeat + a third term on the repeat's position.
+  // Groups {0,1,0}: slot 1 may share position 2 with slot 2 (different
+  // groups); the two group-0 slots sit on distinct positions. One tuple
+  // (1,2,2), cost StepCost(1)+StepCost(0) = 1.
+  expect({.slots = {{1}, {2}, {2}},
+          .expected_steps = {1, 1},
+          .groups = {0, 1, 0},
+          .slop = 0},
+         false, 0, 0, "samepos_repeat_third_slop0");
+  expect({.slots = {{1}, {2}, {2}},
+          .expected_steps = {1, 1},
+          .groups = {0, 1, 0},
+          .slop = 1},
+         true, 1, 1, "samepos_repeat_third_slop1");
+  // Same-group slots forced onto one position stay barred at any slop.
+  expect({.slots = {{2}, {1}, {2}},
+          .expected_steps = {1, 1},
+          .groups = {0, 1, 0},
+          .slop = 5},
+         false, 0, 0, "samepos_same_group_barred");
   // Empty slot -> no match.
   expect({.slots = {{}, {1}}, .expected_steps = {1}, .groups = {}, .slop = 5},
          false, 0, 0, "empty_slot");
