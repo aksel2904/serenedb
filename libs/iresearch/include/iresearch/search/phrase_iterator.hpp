@@ -96,10 +96,10 @@ struct TermInterval {
   PosAttr::value_t offs_max{};
   PosAttr::value_t offs_min{};
   PosAttr::value_t lead_offset{};
-  // Per-slot term-group id (fixed phrase): equal ids == same term. Lets the
-  // slop matcher allow two DIFFERENT terms at one index position (synonyms)
-  // while still forbidding one occurrence / a repeated term from filling two
-  // slots. 0 for all slots when unused (variadic).
+  // Per-slot term-group id: equal ids == same connectivity component of
+  // query term sets (fixed: same term; variadic: computed per segment at
+  // prepare-collect). The slop matcher scopes position uniqueness to a
+  // component. 0 for all slots when unused (slop == 0 paths).
   uint32_t term_group{};
 };
 

@@ -1180,6 +1180,15 @@ class SlopVariadicPhraseFrequencyDP {
     }
 
     const size_t n = _pos.size();
+
+    if (_term_groups.size() != n) {
+      _term_groups.clear();
+      _term_groups.reserve(n);
+      for (const auto& p : _pos) {
+        _term_groups.push_back(p.second.term_group);
+      }
+    }
+
     // Two-slot phrases bypass gather + Run entirely: the fused merge-join
     // consumes the merged per-slot position streams directly.
     if (n == 2 && !detail::slop_dp::gPairJoinDisabled) {
@@ -1275,16 +1284,16 @@ class SlopVariadicPhraseFrequencyDP {
       }
     }
 
-    // A variadic slot is a term set with no per-term group identity, so
-    // strict position uniqueness stays on via empty groups - matching the
-    // Lucene oracle for the variadic case.
+    // Uniqueness is scoped to slot groups: connectivity components of the
+    // per-segment query term sets, computed at prepare-collect and carried
+    // in TermInterval::term_group (ES-verified rule).
     std::vector<detail::slop_dp::EnumeratedMatch>* collect = nullptr;
     if constexpr (kHasOffsets && HasFreq) {
       collect = &_enumerated;
     }
-    auto res = detail::slop_dp::Run(_slot_pos, _max_slop, _expected_steps,
-                                    _dp_scratch, /*early_exit=*/!HasFreq,
-                                    /*groups=*/{}, collect);
+    auto res =
+      detail::slop_dp::Run(_slot_pos, _max_slop, _expected_steps, _dp_scratch,
+                           /*early_exit=*/!HasFreq, _term_groups, collect);
     if (!res.any) {
       return false;
     }
@@ -1572,8 +1581,8 @@ class SlopVariadicPhraseFrequencyDP {
                bool anchor_is_slot0) {
     return FinishPair(detail::slop_dp::JoinPair<kHasOffsets, HasFreq>(
       anchor, partner, anchor_offs, partner_offs, anchor_is_slot0, _max_slop,
-      _expected_steps[0], /*enforce_uniqueness=*/true, _pair_scratch,
-      PairCollect()));
+      _expected_steps[0], detail::slop_dp::EnforceUniqueness(_term_groups),
+      _pair_scratch, PairCollect()));
   }
 
   // See SlopPhraseFrequencyDP::BuildMatches
@@ -1629,6 +1638,7 @@ class SlopVariadicPhraseFrequencyDP {
   PosAttr::value_t _best_distance = 0;
   uint32_t _start_offset{0};
   uint32_t _end_offset{0};
+  std::vector<uint32_t> _term_groups;
 };
 
 }  // namespace irs

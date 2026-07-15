@@ -8994,27 +8994,35 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_overlap_same_position_with_offsets) {
 
 namespace tests {
 
-// Explicit token stream for the ES-verified repeat corpus: foo@1, then
-// bar and foo sharing position 2 (bar at increment 1, foo riding at
-// increment 0). Offsets mimic the source text "foo woof": foo@1 = [0,3),
-// both position-2 tokens = [4,9).
-class RepeatOverlapStream final
-  : public irs::analysis::TypedAnalyzer<RepeatOverlapStream>,
+// Explicit token stream over a fixed (term, increment, offsets) table;
+// each corpus below owns its table.
+class FixedTokensStream final
+  : public irs::analysis::TypedAnalyzer<FixedTokensStream>,
     private irs::util::Noncopyable {
  public:
+  struct Token {
+    std::string_view term;
+    uint32_t inc;
+    uint32_t start;
+    uint32_t end;
+  };
+
   static constexpr std::string_view type_name() noexcept {
-    return "repeat_overlap_stream";
+    return "fixed_tokens_stream";
   }
+
+  explicit FixedTokensStream(std::span<const Token> tokens) noexcept
+    : _tokens(tokens) {}
 
   irs::Attribute* GetMutable(irs::TypeInfo::type_id type) noexcept final {
     return irs::GetMutable(_attrs, type);
   }
 
   bool next() final {
-    if (_i >= kTokens.size()) {
+    if (_i >= _tokens.size()) {
       return false;
     }
-    const auto& t = kTokens[_i++];
+    const auto& t = _tokens[_i++];
     std::get<irs::IncAttr>(_attrs).value = t.inc;
     std::get<irs::TermAttr>(_attrs).value =
       irs::ViewCast<irs::byte_type>(t.term);
@@ -9030,20 +9038,9 @@ class RepeatOverlapStream final
   }
 
  private:
-  struct Token {
-    std::string_view term;
-    uint32_t inc;
-    uint32_t start;
-    uint32_t end;
-  };
-
-  static constexpr std::array<Token, 3> kTokens{{
-    {"foo", 1, 0, 3},
-    {"bar", 1, 4, 9},
-    {"foo", 0, 4, 9},
-  }};
-
   using Attributes = std::tuple<irs::IncAttr, irs::OffsAttr, irs::TermAttr>;
+
+  std::span<const Token> _tokens;
   Attributes _attrs;
   size_t _i{0};
 };
@@ -9064,7 +9061,12 @@ class RepeatOverlapField : public tests::FieldBase {
  private:
   bool Write(irs::DataOutput&) const final { return false; }
 
-  mutable RepeatOverlapStream _stream;
+  static constexpr std::array<FixedTokensStream::Token, 3> kTokens{{
+    {"foo", 1, 0, 3},
+    {"bar", 1, 4, 9},
+    {"foo", 0, 4, 9},
+  }};
+  mutable FixedTokensStream _stream{kTokens};
 };
 
 class RepeatOverlapDocGenerator : public tests::DocGeneratorBase {
@@ -9336,7 +9338,202 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_variadic_overlap_same_position) {
   for (const irs::PosAttr::value_t slop : {0u, 1u, 2u, 5u}) {
     const size_t n = PrefixPhraseMatchCount(rdr, kPhraseAnl, "fo", "fo", slop);
     EXPECT_EQ(0u, n) << "fo* fo* slop=" << slop
-                     << " (predicted 0; non-zero "
-                        "would refute the union-model reading)";
+                     << " (ES-verified: identical per-segment expansions "
+                        "form one component, strict)";
   }
+}
+
+namespace tests {
+
+// aa@1 and cc@1 share position 1 (cc rides at increment 0); ee@2 follows.
+// Offsets mimic a source text "aa cc ee".
+class VariadicOverlapField : public tests::FieldBase {
+ public:
+  VariadicOverlapField(std::string_view name, irs::field_id field_id) {
+    this->Name(std::string(name));
+    this->id = field_id;
+    index_features = irs::IndexFeatures::Freq | irs::IndexFeatures::Pos |
+                     irs::IndexFeatures::Offs;
+  }
+
+  irs::Tokenizer& GetTokens() const final {
+    _stream.reset({});
+    return _stream;
+  }
+
+ private:
+  bool Write(irs::DataOutput&) const final { return false; }
+
+  static constexpr std::array<FixedTokensStream::Token, 3> kTokens{{
+    {"aa", 1, 0, 2},
+    {"cc", 0, 3, 5},
+    {"ee", 1, 6, 8},
+  }};
+  mutable FixedTokensStream _stream{kTokens};
+};
+
+class VariadicOverlapDocGenerator : public tests::DocGeneratorBase {
+ public:
+  explicit VariadicOverlapDocGenerator(irs::field_id field_id)
+    : _field_id(field_id) {}
+
+  const tests::Document* next() final {
+    if (_done) {
+      return nullptr;
+    }
+    _done = true;
+    _doc.indexed.clear();
+    _doc.stored.clear();
+    _doc.insert(std::make_shared<VariadicOverlapField>("phrase_anl", _field_id),
+                /*indexed=*/true, /*stored=*/false);
+    return &_doc;
+  }
+
+  void reset() final { _done = false; }
+
+ private:
+  irs::field_id _field_id;
+  tests::Document _doc;
+  bool _done{false};
+};
+
+}  // namespace tests
+namespace {
+
+// Count docs matched by a variadic phrase (one ByTermsOptions set per slot).
+size_t TermsPhraseMatchCount(
+  const irs::IndexReader& rdr, irs::field_id field,
+  const std::vector<std::vector<std::string_view>>& slots,
+  irs::PosAttr::value_t slop) {
+  irs::ByPhrase q;
+  *q.mutable_field_id() = field;
+  for (const auto& slot : slots) {
+    auto& part = q.mutable_options()->push_back<irs::ByTermsOptions>();
+    for (const auto t : slot) {
+      part.terms.emplace(irs::ViewCast<irs::byte_type>(t));
+    }
+  }
+  q.mutable_options()->set_slop(slop);
+
+  auto prepared = q.prepare({.index = rdr});
+  size_t count = 0;
+  for (auto sub = rdr.begin(); sub != rdr.end(); ++sub) {
+    auto docs = prepared->execute({.segment = *sub});
+    while (docs->next()) {
+      ++count;
+    }
+  }
+  return count;
+}
+
+}  // namespace
+
+// ES-verified (exp 2 of ES_verify_slop_uniqueness): variadic slots with
+// disjoint term sets may share a position at cost 1; identical or
+// intersecting sets form one component and stay strict. Group identity is
+// the QUERY set, so a shared term absent from the index still connects
+// its slots (a3.1).
+TEST_P(PhraseFilterTestCase, sloppy_phrase_variadic_disjoint_same_position) {
+  {
+    tests::VariadicOverlapDocGenerator gen(kPhraseAnl);
+    add_segment(gen);
+  }
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
+
+  // Corpus-shape controls: aa@1 and cc@1 share a position, ee@2 follows.
+  EXPECT_EQ(1u, TermsPhraseMatchCount(rdr, kPhraseAnl, {{"aa"}, {"ee"}}, 0));
+  EXPECT_EQ(1u, TermsPhraseMatchCount(rdr, kPhraseAnl, {{"cc"}, {"ee"}}, 0));
+
+  // The pinned divergence (a2): disjoint sets, shared position, cost 1.
+  EXPECT_EQ(0u, TermsPhraseMatchCount(rdr, kPhraseAnl, {{"aa"}, {"cc"}}, 0));
+  EXPECT_EQ(1u, TermsPhraseMatchCount(rdr, kPhraseAnl, {{"aa"}, {"cc"}}, 1));
+  // Absent terms widen the query sets without changing the expansions;
+  // the sets stay disjoint.
+  EXPECT_EQ(1u, TermsPhraseMatchCount(rdr, kPhraseAnl,
+                                      {{"aa", "zz"}, {"cc", "qq"}}, 1));
+
+  // Identical sets: one component, one shared position, no legal tuple
+  // (ES ctrl B).
+  for (const uint32_t slop : {0u, 1u, 2u, 5u}) {
+    EXPECT_EQ(0u, TermsPhraseMatchCount(rdr, kPhraseAnl,
+                                        {{"aa", "cc"}, {"aa", "cc"}}, slop))
+      << "slop=" << slop;
+  }
+
+  // (a3.1): the shared term is NOT in the index, yet the query-level sets
+  // intersect - one component, strict.
+  for (const uint32_t slop : {0u, 1u, 2u, 5u}) {
+    EXPECT_EQ(0u, TermsPhraseMatchCount(
+                    rdr, kPhraseAnl, {{"aa", "ghost"}, {"ghost", "cc"}}, slop))
+      << "slop=" << slop;
+  }
+
+  // n == 3, all sets disjoint: tuple (aa@1, cc@1, ee@2) costs 1.
+  EXPECT_EQ(
+    0u, TermsPhraseMatchCount(rdr, kPhraseAnl, {{"aa"}, {"cc"}, {"ee"}}, 0));
+  EXPECT_EQ(
+    1u, TermsPhraseMatchCount(rdr, kPhraseAnl, {{"aa"}, {"cc"}, {"ee"}}, 1));
+
+  // n == 3 with a repeated set: the group-0 slots cannot both sit on the
+  // single aa position.
+  for (const uint32_t slop : {0u, 1u, 5u}) {
+    EXPECT_EQ(0u, TermsPhraseMatchCount(rdr, kPhraseAnl,
+                                        {{"aa"}, {"cc"}, {"aa"}}, slop))
+      << "slop=" << slop;
+  }
+}
+
+// Offsets path: enumeration must agree with freq under group-scoped
+// uniqueness on both the n == 2 join and the n >= 3 Run + BuildMatches
+// paths (the latter asserts enumerated == freq).
+TEST_P(PhraseFilterTestCase,
+       sloppy_phrase_variadic_disjoint_same_position_with_offsets) {
+  {
+    tests::VariadicOverlapDocGenerator gen(kPhraseAnl);
+    add_segment(gen);
+  }
+  auto rdr = open_reader(irs::tests::DefaultReaderOptions());
+
+  const auto run = [&](const std::vector<std::vector<std::string_view>>& slots,
+                       irs::PosAttr::value_t slop, size_t want_matches,
+                       uint32_t want_start, uint32_t want_end) {
+    irs::ByPhrase q;
+    *q.mutable_field_id() = kPhraseAnl;
+    for (const auto& slot : slots) {
+      auto& part = q.mutable_options()->push_back<irs::ByTermsOptions>();
+      for (const auto t : slot) {
+        part.terms.emplace(irs::ViewCast<irs::byte_type>(t));
+      }
+    }
+    q.mutable_options()->set_slop(slop);
+
+    auto prepared = q.prepare({.index = rdr});
+    auto* phrase_query =
+      dynamic_cast<const irs::VariadicPhraseQuery*>(prepared.get());
+    ASSERT_NE(nullptr, phrase_query);
+
+    auto sub = rdr.begin();
+    auto docs = phrase_query->ExecuteWithOffsets(*sub);
+    ASSERT_NE(nullptr, docs);
+    auto* pos = irs::GetMutable<irs::PosAttr>(docs.get());
+    ASSERT_NE(nullptr, pos);
+    auto* offs = irs::get<irs::OffsAttr>(*pos);
+    ASSERT_NE(nullptr, offs);
+
+    ASSERT_TRUE(docs->next());
+    size_t matches = 0;
+    while (pos->next()) {
+      EXPECT_EQ(want_start, offs->start);
+      EXPECT_EQ(want_end, offs->end);
+      ++matches;
+    }
+    EXPECT_EQ(want_matches, matches);
+    ASSERT_FALSE(docs->next());
+  };
+
+  // n == 2 join path: single (aa@1, cc@1) pair; positions tie, phrase
+  // slot 0 supplies both ends -> the aa token's offsets.
+  run({{"aa"}, {"cc"}}, 1, 1, 0, 2);
+  // n == 3 Run + BuildMatches path: leftmost aa@1, rightmost ee@2.
+  run({{"aa"}, {"cc"}, {"ee"}}, 1, 1, 0, 8);
 }

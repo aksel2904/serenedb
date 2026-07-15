@@ -22,6 +22,8 @@
 
 #include "phrase_filter.hpp"
 
+#include <absl/container/flat_hash_map.h>
+
 #include "iresearch/index/field_meta.hpp"
 #include "iresearch/index/index_reader.hpp"
 #include "iresearch/search/collectors.hpp"
@@ -188,16 +190,23 @@ class PhraseTermVisitor final : public FilterVisitor,
 
       _collectors->Collect(_term_offset++, *_terms);
     }
+    if (_visited_terms) {
+      // The view is valid only while the iterator sits on the term.
+      const auto term = _terms->value();
+      _visited_terms->emplace_back(term.data(), term.size());
+    }
     _phrase_states.emplace_back(_terms->cookie(), boost);
   }
 
   void Reset() noexcept { _volatile_boost = false; }
 
-  void Reset(FlatTermBuffer* collectors) noexcept {
+  void Reset(FlatTermBuffer* collectors,
+             std::vector<bstring>* visited_terms = nullptr) noexcept {
     _found = false;
     _terms = nullptr;
     _term_offset = 0;
     _collectors = collectors;
+    _visited_terms = visited_terms;
     if (_collectors) {
       _stats_size = collectors->Size();
     }
@@ -214,6 +223,7 @@ class PhraseTermVisitor final : public FilterVisitor,
   const TermReader* _reader{};
   PhraseStates& _phrase_states;
   FlatTermBuffer* _collectors = nullptr;
+  std::vector<bstring>* _visited_terms = nullptr;
   const SeekTermIterator* _terms = nullptr;
   bool _found = false;
   bool _volatile_boost = false;
@@ -328,6 +338,63 @@ Filter::Query::ptr FixedPrepareCollect(const PrepareContext& ctx,
     std::move(stats), ctx.boost, options.slop());
 }
 
+// Slot connectivity components over query term sets, per segment. The
+// ES-verified rule detects repeats over the terms of the QUERY, so literal
+// parts contribute their full query-level sets (a shared term absent from
+// the segment still connects its slots), while pattern parts have no
+// query-level set and contribute their per-segment expansion instead.
+ManagedVector<uint32_t> ComputeTermGroups(
+  const ByPhraseOptions& options,
+  const std::vector<std::vector<bstring>>& part_terms,
+  IResourceManager& memory) {
+  const auto n = options.size();
+  std::vector<uint32_t> parent(n);
+  for (size_t i = 0; i < n; ++i) {
+    parent[i] = static_cast<uint32_t>(i);
+  }
+  const auto find = [&](uint32_t x) {
+    while (parent[x] != x) {
+      parent[x] = parent[parent[x]];
+      x = parent[x];
+    }
+    return x;
+  };
+
+  absl::flat_hash_map<bytes_view, uint32_t> first_owner;
+  const auto add_term = [&](bytes_view term, uint32_t part) {
+    const auto [it, inserted] = first_owner.emplace(term, part);
+    if (!inserted) {
+      const auto a = find(it->second);
+      const auto b = find(part);
+      if (a != b) {
+        parent[b] = a;
+      }
+    }
+  };
+
+  uint32_t part = 0;
+  for (const auto& word : options) {
+    if (const auto* t = std::get_if<ByTermOptions>(&word.part)) {
+      add_term(t->term, part);
+    } else if (const auto* ts = std::get_if<ByTermsOptions>(&word.part)) {
+      for (const auto& st : ts->terms) {
+        add_term(st.term, part);
+      }
+    } else {
+      for (const auto& term : part_terms[part]) {
+        add_term(term, part);
+      }
+    }
+    ++part;
+  }
+
+  ManagedVector<uint32_t> groups(n, {memory});
+  for (size_t i = 0; i < n; ++i) {
+    groups[i] = find(static_cast<uint32_t>(i));
+  }
+  return groups;
+}
+
 Filter::Query::ptr VariadicPrepareCollect(const PrepareContext& ctx,
                                           irs::field_id id,
                                           const ByPhraseOptions& options) {
@@ -387,6 +454,22 @@ Filter::Query::ptr VariadicPrepareCollect(const PrepareContext& ctx,
 
   PhraseTermVisitor<decltype(phrase_terms)> ptv(phrase_terms);
 
+  // Slot grouping is consumed only by the sloppy matcher; skip the term
+  // bookkeeping entirely at slop == 0. Literal parts are grouped from the
+  // query-level options, so only pattern parts collect their expansions.
+  const bool collect_groups = options.slop() > 0;
+  std::vector<std::vector<bstring>> part_terms;
+  std::vector<bool> needs_expansion;
+  if (collect_groups) {
+    part_terms.resize(phrase_size);
+    needs_expansion.reserve(phrase_size);
+    for (const auto& word : options) {
+      needs_expansion.push_back(
+        !std::holds_alternative<ByTermOptions>(word.part) &&
+        !std::holds_alternative<ByTermsOptions>(word.part));
+    }
+  }
+
   for (const auto& segment : ctx.index) {
     // get term dictionary for field
     const auto* reader = segment.field(id);
@@ -399,9 +482,16 @@ Filter::Query::ptr VariadicPrepareCollect(const PrepareContext& ctx,
     ptv.Reset();  // reset boost volaitility mark
 
     size_t found_parts = 0;
+    size_t part_idx = 0;
     for (auto& visitor : phrase_part_visitors) {
       const auto was_terms_count = phrase_terms.size();
-      ptv.Reset(phrase_part_stats.GetCollector(found_parts));
+      std::vector<bstring>* visited = nullptr;
+      if (collect_groups && needs_expansion[part_idx]) {
+        part_terms[part_idx].clear();
+        visited = &part_terms[part_idx];
+      }
+      ++part_idx;
+      ptv.Reset(phrase_part_stats.GetCollector(found_parts), visited);
       visitor(segment, *reader, ptv);
       const auto new_terms_count = phrase_terms.size() - was_terms_count;
       // TODO(mbkkt) Avoid unnecessary work for min_match > 1 queries
@@ -421,6 +511,9 @@ Filter::Query::ptr VariadicPrepareCollect(const PrepareContext& ctx,
     auto& state = phrase_states.insert(segment);
     state.terms = std::move(phrase_terms);
     state.num_terms = std::move(num_terms);
+    if (collect_groups) {
+      state.term_groups = ComputeTermGroups(options, part_terms, ctx.memory);
+    }
     state.reader = reader;
     state.volatile_boost = !is_ord_empty && ptv.VolatileBoost();
     SDB_ASSERT(phrase_size == state.num_terms.size());

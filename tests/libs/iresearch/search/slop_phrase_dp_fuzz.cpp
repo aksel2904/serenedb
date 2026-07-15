@@ -369,17 +369,21 @@ bool Check(const Case& c) {
 
 // A variadic n == 2 case: each slot is a set of per-term sub position
 // lists. The engine merges each slot with duplicates collapsed
-// (MergedPosStream, mirroring gather's sort + unique) and matches with
-// strict uniqueness - the variadic path has no term groups.
+// (MergedPosStream, mirroring gather's sort + unique). same_group models
+// whether the two slots' query term sets intersect: one component
+// (enforced pair uniqueness) or two (a shared position is legal).
 struct MergedCase {
   std::array<std::vector<std::vector<value_t>>, 2> subs;
   value_t expected{1};
   value_t slop{0};
+  bool same_group{true};
 };
 
 std::string Show(const MergedCase& c) {
   std::string s = "slop=" + std::to_string(c.slop) +
-                  " expected=" + std::to_string(c.expected) + " subs=";
+                  " expected=" + std::to_string(c.expected) +
+                  " same_group=" + std::string(c.same_group ? "1" : "0") +
+                  " subs=";
   for (const auto& slot : c.subs) {
     s += "[";
     for (const auto& sub : slot) {
@@ -493,15 +497,16 @@ bool CheckMergedStreamEnumeration(const MergedCase& c, uint32_t slot) {
 }
 
 // The variadic n == 2 path: JoinPair over two merged streams must match the
-// brute reference and Run's collector over the merged-dedup slot lists
-// (strict uniqueness, as the variadic path always is), and the emitted
-// offsets must obey the first-registered-sub rule. Also runs the full plain
-// battery over the merged lists, which the production gather would have
-// produced.
+// brute reference and Run's collector over the merged-dedup slot lists.
+// same_group mirrors the production mapping (EnforceUniqueness over the two
+// slots' group ids). Also runs the full plain battery over the merged
+// lists, which the production gather would have produced.
 bool CheckMergedJoin(const MergedCase& c) {
+  const std::vector<uint32_t> groups =
+    c.same_group ? std::vector<uint32_t>{0, 0} : std::vector<uint32_t>{0, 1};
   Case merged{.slots = {MergedUnion(c.subs[0]), MergedUnion(c.subs[1])},
               .expected_steps = {c.expected},
-              .groups = {},
+              .groups = groups,
               .slop = c.slop};
 
   bool ok = Check(merged);
@@ -510,7 +515,7 @@ bool CheckMergedJoin(const MergedCase& c) {
   std::vector<dp::EnumeratedMatch> run_out;
   const dp::DpResult ref =
     dp::Run(merged.slots, merged.slop, merged.expected_steps, scratch,
-            /*early_exit=*/false, /*groups=*/{}, &run_out);
+            /*early_exit=*/false, groups, &run_out);
 
   ok &= CheckMergedStreamEnumeration(c, 0);
   ok &= CheckMergedStreamEnumeration(c, 1);
@@ -530,7 +535,7 @@ bool CheckMergedJoin(const MergedCase& c) {
     std::vector<dp::PairMatch> out;
     const dp::DpResult join = dp::JoinPair<true, true>(
       anchor, partner, anchor.GetOffs(), partner.GetOffs(), anchor_is_slot0,
-      c.slop, c.expected, /*enforce_uniqueness=*/true, pair_scratch, &out);
+      c.slop, c.expected, c.same_group, pair_scratch, &out);
 
     if (join.any != ref.any || join.freq != ref.freq ||
         (ref.any && join.best_distance != ref.best_distance)) {
@@ -585,7 +590,7 @@ bool CheckMergedJoin(const MergedCase& c) {
     dp::PairScratch pair_scratch2;
     const dp::DpResult join_exit = dp::JoinPair<false, false>(
       anchor2, partner2, nullptr, nullptr, anchor_is_slot0, c.slop, c.expected,
-      /*enforce_uniqueness=*/true, pair_scratch2, nullptr);
+      c.same_group, pair_scratch2, nullptr);
     if (join_exit.any != ref.any) {
       std::printf(
         "MISMATCH MergedJoin(filter).any (anchor_slot0=%d)\n"
@@ -754,6 +759,7 @@ MergedCase RandomMergedCase(std::mt19937_64& rng) {
   c.expected = (roll < 3) ? 1u : (roll == 3 ? 2u : 3u);
   std::uniform_int_distribution<value_t> slop_dist(0, 6);
   c.slop = slop_dist(rng);
+  c.same_group = (rng() % 2) == 0;
   return c;
 }
 
@@ -788,6 +794,11 @@ int RunMergedEdgeCases() {
   // Cross-slot same position: strict uniqueness drops the (1, 1) pair.
   check({.subs = {{{{1}}, {{1}}}}, .expected = 1, .slop = 3},
         "cross_slot_same_position");
+  // Same shape, disjoint term sets: the (1, 1) pair is legal at cost 1
+  // (ES-verified a2 corner).
+  check(
+    {.subs = {{{{1}}, {{1}}}}, .expected = 1, .slop = 3, .same_group = false},
+    "cross_slot_same_position_disjoint");
 
   if (failures == 0) {
     std::printf("merged edge cases: OK\n");

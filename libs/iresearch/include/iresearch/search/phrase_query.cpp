@@ -341,6 +341,11 @@ DocIterator::ptr VariadicPhraseQuery::execute(
     auto& pos = positions[i];
     pos.second = *position;
 
+    if (this->slop > 0) {
+      SDB_ASSERT(phrase_state->term_groups.size() == phrase_size);
+      pos.second.term_group = phrase_state->term_groups[i];
+    }
+
     std::vector<Adapter> disj_itrs;
     disj_itrs.reserve(num_terms);
     for (const auto end = term_state + num_terms; term_state != end;
@@ -480,6 +485,9 @@ DocIterator::ptr VariadicPhraseQuery::ExecuteWithOffsets(
       const auto num_terms = phrase_state->num_terms[i];
       auto& pos = positions[i];
       pos.second = *position;
+
+      SDB_ASSERT(phrase_state->term_groups.size() == phrase_size);
+      pos.second.term_group = phrase_state->term_groups[i];
 
       std::vector<Adapter> disj_itrs;
       disj_itrs.reserve(num_terms);
