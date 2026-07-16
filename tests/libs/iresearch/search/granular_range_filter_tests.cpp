@@ -169,11 +169,9 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       q.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       q.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = q.prepare({
-        .index = irs::SubReader::empty(),
-        .memory = counter,
-      });
-      ASSERT_EQ(irs::kNoBoost, prepared->Boost());
+      tests::PreparedFilter prepared{q, irs::SubReader::empty(), nullptr,
+                                     counter};
+      ASSERT_EQ(irs::kNoBoost, prepared.Query(0)->Boost());
     }
     EXPECT_EQ(counter.current, 0);
     EXPECT_GT(counter.max, 0);
@@ -195,8 +193,8 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       q.mutable_options()->is_granular = false;
       q.boost(boost);
 
-      auto prepared = q.prepare({.index = segment});
-      ASSERT_EQ(boost, prepared->Boost());
+      tests::PreparedFilter prepared{q, segment};
+      ASSERT_EQ(boost, prepared.Query(0)->Boost());
     }
   }
 
@@ -230,16 +228,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       ASSERT_EQ(2, query.options().range.min.size());
       ASSERT_EQ(2, query.options().range.max.size());
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{1, 2, 3};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -263,16 +262,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       ASSERT_EQ(2, query.options().range.min.size());
       ASSERT_EQ(2, query.options().range.max.size());
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{1, 2, 3, 11, 12};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -292,16 +292,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{1, 2, 3, 4, 5, 6, 7, 10, 11, 12};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -319,16 +320,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Exclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{3, 4, 5, 6, 7, 8};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -343,16 +345,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       irs::SetGranularTerm(query.mutable_options()->range.min, min_stream);
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{2, 3, 4, 5, 6, 7, 8};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -367,16 +370,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       irs::SetGranularTerm(query.mutable_options()->range.min, min_stream);
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{8};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -395,16 +399,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Exclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{1, 2, 3, 4, 9, 10, 11, 12};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -419,16 +424,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       irs::SetGranularTerm(query.mutable_options()->range.max, max_stream);
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{1, 2, 3, 4, 5, 9, 10, 11, 12};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -438,17 +444,18 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       irs::ByGranularRange query;
       *query.mutable_field_id() = kValue;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{1, 2, 3, 4,  5,  6,
                                           7, 8, 9, 10, 11, 12};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -484,16 +491,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{8};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -517,16 +525,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{2, 3, 4, 5, 6, 7, 8};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -547,16 +556,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{32};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -577,16 +587,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Exclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{30, 31, 32};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -607,16 +618,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{32};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -637,16 +649,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{1, 2, 3, 4, 5, 6};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -670,16 +683,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{8};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -703,16 +717,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{2, 3, 4, 5, 6, 7, 8};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -733,16 +748,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{32};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -763,16 +779,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Exclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{30, 31, 32};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -793,16 +810,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{32};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -823,16 +841,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{1, 2, 3, 4, 5, 6};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -856,16 +875,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{3, 8};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -889,16 +909,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Exclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{1, 2, 5, 7, 9, 10, 12};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -919,16 +940,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{32};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -948,16 +970,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Exclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{4, 11, 13, 14, 15, 16, 17};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -977,16 +1000,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Exclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{1, 2, 3, 5, 6, 7, 8, 9, 10, 12};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -1006,16 +1030,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{32};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -1038,16 +1063,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{3, 8};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -1070,16 +1096,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Exclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{4, 11, 13, 14, 15, 16, 17};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -1100,16 +1127,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{32};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -1130,16 +1158,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Exclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Exclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{14, 15, 17};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -1159,16 +1188,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Exclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{1, 2, 3, 5, 6, 7, 8, 9, 10, 12, 13};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -1188,16 +1218,17 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{32};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -1227,7 +1258,7 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       *query.mutable_field_id() = kName;
       query.mutable_options()->is_granular = false;
 
-      CheckQuery(query, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(query), docs, costs, rdr);
     }
 
     // invalid_name = (..;..)
@@ -1236,7 +1267,7 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       *query.mutable_field_id() = kInvalidName;
       query.mutable_options()->is_granular = false;
 
-      CheckQuery(query, Docs{}, rdr);
+      CheckQuery(*tests::Optimized(query), Docs{}, rdr);
     }
 
     // name = [A;..)
@@ -1254,7 +1285,7 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Exclusive;
       query.mutable_options()->is_granular = false;
 
-      CheckQuery(query, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(query), docs, costs, rdr);
     }
 
     // name = (A;..)
@@ -1272,7 +1303,7 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->is_granular = false;
 
-      CheckQuery(query, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(query), docs, costs, rdr);
     }
 
     // name = (..;C)
@@ -1289,7 +1320,7 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.max_type = irs::BoundType::Exclusive;
       query.mutable_options()->is_granular = false;
 
-      CheckQuery(query, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(query), docs, costs, rdr);
     }
 
     // name = (..;C]
@@ -1306,7 +1337,7 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
       query.mutable_options()->is_granular = false;
 
-      CheckQuery(query, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(query), docs, costs, rdr);
     }
 
     // name = [A;C]
@@ -1327,7 +1358,7 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
       query.mutable_options()->is_granular = false;
 
-      CheckQuery(query, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(query), docs, costs, rdr);
     }
 
     // name = [A;B]
@@ -1348,7 +1379,7 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
       query.mutable_options()->is_granular = false;
 
-      CheckQuery(query, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(query), docs, costs, rdr);
     }
 
     // name = [A;B)
@@ -1369,7 +1400,7 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.max_type = irs::BoundType::Exclusive;
       query.mutable_options()->is_granular = false;
 
-      CheckQuery(query, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(query), docs, costs, rdr);
     }
 
     // name = (A;B]
@@ -1390,7 +1421,7 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
       query.mutable_options()->is_granular = false;
 
-      CheckQuery(query, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(query), docs, costs, rdr);
     }
 
     // name = (A;B)
@@ -1408,7 +1439,7 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.max_type = irs::BoundType::Exclusive;
       query.mutable_options()->is_granular = false;
 
-      CheckQuery(query, Docs{}, Costs{0}, rdr);
+      CheckQuery(*tests::Optimized(query), Docs{}, Costs{0}, rdr);
     }
 
     // name = [A;C)
@@ -1429,7 +1460,7 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.max_type = irs::BoundType::Exclusive;
       query.mutable_options()->is_granular = false;
 
-      CheckQuery(query, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(query), docs, costs, rdr);
     }
 
     // name = (A;C]
@@ -1450,7 +1481,7 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
       query.mutable_options()->is_granular = false;
 
-      CheckQuery(query, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(query), docs, costs, rdr);
     }
 
     // name = (A;C)
@@ -1471,7 +1502,7 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.max_type = irs::BoundType::Exclusive;
       query.mutable_options()->is_granular = false;
 
-      CheckQuery(query, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(query), docs, costs, rdr);
     }
 
     // name = [C;A]
@@ -1489,7 +1520,7 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
       query.mutable_options()->is_granular = false;
 
-      CheckQuery(query, Docs{}, Costs{0}, rdr);
+      CheckQuery(*tests::Optimized(query), Docs{}, Costs{0}, rdr);
     }
 
     // name = [~;..]
@@ -1506,7 +1537,7 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->is_granular = false;
 
-      CheckQuery(query, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(query), docs, costs, rdr);
     }
 
     // name = (~;..]
@@ -1520,7 +1551,7 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Exclusive;
       query.mutable_options()->is_granular = false;
 
-      CheckQuery(query, Docs{}, Costs{0}, rdr);
+      CheckQuery(*tests::Optimized(query), Docs{}, Costs{0}, rdr);
     }
 
     // name = (a;..]
@@ -1537,7 +1568,7 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Exclusive;
       query.mutable_options()->is_granular = false;
 
-      CheckQuery(query, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(query), docs, costs, rdr);
     }
 
     // name = [..;a]
@@ -1555,7 +1586,7 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.max_type = irs::BoundType::Inclusive;
       query.mutable_options()->is_granular = false;
 
-      CheckQuery(query, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(query), docs, costs, rdr);
     }
 
     // name = [..;a)
@@ -1573,7 +1604,7 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.max_type = irs::BoundType::Exclusive;
       query.mutable_options()->is_granular = false;
 
-      CheckQuery(query, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(query), docs, costs, rdr);
     }
 
     // name = [DEL;..]
@@ -1587,7 +1618,7 @@ class GranularRangeFilterTestCase : public tests::FilterTestCaseBase {
       query.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       query.mutable_options()->is_granular = false;
 
-      CheckQuery(query, Docs{}, Costs{0}, rdr);
+      CheckQuery(*tests::Optimized(query), Docs{}, Costs{0}, rdr);
     }
   }
 };
@@ -1729,8 +1760,8 @@ TEST(by_granular_range_test, boost) {
     q.mutable_options()->range.min_type = irs::BoundType::Inclusive;
     q.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-    auto prepared = q.prepare({.index = irs::SubReader::empty()});
-    ASSERT_EQ(irs::kNoBoost, prepared->Boost());
+    tests::PreparedFilter prepared{q, irs::SubReader::empty()};
+    ASSERT_EQ(irs::kNoBoost, prepared.Query(0)->Boost());
   }
 
   // with boost, empty query
@@ -1748,8 +1779,8 @@ TEST(by_granular_range_test, boost) {
     q.mutable_options()->range.max_type = irs::BoundType::Inclusive;
     q.boost(boost);
 
-    auto prepared = q.prepare({.index = irs::SubReader::empty()});
-    ASSERT_EQ(irs::kNoBoost, prepared->Boost());
+    tests::PreparedFilter prepared{q, irs::SubReader::empty()};
+    ASSERT_EQ(boost, prepared.Query(0)->Boost());
   }
 }
 
@@ -1812,7 +1843,7 @@ TEST_P(GranularRangeFilterTestCase, by_range_order) {
     q.mutable_options()->range.min_type = irs::BoundType::Exclusive;
     q.mutable_options()->range.max_type = irs::BoundType::Exclusive;
 
-    CheckQuery(q, scorers, docs, rdr, false);
+    CheckQuery(*tests::Optimized(q), scorers, docs, rdr, false);
     ASSERT_EQ(0, field_docs);
     ASSERT_EQ(0, finish_count);
   }
@@ -1871,7 +1902,7 @@ TEST_P(GranularRangeFilterTestCase, by_range_order) {
     q.mutable_options()->range.min_type = irs::BoundType::Exclusive;
     q.mutable_options()->range.max_type = irs::BoundType::Exclusive;
 
-    CheckQuery(q, order, docs, rdr);
+    CheckQuery(*tests::Optimized(q), order, docs, rdr);
   }
 
   // value = (..;..) + scored_terms_limit
@@ -1891,7 +1922,7 @@ TEST_P(GranularRangeFilterTestCase, by_range_order) {
     q.mutable_options()->range.max_type = irs::BoundType::Exclusive;
     q.mutable_options()->scored_terms_limit = 2;
 
-    CheckQuery(q, order, docs, rdr);
+    CheckQuery(*tests::Optimized(q), order, docs, rdr);
   }
 
   // value = (..;100)
@@ -1915,7 +1946,7 @@ TEST_P(GranularRangeFilterTestCase, by_range_order) {
     q.mutable_options()->range.min_type = irs::BoundType::Exclusive;
     q.mutable_options()->range.max_type = irs::BoundType::Exclusive;
 
-    CheckQuery(q, order, docs, rdr);
+    CheckQuery(*tests::Optimized(q), order, docs, rdr);
   }
 }
 
@@ -1976,7 +2007,7 @@ TEST_P(GranularRangeFilterTestCase, by_range_order_multiple_sorts) {
     irs::SetGranularTerm(q.mutable_options()->range.min, min_stream);
     q.mutable_options()->range.min_type = irs::BoundType::Inclusive;
 
-    CheckQuery(q, order, docs, rdr);
+    CheckQuery(*tests::Optimized(q), order, docs, rdr);
   }
 }
 
@@ -2074,16 +2105,16 @@ TEST_P(GranularRangeFilterTestCase, by_range_numeric_sequence) {
     query.mutable_options()->range.min_type = irs::BoundType::Exclusive;
     query.mutable_options()->range.max_type = irs::BoundType::Exclusive;
 
-    auto prepared = query.prepare({.index = reader});
-    ASSERT_NE(nullptr, prepared);
+    tests::PreparedFilter prepared{query, reader};
+    ASSERT_NE(nullptr, prepared.Query(0));
     const auto* column = segment.Column(kKey);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{segment, *column};
 
     std::set<std::string> actual;
 
-    auto docs = prepared->execute({.segment = segment});
-    while (docs->next()) {
+    auto docs = prepared.Execute(0);
+    while (!irs::doc_limits::eof(docs->advance())) {
       const auto doc = docs->value();
       const auto bytes = values.Get(doc);
       irs::BytesViewInput in;
@@ -2123,16 +2154,16 @@ TEST_P(GranularRangeFilterTestCase, by_range_numeric_sequence) {
     irs::SetGranularTerm(query.mutable_options()->range.max, max_stream);
     query.mutable_options()->range.max_type = irs::BoundType::Exclusive;
 
-    auto prepared = query.prepare({.index = reader});
-    ASSERT_NE(nullptr, prepared);
+    tests::PreparedFilter prepared{query, reader};
+    ASSERT_NE(nullptr, prepared.Query(0));
     const auto* column = segment.Column(kKey);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{segment, *column};
 
     std::set<std::string> actual;
 
-    auto docs = prepared->execute({.segment = segment});
-    while (docs->next()) {
+    auto docs = prepared.Execute(0);
+    while (!irs::doc_limits::eof(docs->advance())) {
       const auto doc = docs->value();
       const auto bytes = values.Get(doc);
       irs::BytesViewInput in;
@@ -2175,16 +2206,16 @@ TEST_P(GranularRangeFilterTestCase, by_range_numeric_sequence) {
     query.mutable_options()->range.min_type = irs::BoundType::Exclusive;
     query.mutable_options()->range.max_type = irs::BoundType::Exclusive;
 
-    auto prepared = query.prepare({.index = reader});
-    ASSERT_NE(nullptr, prepared);
+    tests::PreparedFilter prepared{query, reader};
+    ASSERT_NE(nullptr, prepared.Query(0));
     const auto* column = segment.Column(kKey);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{segment, *column};
 
     std::set<std::string> actual;
 
-    auto docs = prepared->execute({.segment = segment});
-    while (docs->next()) {
+    auto docs = prepared.Execute(0);
+    while (!irs::doc_limits::eof(docs->advance())) {
       const auto doc = docs->value();
       const auto bytes = values.Get(doc);
       irs::BytesViewInput in;
@@ -2224,16 +2255,16 @@ TEST_P(GranularRangeFilterTestCase, by_range_numeric_sequence) {
     irs::SetGranularTerm(query.mutable_options()->range.min, min_stream);
     query.mutable_options()->range.min_type = irs::BoundType::Exclusive;
 
-    auto prepared = query.prepare({.index = reader});
-    ASSERT_NE(nullptr, prepared);
+    tests::PreparedFilter prepared{query, reader};
+    ASSERT_NE(nullptr, prepared.Query(0));
     const auto* column = segment.Column(kKey);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{segment, *column};
 
     std::set<std::string> actual;
 
-    auto docs = prepared->execute({.segment = segment});
-    while (docs->next()) {
+    auto docs = prepared.Execute(0);
+    while (!irs::doc_limits::eof(docs->advance())) {
       const auto doc = docs->value();
       const auto bytes = values.Get(doc);
       irs::BytesViewInput in;
@@ -2242,44 +2273,6 @@ TEST_P(GranularRangeFilterTestCase, by_range_numeric_sequence) {
     }
     ASSERT_EQ(expected, actual);
   }
-}
-
-TEST_P(GranularRangeFilterTestCase, visit) {
-  // add segment
-  {
-    tests::JsonDocGenerator gen(resource("simple_sequential.json"),
-                                &ByRangeJsonFieldFactory);
-
-    add_segment(gen, irs::kOmCreate);
-  }
-
-  tests::EmptyFilterVisitor visitor;
-  irs::ByGranularRange::options_type opts;
-  opts.is_granular = false;
-  auto& rng = opts.range;
-  rng.min = {static_cast<irs::bstring>(
-    irs::ViewCast<irs::byte_type>(std::string_view("abc")))};
-  rng.max = {static_cast<irs::bstring>(
-    irs::ViewCast<irs::byte_type>(std::string_view("abcd")))};
-  rng.min_type = irs::BoundType::Inclusive;
-  rng.max_type = irs::BoundType::Inclusive;
-
-  // read segment
-  auto index = open_reader();
-  ASSERT_EQ(1, index.size());
-  auto& segment = index[0];
-  // get term dictionary for field
-  const auto* reader = segment.field(kPrefix);
-  ASSERT_TRUE(reader != nullptr);
-
-  irs::ByGranularRange::visit(segment, *reader, opts, visitor);
-  ASSERT_EQ(2, visitor.prepare_calls_counter());
-  ASSERT_EQ(2, visitor.visit_calls_counter());
-  ASSERT_EQ((std::vector<std::pair<std::string_view, irs::score_t>>{
-              {"abc", irs::kNoBoost}, {"abcd", irs::kNoBoost}}),
-            visitor.term_refs<char>());
-
-  visitor.reset();
 }
 
 static constexpr auto kTestDirs = tests::GetDirectories<tests::kTypesDefault>();

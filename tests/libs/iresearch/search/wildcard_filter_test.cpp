@@ -22,6 +22,8 @@
 
 #include "filter_test_case_base.hpp"
 #include "iresearch/search/all_filter.hpp"
+#include "iresearch/search/automaton_filter.hpp"
+#include "iresearch/search/filter_optimizer.hpp"
 #include "iresearch/search/multiterm_query.hpp"
 #include "iresearch/search/prefix_filter.hpp"
 #include "iresearch/search/term_filter.hpp"
@@ -67,10 +69,14 @@ Filter MakeFilter(irs::field_id field, std::string_view term) {
   return q;
 }
 
-// Resolves a wildcard pattern into its concrete filter (ByTerm / ByPrefix /
-// ByWildcard), mirroring how callers build wildcard filters in production.
+// Resolves a wildcard pattern into its concrete executable filter
+// (ByTerm / ByPrefix / AutomatonFilter), mirroring how callers build and
+// optimize wildcard filters in production.
 irs::Filter::ptr MakeWildcard(irs::field_id field, std::string_view term) {
-  return irs::CreateByWildcard(field, irs::ViewCast<irs::byte_type>(term));
+  auto filter =
+    irs::CreateByWildcard(field, irs::ViewCast<irs::byte_type>(term));
+  irs::Optimize(filter);
+  return filter;
 }
 
 }  // namespace
@@ -106,13 +112,11 @@ TEST(by_wildcard_test, boost) {
 
   // no boost
   {
-    irs::ByWildcard q = MakeFilter(kFieldId, "bar*");
+    irs::Filter::ptr q = MakeWildcard(kFieldId, "bar*");
 
-    auto prepared = q.prepare({
-      .index = irs::SubReader::empty(),
-      .memory = counter,
-    });
-    ASSERT_EQ(irs::kNoBoost, prepared->Boost());
+    tests::PreparedFilter prepared{*q, irs::SubReader::empty(), nullptr,
+                                   counter};
+    ASSERT_EQ(irs::kNoBoost, prepared.Query(0)->Boost());
   }
   EXPECT_EQ(counter.current, 0);
   EXPECT_GT(counter.max, 0);
@@ -122,14 +126,14 @@ TEST(by_wildcard_test, boost) {
   {
     irs::score_t boost = 1.5f;
 
-    irs::ByWildcard q = MakeFilter(kFieldId, "bar*");
-    q.boost(boost);
+    irs::Filter::ptr q = irs::CreateByWildcard(
+      kFieldId, irs::ViewCast<irs::byte_type>(std::string_view("bar*")), 1024,
+      boost);
+    irs::Optimize(q);
 
-    auto prepared = q.prepare({
-      .index = irs::SubReader::empty(),
-      .memory = counter,
-    });
-    ASSERT_EQ(boost, prepared->Boost());
+    tests::PreparedFilter prepared{*q, irs::SubReader::empty(), nullptr,
+                                   counter};
+    ASSERT_EQ(boost, prepared.Query(0)->Boost());
   }
   EXPECT_EQ(counter.current, 0);
   EXPECT_GT(counter.max, 0);
@@ -141,18 +145,12 @@ TEST(by_wildcard_test, test_type_of_prepared_query) {
 
   // term query
   {
-    auto lhs = MakeFilter<irs::ByTerm>(kFooId, "bar")
-                 .prepare({
-                   .index = irs::SubReader::empty(),
-                   .memory = counter,
-                 });
-    auto rhs = MakeWildcard(kFooId, "bar")
-                 ->prepare({
-                   .index = irs::SubReader::empty(),
-                   .memory = counter,
-                 });
-    auto& lhs_ref = *lhs;
-    auto& rhs_ref = *rhs;
+    tests::PreparedFilter lhs{MakeFilter<irs::ByTerm>(kFooId, "bar"),
+                              irs::SubReader::empty(), nullptr, counter};
+    tests::PreparedFilter rhs{*tests::Optimized(MakeFilter(kFooId, "bar")),
+                              irs::SubReader::empty(), nullptr, counter};
+    auto& lhs_ref = *lhs.Query(0);
+    auto& rhs_ref = *rhs.Query(0);
     ASSERT_EQ(typeid(lhs_ref), typeid(rhs_ref));
   }
   EXPECT_EQ(counter.current, 0);
@@ -161,18 +159,12 @@ TEST(by_wildcard_test, test_type_of_prepared_query) {
 
   // term query
   {
-    auto lhs = MakeFilter<irs::ByTerm>(kFooId, "")
-                 .prepare({
-                   .index = irs::SubReader::empty(),
-                   .memory = counter,
-                 });
-    auto rhs = MakeWildcard(kFooId, "")
-                 ->prepare({
-                   .index = irs::SubReader::empty(),
-                   .memory = counter,
-                 });
-    auto& lhs_ref = *lhs;
-    auto& rhs_ref = *rhs;
+    tests::PreparedFilter lhs{MakeFilter<irs::ByTerm>(kFooId, ""),
+                              irs::SubReader::empty(), nullptr, counter};
+    tests::PreparedFilter rhs{*tests::Optimized(MakeFilter(kFooId, "")),
+                              irs::SubReader::empty(), nullptr, counter};
+    auto& lhs_ref = *lhs.Query(0);
+    auto& rhs_ref = *rhs.Query(0);
     ASSERT_EQ(typeid(lhs_ref), typeid(rhs_ref));
   }
   EXPECT_EQ(counter.current, 0);
@@ -181,18 +173,12 @@ TEST(by_wildcard_test, test_type_of_prepared_query) {
 
   // term query
   {
-    auto lhs = MakeFilter<irs::ByTerm>(kFooId, "foo%")
-                 .prepare({
-                   .index = irs::SubReader::empty(),
-                   .memory = counter,
-                 });
-    auto rhs = MakeWildcard(kFooId, "foo\\%")
-                 ->prepare({
-                   .index = irs::SubReader::empty(),
-                   .memory = counter,
-                 });
-    auto& lhs_ref = *lhs;
-    auto& rhs_ref = *rhs;
+    tests::PreparedFilter lhs{MakeFilter<irs::ByTerm>(kFooId, "foo%"),
+                              irs::SubReader::empty(), nullptr, counter};
+    tests::PreparedFilter rhs{*tests::Optimized(MakeFilter(kFooId, "foo\\%")),
+                              irs::SubReader::empty(), nullptr, counter};
+    auto& lhs_ref = *lhs.Query(0);
+    auto& rhs_ref = *rhs.Query(0);
     ASSERT_EQ(typeid(lhs_ref), typeid(rhs_ref));
   }
   EXPECT_EQ(counter.current, 0);
@@ -201,18 +187,12 @@ TEST(by_wildcard_test, test_type_of_prepared_query) {
 
   // prefix query
   {
-    auto lhs = MakeFilter<irs::ByPrefix>(kFooId, "bar")
-                 .prepare({
-                   .index = irs::SubReader::empty(),
-                   .memory = counter,
-                 });
-    auto rhs = MakeWildcard(kFooId, "bar%")
-                 ->prepare({
-                   .index = irs::SubReader::empty(),
-                   .memory = counter,
-                 });
-    auto& lhs_ref = *lhs;
-    auto& rhs_ref = *rhs;
+    tests::PreparedFilter lhs{MakeFilter<irs::ByPrefix>(kFooId, "bar"),
+                              irs::SubReader::empty(), nullptr, counter};
+    tests::PreparedFilter rhs{*tests::Optimized(MakeFilter(kFooId, "bar%")),
+                              irs::SubReader::empty(), nullptr, counter};
+    auto& lhs_ref = *lhs.Query(0);
+    auto& rhs_ref = *rhs.Query(0);
     ASSERT_EQ(typeid(lhs_ref), typeid(rhs_ref));
   }
   EXPECT_EQ(counter.current, 0);
@@ -221,18 +201,12 @@ TEST(by_wildcard_test, test_type_of_prepared_query) {
 
   // prefix query
   {
-    auto lhs = MakeFilter<irs::ByPrefix>(kFooId, "bar")
-                 .prepare({
-                   .index = irs::SubReader::empty(),
-                   .memory = counter,
-                 });
-    auto rhs = MakeWildcard(kFooId, "bar%%")
-                 ->prepare({
-                   .index = irs::SubReader::empty(),
-                   .memory = counter,
-                 });
-    auto& lhs_ref = *lhs;
-    auto& rhs_ref = *rhs;
+    tests::PreparedFilter lhs{MakeFilter<irs::ByPrefix>(kFooId, "bar"),
+                              irs::SubReader::empty(), nullptr, counter};
+    tests::PreparedFilter rhs{*tests::Optimized(MakeFilter(kFooId, "bar%%")),
+                              irs::SubReader::empty(), nullptr, counter};
+    auto& lhs_ref = *lhs.Query(0);
+    auto& rhs_ref = *rhs.Query(0);
     ASSERT_EQ(typeid(lhs_ref), typeid(rhs_ref));
   }
   EXPECT_EQ(counter.current, 0);
@@ -241,18 +215,12 @@ TEST(by_wildcard_test, test_type_of_prepared_query) {
 
   // term query
   {
-    auto lhs = MakeFilter<irs::ByTerm>(kFooId, "bar%")
-                 .prepare({
-                   .index = irs::SubReader::empty(),
-                   .memory = counter,
-                 });
-    auto rhs = MakeWildcard(kFooId, "bar\\%")
-                 ->prepare({
-                   .index = irs::SubReader::empty(),
-                   .memory = counter,
-                 });
-    auto& lhs_ref = *lhs;
-    auto& rhs_ref = *rhs;
+    tests::PreparedFilter lhs{MakeFilter<irs::ByTerm>(kFooId, "bar%"),
+                              irs::SubReader::empty(), nullptr, counter};
+    tests::PreparedFilter rhs{*tests::Optimized(MakeFilter(kFooId, "bar\\%")),
+                              irs::SubReader::empty(), nullptr, counter};
+    auto& lhs_ref = *lhs.Query(0);
+    auto& rhs_ref = *rhs.Query(0);
     ASSERT_EQ(typeid(lhs_ref), typeid(rhs_ref));
   }
   EXPECT_EQ(counter.current, 0);
@@ -261,18 +229,12 @@ TEST(by_wildcard_test, test_type_of_prepared_query) {
 
   // all query
   {
-    auto lhs = MakeFilter<irs::ByPrefix>(kFooId, "")
-                 .prepare({
-                   .index = irs::SubReader::empty(),
-                   .memory = counter,
-                 });
-    auto rhs = MakeWildcard(kFooId, "%")
-                 ->prepare({
-                   .index = irs::SubReader::empty(),
-                   .memory = counter,
-                 });
-    auto& lhs_ref = *lhs;
-    auto& rhs_ref = *rhs;
+    tests::PreparedFilter lhs{MakeFilter<irs::ByPrefix>(kFooId, ""),
+                              irs::SubReader::empty(), nullptr, counter};
+    tests::PreparedFilter rhs{*tests::Optimized(MakeFilter(kFooId, "%")),
+                              irs::SubReader::empty(), nullptr, counter};
+    auto& lhs_ref = *lhs.Query(0);
+    auto& rhs_ref = *rhs.Query(0);
     ASSERT_EQ(typeid(lhs_ref), typeid(rhs_ref));
   }
   EXPECT_EQ(counter.current, 0);
@@ -281,18 +243,12 @@ TEST(by_wildcard_test, test_type_of_prepared_query) {
 
   // all query
   {
-    auto lhs = MakeFilter<irs::ByPrefix>(kFooId, "")
-                 .prepare({
-                   .index = irs::SubReader::empty(),
-                   .memory = counter,
-                 });
-    auto rhs = MakeWildcard(kFooId, "%%")
-                 ->prepare({
-                   .index = irs::SubReader::empty(),
-                   .memory = counter,
-                 });
-    auto& lhs_ref = *lhs;
-    auto& rhs_ref = *rhs;
+    tests::PreparedFilter lhs{MakeFilter<irs::ByPrefix>(kFooId, ""),
+                              irs::SubReader::empty(), nullptr, counter};
+    tests::PreparedFilter rhs{*tests::Optimized(MakeFilter(kFooId, "%%")),
+                              irs::SubReader::empty(), nullptr, counter};
+    auto& lhs_ref = *lhs.Query(0);
+    auto& rhs_ref = *rhs.Query(0);
     ASSERT_EQ(typeid(lhs_ref), typeid(rhs_ref));
   }
   EXPECT_EQ(counter.current, 0);
@@ -301,18 +257,12 @@ TEST(by_wildcard_test, test_type_of_prepared_query) {
 
   // term query
   {
-    auto lhs = MakeFilter<irs::ByTerm>(kFooId, "%")
-                 .prepare({
-                   .index = irs::SubReader::empty(),
-                   .memory = counter,
-                 });
-    auto rhs = MakeWildcard(kFooId, "\\%")
-                 ->prepare({
-                   .index = irs::SubReader::empty(),
-                   .memory = counter,
-                 });
-    auto& lhs_ref = *lhs;
-    auto& rhs_ref = *rhs;
+    tests::PreparedFilter lhs{MakeFilter<irs::ByTerm>(kFooId, "%"),
+                              irs::SubReader::empty(), nullptr, counter};
+    tests::PreparedFilter rhs{*tests::Optimized(MakeFilter(kFooId, "\\%")),
+                              irs::SubReader::empty(), nullptr, counter};
+    auto& lhs_ref = *lhs.Query(0);
+    auto& rhs_ref = *rhs.Query(0);
     ASSERT_EQ(typeid(lhs_ref), typeid(rhs_ref));
   }
   EXPECT_EQ(counter.current, 0);
@@ -596,7 +546,7 @@ TEST_P(WildcardFilterTestCase, visit) {
     auto term = irs::ViewCast<irs::byte_type>(std::string_view("abc"));
     tests::EmptyFilterVisitor visitor;
     auto automaton = irs::FromWildcard(term);
-    auto field_visitor = irs::ByWildcard::visitor(automaton);
+    auto field_visitor = irs::AutomatonFilter::visitor(automaton);
     ASSERT_TRUE(field_visitor);
     field_visitor(segment, *reader, visitor);
     ASSERT_EQ(1, visitor.prepare_calls_counter());
@@ -613,7 +563,7 @@ TEST_P(WildcardFilterTestCase, visit) {
     auto prefix = irs::ViewCast<irs::byte_type>(std::string_view("ab%"));
     tests::EmptyFilterVisitor visitor;
     auto automaton = irs::FromWildcard(prefix);
-    auto field_visitor = irs::ByWildcard::visitor(automaton);
+    auto field_visitor = irs::AutomatonFilter::visitor(automaton);
     ASSERT_TRUE(field_visitor);
     field_visitor(segment, *reader, visitor);
     ASSERT_EQ(1, visitor.prepare_calls_counter());
@@ -634,7 +584,7 @@ TEST_P(WildcardFilterTestCase, visit) {
     auto wildcard = irs::ViewCast<irs::byte_type>(std::string_view("a_c%"));
     tests::EmptyFilterVisitor visitor;
     auto automaton = irs::FromWildcard(wildcard);
-    auto field_visitor = irs::ByWildcard::visitor(automaton);
+    auto field_visitor = irs::AutomatonFilter::visitor(automaton);
     ASSERT_TRUE(field_visitor);
     field_visitor(segment, *reader, visitor);
     ASSERT_EQ(1, visitor.prepare_calls_counter());

@@ -25,6 +25,7 @@
 #include <duckdb/common/enums/compression_type.hpp>
 #include <duckdb/storage/storage_info.hpp>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string_view>
 
@@ -33,27 +34,51 @@
 
 namespace irs {
 
-enum class HNSWMetric : uint8_t {
+enum class VectorMetric : uint8_t {
   L2Sqr = 0,
-  NegativeIP,
+  InnerProduct,
   Cosine,
   L1,
 };
 
-struct HNSWInfo {
-  doc_id_t max_doc = 0;
+enum class VectorQuantization : uint8_t {
+  None = 0,
+  SQ8,
+  SQ4,
+  PQ,
+  RaBitQ,
+};
+
+inline constexpr uint32_t kRaBitQMinBits = 1;
+inline constexpr uint32_t kRaBitQMaxBits = 9;
+
+struct IvfInfo {
+  struct Quantizer {
+    VectorQuantization kind = VectorQuantization::None;
+    uint32_t pq_m = 0;
+    uint32_t nb_bits = 0;
+
+    friend bool operator==(const Quantizer&, const Quantizer&) = default;
+  };
+
+  field_id centroids_id = field_limits::invalid();
+  field_id postings_id = field_limits::invalid();
 
   // dimensionality of the data
   int d = 0;
 
-  // HNSW M parameter
-  int m = 32;
+  VectorMetric metric = VectorMetric::L2Sqr;
+  Quantizer quant;
 
-  // HNSW metric
-  HNSWMetric metric = HNSWMetric::L2Sqr;
+  uint32_t nlist = 0;
 
-  // expansion factor at construction time
-  int ef_construction = 40;
+  float nlist_factor = 0;
+
+  uint32_t train_sample = 0;
+
+  uint32_t cluster_iters = 0;
+
+  friend bool operator==(const IvfInfo&, const IvfInfo&) = default;
 };
 
 struct ColumnOptions {
@@ -61,7 +86,8 @@ struct ColumnOptions {
   uint32_t row_group_size = DEFAULT_ROW_GROUP_SIZE;
   duckdb::CompressionType compression =
     duckdb::CompressionType::COMPRESSION_AUTO;
-  std::optional<HNSWInfo> hnsw_info;
+  std::optional<IvfInfo> ivf_info;
+  bool hyperloglog = false;
 };
 
 using ColumnOptionsProvider = std::function<ColumnOptions(field_id)>;
@@ -72,5 +98,54 @@ struct NormColumnOptions {
 };
 
 using NormColumnOptionsProvider = std::function<NormColumnOptions(field_id)>;
+
+// Per-column encoding config the writer consults at flush + merge time. The
+// host supplies one per operation, so a long-lived writer is never coupled to
+// its mutable metadata.
+class IndexFieldOptions {
+ public:
+  virtual ~IndexFieldOptions() = default;
+  virtual ColumnOptions GetColumnOptions(field_id id) const = 0;
+  virtual NormColumnOptions GetNormColumnOptions(field_id id) const = 0;
+
+  // Segment reuse gate: two writes share a segment only if their options are
+  // equal (a segment must not mix encodings). Default is pointer identity --
+  // COW means an unchanged config is the same object.
+  virtual bool EqualOptions(const IndexFieldOptions& other) const noexcept {
+    return this == &other;
+  }
+};
+
+// May `next` resume a segment opened under `prev`? nullptr `next` is the
+// fallback path that never varies, so it always matches.
+inline bool CompatibleFieldOptions(const IndexFieldOptions* prev,
+                                   const IndexFieldOptions* next) noexcept {
+  if (next == nullptr || prev == next) {
+    return true;
+  }
+  return prev != nullptr && prev->EqualOptions(*next);
+}
+
+// Adapts the std::function providers to IndexFieldOptions; the writer's
+// fallback.
+class FunctionFieldOptions final : public IndexFieldOptions {
+ public:
+  FunctionFieldOptions(ColumnOptionsProvider column_options,
+                       NormColumnOptionsProvider norm_column_options) noexcept
+    : _column_options{std::move(column_options)},
+      _norm_column_options{std::move(norm_column_options)} {}
+
+  ColumnOptions GetColumnOptions(field_id id) const final {
+    return _column_options ? _column_options(id) : ColumnOptions{};
+  }
+  NormColumnOptions GetNormColumnOptions(field_id id) const final {
+    return _norm_column_options ? _norm_column_options(id)
+                                : NormColumnOptions{};
+  }
+
+ private:
+  ColumnOptionsProvider _column_options;
+  NormColumnOptionsProvider _norm_column_options;
+};
 
 }  // namespace irs

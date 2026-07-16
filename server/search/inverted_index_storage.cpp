@@ -45,16 +45,14 @@
 #include "basics/assert.h"
 #include "basics/down_cast.h"
 #include "basics/duckdb_engine.h"
-#include "basics/errors.h"
-#include "basics/exceptions.h"
 #include "basics/log.h"
 #include "basics/serializer.h"
 #include "basics/system-compiler.h"
 #include "catalog/catalog.h"
 #include "catalog/scorer_options.h"
 #include "catalog/store/store.h"
+#include "pg/sql_exception_macro.h"
 #include "query/transaction.h"
-#include "search/task.h"
 #include "search/tick_domain.h"
 #include "search/wal_recovery.h"
 #include "storage_engine/search_engine.h"
@@ -106,8 +104,7 @@ WalCursor InvertedIndexStorage::CursorAtOrBelow(Tick tick) noexcept {
 std::filesystem::path InvertedIndexStorage::GetPath(ObjectId db_id,
                                                     ObjectId schema_id,
                                                     ObjectId table_id,
-                                                    ObjectId index_id,
-                                                    ObjectId storage_id) {
+                                                    ObjectId index_id) {
   SDB_ASSERT(db_id.isSet());
   auto path = search::GetSearchEngine().GetPersistedPath(db_id);
   if (schema_id.isSet()) {
@@ -121,10 +118,6 @@ std::filesystem::path InvertedIndexStorage::GetPath(ObjectId db_id,
     SDB_ASSERT(table_id.isSet());
     path /= absl::StrCat(index_id);
   }
-  if (storage_id.isSet()) {
-    SDB_ASSERT(index_id.isSet());
-    path /= absl::StrCat(storage_id);
-  }
   return path;
 }
 
@@ -136,9 +129,7 @@ std::shared_ptr<InvertedIndexStorage> InvertedIndexStorage::Create(
 InvertedIndexStorage::InvertedIndexStorage(ObjectId id,
                                            const catalog::InvertedIndex& index,
                                            bool is_new)
-  : _index_id{index.GetId()},
-    _search{GetSearchEngine()},
-    _state{std::make_shared<ThreadPoolState>()} {
+  : _index_id{index.GetId()}, _search{GetSearchEngine()} {
   const auto& options = index.GetOptions();
   _tasks_settings.refresh_interval_msec = options.refresh_interval_ms;
   _tasks_settings.compaction_interval_msec = options.compaction_interval_ms;
@@ -150,22 +141,22 @@ InvertedIndexStorage::InvertedIndexStorage(ObjectId id,
   const auto index_id = index.GetId();
   SDB_ASSERT(index_id.isSet());
   std::filesystem::path path =
-    GetPath(db_id, schema_id, index.GetRelationId(), index_id, GetId());
+    GetPath(db_id, schema_id, index.GetRelationId(), index_id);
   // TODO(mbkkt) maybe we should use create_directories result instead of
   // exists?
   std::error_code ec;
   bool path_exists = std::filesystem::exists(path, ec);
   if (ec) {
-    SDB_THROW(ERROR_INTERNAL, "Failed to check existence of path '",
-              path.string(), "' while initializing data store '", _index_id,
-              "': ", ec.message());
+    THROW_SQL_ERROR(ERR_MSG("Failed to check existence of path '",
+                            path.string(), "' while initializing data store '",
+                            _index_id, "': ", ec.message()));
   }
   if (!path_exists) {
     std::filesystem::create_directories(path, ec);
     if (ec) {
-      SDB_THROW(ERROR_INTERNAL, "Failed to create directory '", path.string(),
-                "' while initializing data store '", _index_id,
-                "': ", ec.message());
+      THROW_SQL_ERROR(ERR_MSG("Failed to create directory '", path.string(),
+                              "' while initializing data store '", _index_id,
+                              "': ", ec.message()));
     }
   }
   auto codec = irs::formats::Get("1_5simd");
@@ -187,47 +178,22 @@ InvertedIndexStorage::InvertedIndexStorage(ObjectId id,
 
   irs::IndexWriterOptions writer_options;
   writer_options.segment_memory_max = 256 * (size_t{1} << 20);  // 256MB
+#ifdef SDB_DEV
+  // Dev safety net: a second IndexWriter opening the same index directory (a
+  // lifecycle bug -- two storages/loops on one dir) fails to acquire the lock
+  // with a clean error instead of silently corrupting segment files.
+  writer_options.lock_repository = true;
+#else
   writer_options.lock_repository = false;  // single-process server owns the dir
+#endif
   writer_options.db = &sdb::DuckDBEngine::Instance().instance();
   writer_options.reader_options.db = writer_options.db;
-  writer_options.column_options = [&](irs::field_id id) -> irs::ColumnOptions {
-    if (const auto* entry = index.FindEntry(id)) {
-      return {
-        .row_group_size = entry->row_group_size,
-        .compression = entry->compression,
-        .hnsw_info = index.GetHNSWInfo(id),
-      };
-    }
-    if (static_cast<catalog::Column::Id>(id) ==
-        catalog::Column::kGeneratedPKId) {
-      return {
-        .skip_validity = true,
-        .row_group_size = index.GetOptions().row_group_size,
-      };
-    }
-    const auto* features = index.FindSyntheticFeatures(id);
-    SDB_ASSERT(features, "column callback for unknown column: ", id);
-    SDB_ASSERT(!features->HasFeatures(irs::IndexFeatures::Norm),
-               "norm-role synthetic id must not reach column callback: ", id);
-    return {
-      .skip_validity = true,
-      .row_group_size = index.GetOptions().row_group_size,
-    };
-  };
-  writer_options.norm_column_options =
-    [&](irs::field_id id) -> irs::NormColumnOptions {
-    const auto* entry = index.FindEntry(id);
-    SDB_ASSERT(entry != nullptr, ERROR_INTERNAL,
-               "norm callback for unknown id: ", id);
-    SDB_ASSERT(irs::field_limits::valid(entry->synthetic_column),
-               "norm callback fired without a catalog reservation; id: ", id);
-    SDB_ASSERT(entry->features.HasFeatures(irs::IndexFeatures::Norm),
-               "norm callback fired but catalog features lack Norm; id: ", id);
-    return {
-      .id = entry->synthetic_column,
-      .row_group_size = entry->norm_row_group_size,
-    };
-  };
+  // No column/norm options are configured on the writer: the per-column
+  // encoding config travels with each operation instead. A write hands its own
+  // DDL snapshot's InvertedIndex (SegmentWriter::SetFieldOptions, via the
+  // serenedb transaction) and a merge hands the compaction task's snapshot
+  // index (CompactUnsafe). The long-lived writer therefore never reaches into
+  // the live catalog, so a concurrent DROP can no longer dangle it.
 
   if (const auto& options = index.GetTopKScorer()) {
     _topk_scorer = catalog::MakeScorer(*options);
@@ -299,81 +265,18 @@ InvertedIndexStorage::InvertedIndexStorage(ObjectId id,
       _last_durable_tick = _recovery_tick;
     }
   }
-  _snapshot = std::make_shared<InvertedIndexSnapshot>(std::move(reader));
+  std::atomic_store(&_snapshot,
+                    std::make_shared<InvertedIndexSnapshot>(std::move(reader)));
 }
 
-void InvertedIndexStorage::TruncateCommit(TruncateGuard&& guard, Tick tick,
-                                          query::Transaction* user_txn)
-  ABSL_NO_THREAD_SAFETY_ANALYSIS {
-  SDB_IF_FAILURE("SereneSearchTruncateFailure") { SDB_THROW(ERROR_DEBUG); }
-
-  SDB_ASSERT(_writer);
-
-  // If we're inside a user transaction, drop its per-conn iresearch staging
-  // for this storage (the new-arch analog of the old SearchTrxState cookie
-  // cleanup). Throws away pending operations -- Clear will overwrite them
-  // anyway -- and forces release of any active segment context so the
-  // _writer->Clear below doesn't deadlock waiting for it.
-  if (user_txn != nullptr) {
-    user_txn->EraseSearchTransaction(GetId());
-  }
-
-  // Allow callers to pass an empty guard -- self-lock in that case so this
-  // is callable from paths that didn't go through TruncateBegin (e.g. WAL
-  // recovery).
-  if (!guard.mutex) {
-    guard = TruncateBegin();
-  }
-  SDB_ASSERT(guard.mutex.get() == &_refresh_mutex);
-
-  // Roll _last_durable_tick back to its prior value if the iresearch Clear
-  // throws partway through. Once Clear returns, we cancel the rollback and
-  // commit to the new tick -- same ordering as the legacy code.
-  absl::Cleanup clear_guard = [&, last = _last_durable_tick]() noexcept {
-    _last_durable_tick = last;
-  };
-  try {
-    _writer->Clear(tick);
-    std::move(clear_guard).Cancel();
-    // payload will not be called if index already empty
-    _last_durable_tick = std::max(tick, _last_durable_tick);
-
-    auto reader = _writer->GetSnapshot();
-    SDB_ASSERT(reader);
-
-    // update reader
-    auto data = std::make_shared<InvertedIndexSnapshot>(std::move(reader));
-    StoreInvertedIndexSnapshot(data);
-
-    UpdateStatsUnsafe(std::move(data));
-  } catch (const std::exception& e) {
-    SDB_ERROR(SEARCH, "caught exception while truncating Search index '",
-              GetId().id(), "': ", e.what());
-    throw;
-  } catch (...) {
-    SDB_WARN(SEARCH, "caught exception while truncating Search index '",
-             GetId().id(), "'");
-    throw;
-  }
+void InvertedIndexStorage::StartTasks() {
+  _search.StartTasks(shared_from_this());
 }
 
-void InvertedIndexStorage::ScheduleCompaction(absl::Duration delay) {
-  CompactionTask task{shared_from_this(), [] { return /* TODO */ true; }};
-
-  _state->pending_compactions.fetch_add(1, std::memory_order_release);
-  std::move(task).Schedule(delay).Detach();
-}
-
-void InvertedIndexStorage::ScheduleRefresh(absl::Duration delay) {
-  RefreshTask task{shared_from_this(), false};
-
-  _state->pending_refreshes.fetch_add(1, std::memory_order_release);
-  std::move(task).Schedule(delay).Detach();
-}
-
-void InvertedIndexStorage::Refresh() {
+void InvertedIndexStorage::Refresh(
+  const irs::ProgressReportCallback& progress) {
   RefreshResult code = RefreshResult::Undefined;
-  std::ignore = RefreshUnsafe(/*wait=*/true, nullptr, code);
+  std::ignore = RefreshUnsafe(/*wait=*/true, progress, code);
 }
 
 void InvertedIndexStorage::CheckpointRefresh() {
@@ -384,58 +287,82 @@ void InvertedIndexStorage::CheckpointRefresh() {
 
 InvertedIndexStorage::Stats InvertedIndexStorage::UpdateStatsUnsafe(
   InvertedIndexSnapshotPtr inverted_index_snapshot) const {
-  SDB_ASSERT(inverted_index_snapshot);
-  auto& reader = inverted_index_snapshot->reader;
-  SDB_ASSERT(reader);
-  auto& segments = reader->Meta().index_meta.segments;
-
   Stats stats;
-  stats.numSegments = segments.size();
-  stats.numDocs = reader->docs_count();
-  stats.numLiveDocs = reader->live_docs_count();
-  stats.numFiles = 1 + stats.numSegments;
-  for (const auto& segment : segments) {
-    const auto& meta = segment.meta;
-    stats.indexSize += meta.byte_size;
-    stats.numFiles += meta.files.size();
+  if (inverted_index_snapshot) {
+    auto& reader = inverted_index_snapshot->reader;
+    SDB_ASSERT(reader);
+    auto& segments = reader->Meta().index_meta.segments;
+    stats.numSegments = segments.size();
+    stats.numDocs = reader->docs_count();
+    stats.numLiveDocs = reader->live_docs_count();
+    stats.numFiles = 1 + stats.numSegments;
+    for (const auto& segment : segments) {
+      const auto& meta = segment.meta;
+      stats.indexSize += meta.byte_size;
+      stats.numFiles += meta.files.size();
+    }
   }
+  if (_writer) {
+    stats.numBufferedDocs = _writer->BufferedDocs();
+  }
+  stats.numFailedCommits = _num_failed_commits.load(std::memory_order_relaxed);
+  stats.numFailedCleanups =
+    _num_failed_cleanups.load(std::memory_order_relaxed);
+  stats.numFailedConsolidations =
+    _num_failed_consolidations.load(std::memory_order_relaxed);
+  stats.avgCommitTimeMs = _avg_commit_time_ms.Average();
+  stats.avgCleanupTimeMs = _avg_cleanup_time_ms.Average();
+  stats.avgConsolidationTimeMs = _avg_consolidation_time_ms.Average();
   return stats;
 }
 
-InvertedIndexStorage::ResultWithTime InvertedIndexStorage::CleanupUnsafe() {
+ResultWithTime InvertedIndexStorage::CleanupUnsafe() {
   auto begin = std::chrono::steady_clock::now();
   auto result = CleanupUnsafeImpl();
   uint64_t time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                        std::chrono::steady_clock::now() - begin)
                        .count();
+  if (!result.ok()) {
+    _num_failed_cleanups.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    _avg_cleanup_time_ms.Record(time_ms);
+  }
   return {std::move(result), time_ms};
 }
 
-Result InvertedIndexStorage::CleanupUnsafeImpl() {
+absl::Status InvertedIndexStorage::CleanupUnsafeImpl() {
   try {
     irs::directory_utils::RemoveAllUnreferenced(*_dir);
   } catch (const std::exception& e) {
-    return {ERROR_INTERNAL, "caught exception while cleaning up Search index '",
-            GetId().id(), "': ", e.what()};
+    return absl::InternalError(
+      absl::StrCat("caught exception while cleaning up Search index '",
+                   GetId().id(), "': ", e.what()));
   } catch (...) {
-    return {ERROR_INTERNAL, "caught exception while cleaning up Search index '",
-            GetId().id(), "'"};
+    return absl::InternalError(absl::StrCat(
+      "caught exception while cleaning up Search index '", GetId().id(), "'"));
   }
-  return {};
+  return absl::OkStatus();
 }
 
-InvertedIndexStorage::ResultWithTime InvertedIndexStorage::CompactUnsafe(
+ResultWithTime InvertedIndexStorage::CompactUnsafe(
   const irs::CompactionPolicy& policy,
-  const irs::MergeWriter::FlushProgress& progress, bool& empty_compaction) {
+  const irs::MergeWriter::FlushProgress& progress, bool& empty_compaction,
+  const irs::IndexFieldOptions* field_options) {
   auto begin = std::chrono::steady_clock::now();
-  auto result = CompactUnsafeImpl(policy, progress, empty_compaction);
+  auto result =
+    CompactUnsafeImpl(policy, progress, empty_compaction, field_options);
   uint64_t time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                        std::chrono::steady_clock::now() - begin)
                        .count();
+  if (!result.ok()) {
+    _num_failed_consolidations.fetch_add(1, std::memory_order_relaxed);
+  } else if (!empty_compaction) {
+    _avg_consolidation_time_ms.Record(time_ms);
+  }
   return {std::move(result), time_ms};
 }
 
-InvertedIndexStorage::ResultWithTime InvertedIndexStorage::RefreshUnsafe(
+ResultWithTime InvertedIndexStorage::RefreshUnsafe(
   bool wait, const irs::ProgressReportCallback& progress, RefreshResult& code,
   bool for_checkpoint) {
   auto begin = std::chrono::steady_clock::now();
@@ -444,49 +371,61 @@ InvertedIndexStorage::ResultWithTime InvertedIndexStorage::RefreshUnsafe(
                        std::chrono::steady_clock::now() - begin)
                        .count();
 
-  SDB_IF_FAILURE("Search::FailOnCommit") { result.reset(ERROR_DEBUG); }
+  SDB_IF_FAILURE("Search::FailOnCommit") {
+    result = absl::InternalError("debug failure point");
+  }
   SDB_IF_FAILURE("Search::CrashAfterCommit") { SDB_IMMEDIATE_ABORT(); }
+
+  if (!result.ok()) {
+    _num_failed_commits.fetch_add(1, std::memory_order_relaxed);
+  } else if (code == RefreshResult::Done) {
+    _avg_commit_time_ms.Record(time_ms);
+  }
 
   return {std::move(result), time_ms};
 }
 
-Result InvertedIndexStorage::CompactUnsafeImpl(
+absl::Status InvertedIndexStorage::CompactUnsafeImpl(
   const irs::CompactionPolicy& policy,
-  const irs::MergeWriter::FlushProgress& progress, bool& empty_compaction) {
+  const irs::MergeWriter::FlushProgress& progress, bool& empty_compaction,
+  const irs::IndexFieldOptions* field_options) {
   empty_compaction = false;
 
   if (!policy) {
-    return {ERROR_BAD_PARAMETER,
-            "unset compaction policy while executing compaction policy "
-            "on Search index '",
-            GetId().id(), "'"};
+    return absl::InvalidArgumentError(
+      absl::StrCat("unset compaction policy while executing compaction policy "
+                   "on Search index '",
+                   GetId().id(), "'"));
   }
 
   try {
-    const auto res = _writer->Compact(policy, nullptr, progress);
-    if (!res) {
-      return {ERROR_INTERNAL,
-              "failure while executing compaction policy on Search index '",
-              GetId().id(), "'"};
+    const auto res = _writer->Compact(policy, field_options, nullptr, progress);
+    if (res.error == irs::CompactionError::Fail) {
+      return absl::InternalError(absl::StrCat(
+        "failure while executing compaction policy on Search index '",
+        GetId().id(), "'"));
+    }
+    if (res.error == irs::CompactionError::Busy) {
+      empty_compaction = false;
+      return absl::OkStatus();
     }
 
     empty_compaction = (res.size == 0);
   } catch (const std::exception& e) {
-    return {ERROR_INTERNAL,
-            "caught exception while executing compaction policy ",
-            "on Search index '",
-            GetId().id(),
-            "': ",
-            e.what()};
+    return absl::InternalError(
+      absl::StrCat("caught exception while executing compaction policy "
+                   "on Search index '",
+                   GetId().id(), "': ", e.what()));
   } catch (...) {
-    return {ERROR_INTERNAL,
-            "caught exception while executing compaction policy ",
-            "on Search index '", GetId().id(), "'"};
+    return absl::InternalError(
+      absl::StrCat("caught exception while executing compaction policy "
+                   "on Search index '",
+                   GetId().id(), "'"));
   }
-  return {};
+  return absl::OkStatus();
 }
 
-Result InvertedIndexStorage::RefreshUnsafeImpl(
+absl::Status InvertedIndexStorage::RefreshUnsafeImpl(
   bool wait, const irs::ProgressReportCallback& progress, RefreshResult& code,
   bool for_checkpoint) {
   code = RefreshResult::NoChanges;
@@ -499,7 +438,7 @@ Result InvertedIndexStorage::RefreshUnsafeImpl(
                   "' is already in progress, skipping");
 
         code = RefreshResult::InProgress;
-        return {};
+        return absl::OkStatus();
       }
 
       SDB_TRACE(SEARCH, "Refresh for Search index '", GetId().id(),
@@ -538,7 +477,7 @@ Result InvertedIndexStorage::RefreshUnsafeImpl(
     if (for_checkpoint) {
       if (auto store =
             duckdb::DatabaseManager::Get(DuckDBEngine::Instance().instance())
-              .GetDatabase(std::string{catalog::kStoreDatabaseName})) {
+              .GetDatabase(duckdb::Identifier{catalog::kStoreDatabaseName})) {
         const auto next_gen = store->GetStorageManager()
                                 .GetBlockManager()
                                 .GetCheckpointIteration() +
@@ -576,7 +515,7 @@ Result InvertedIndexStorage::RefreshUnsafeImpl(
       }
       StoreInvertedIndexSnapshot(
         std::make_shared<InvertedIndexSnapshot>(std::move(reader)));
-      return {};
+      return absl::OkStatus();
     }
     SDB_ASSERT(_phase != Phase::Active || _last_durable_tick == before_refresh);
     code = RefreshResult::Done;
@@ -597,17 +536,19 @@ Result InvertedIndexStorage::RefreshUnsafeImpl(
               "', segments '", reader_size, "', docs count '", docs_count,
               "', live docs count '", live_docs_count,
               "', last operation tick '", _last_durable_tick, "'");
-  } catch (const basics::Exception& e) {
-    return {e.code(), "caught exception while refreshing Search index '",
-            GetId().id(), "': ", e.message()};
+  } catch (const SqlException& e) {
+    return absl::InternalError(
+      absl::StrCat("caught exception while refreshing Search index '",
+                   GetId().id(), "': ", e.message()));
   } catch (const std::exception& e) {
-    return {ERROR_INTERNAL, "caught exception while refreshing Search index '",
-            GetId().id(), "': ", e.what()};
+    return absl::InternalError(
+      absl::StrCat("caught exception while refreshing Search index '",
+                   GetId().id(), "': ", e.what()));
   } catch (...) {
-    return {ERROR_INTERNAL, "caught exception while refreshing Search index '",
-            GetId().id(), "'"};
+    return absl::InternalError(absl::StrCat(
+      "caught exception while refreshing Search index '", GetId().id(), "'"));
   }
-  return {};
+  return absl::OkStatus();
 }
 
 void InvertedIndexStorage::FinishCreation() {
@@ -619,11 +560,7 @@ void InvertedIndexStorage::FinishCreation() {
 }
 
 InvertedIndexStorage::Stats InvertedIndexStorage::GetStats() const {
-  auto snapshot = GetInvertedIndexSnapshot();
-  if (!snapshot) {
-    return {};
-  }
-  return UpdateStatsUnsafe(std::move(snapshot));
+  return UpdateStatsUnsafe(GetInvertedIndexSnapshot());
 }
 
 }  // namespace sdb::search

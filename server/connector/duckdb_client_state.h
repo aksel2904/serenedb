@@ -24,11 +24,17 @@
 #include <duckdb/main/client_context_state.hpp>
 #include <memory>
 
-#include "pg/progress_tracker.h"
+#include "catalog/identifiers/object_id.h"
+#include "pg/progress_registry.h"
 
 namespace sdb {
 
 class ConnectionContext;
+}
+
+namespace sdb::network::pg {
+
+class WireSinkContext;
 }
 
 namespace sdb::connector {
@@ -48,30 +54,54 @@ class SereneDBClientState final : public duckdb::ClientContextState {
  public:
   // Creates a SereneDBClientState, registers it in the ClientContext, and wires
   // up per-connection hooks (e.g. transaction isolation level validator).
-  static void Register(duckdb::ClientContext& client_ctx,
-                       std::shared_ptr<ConnectionContext> connection_ctx);
+  // Returns the registered state so the caller can cache it and skip the keyed
+  // (locked, case-insensitive) registry lookup on every query.
+  static SereneDBClientState& Register(
+    duckdb::ClientContext& client_ctx,
+    std::shared_ptr<ConnectionContext> connection_ctx);
 
   explicit SereneDBClientState(
     std::shared_ptr<ConnectionContext> connection_ctx)
     : _connection_ctx{std::move(connection_ctx)} {}
 
+  ~SereneDBClientState() final {
+    if (progress_source) {
+      progress_source->Detach();
+      pg::ProgressRegistry::Instance().Unregister(progress_source.get());
+    }
+  }
+
   ConnectionContext& GetConnectionContext() const { return *_connection_ctx; }
 
-  std::unique_ptr<pg::ProgressReporter> progress;
+  // The connection's row in sdb_progress. Execution paths write the
+  // command-specific counters straight into Progress(); the registry snapshots
+  // them from any thread.
+  std::shared_ptr<pg::ProgressSource> progress_source;
 
-  // COPY FROM STDIN state shared across handles within a single query.
-  // DuckDB may open /dev/stdin more than once (CSV sniff then real read);
-  // the buffer captures what the first open drains so later opens replay
-  // it, and the done flag short-circuits reads after CopyDone.
-  std::shared_ptr<std::string> copy_stdin_buffer;
+  pg::ProgressMetrics& Progress() { return progress_source->metrics; }
+
+  // COPY FROM STDIN state shared across handles within a single query. The
+  // non-seekable wire stream is read SINGLE-PASS: our binary/text functions
+  // stream straight off the bridge, and DuckDB's csv/json readers sniff+scan
+  // over one buffer-manager pass (no re-open). So there is no replay buffer.
+  // open_count lets the handle reject an unexpected re-open; done
+  // short-circuits reads after CopyDone.
   int copy_stdin_open_count = 0;
   bool copy_stdin_done = false;
+
+  // Armed by the pg-wire session around PendingQuery for row-returning
+  // statements: the get_result_collector hook reads it to install the
+  // encode-in-Sink wire collector. Shared so the executor's sink state keeps
+  // it alive on every error/teardown path.
+  std::shared_ptr<network::pg::WireSinkContext> wire_sink;
 
   void TransactionPreCommit(duckdb::MetaTransaction& transaction,
                             duckdb::ClientContext& context) final;
 
   void TransactionPreCheckpoint(duckdb::AttachedDatabase& db,
-                                duckdb::ClientContext& context) final;
+                                duckdb::ClientContext& context,
+                                duckdb::idx_t wal_generation,
+                                duckdb::idx_t wal_end_offset) final;
 
   void TransactionPreRollback(
     duckdb::MetaTransaction& transaction, duckdb::ClientContext& context,
@@ -83,17 +113,31 @@ class SereneDBClientState final : public duckdb::ClientContextState {
   void TransactionRollback(duckdb::MetaTransaction& transaction,
                            duckdb::ClientContext& context) final;
 
-  duckdb::RebindQueryInfo OnExecutePrepared(
-    duckdb::ClientContext& context, duckdb::PreparedStatementCallbackInfo& info,
-    duckdb::RebindQueryInfo current_rebind) final;
-
+  void QueryBegin(duckdb::ClientContext& context) final;
   void QueryEnd(duckdb::ClientContext& context) final;
+
+  // COPY classification for the NEXT query, staged by the wire session before
+  // PendingQuery. QueryBegin resets the metrics of the previous statement, so
+  // the session cannot write them directly; QueryBegin applies these after the
+  // reset and clears them.
+  pg::ProgressCommand pending_copy_command = pg::ProgressCommand::None;
+  pg::ProgressIoType pending_copy_io = pg::ProgressIoType::None;
+  ObjectId pending_copy_relid;
+
+  // Transaction-scoped compensation for work staged on a side transaction
+  // (CTAS): registered when the side transaction starts, run in
+  // TransactionPreRollback while the MetaTransaction is alive, cleared by the
+  // owner right before its commit point. Never runs from a destructor -- a
+  // sink state outlives the statement (it dies with the cached plan), so a
+  // destructor-time MetaTransaction reference is a use-after-free.
+  std::function<void(duckdb::MetaTransaction&)> transaction_abort_cleanup;
 
  private:
   std::shared_ptr<ConnectionContext> _connection_ctx;
 };
 
 // Helper to get the ConnectionContext from a DuckDB ClientContext.
+ConnectionContext* GetSereneDBContextPtr(duckdb::ClientContext& context);
 ConnectionContext& GetSereneDBContext(duckdb::ClientContext& context);
 
 }  // namespace sdb::connector

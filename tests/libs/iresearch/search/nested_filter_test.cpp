@@ -80,6 +80,8 @@ struct ChildIterator : irs::DocIterator {
 
   void FetchScoreArgs(uint16_t index) final { _it->FetchScoreArgs(index); }
 
+  IRS_DOC_ITERATOR_DEFAULTS
+
  private:
   irs::DocIterator::ptr _it;
   std::set<irs::doc_id_t> _parents;
@@ -109,6 +111,8 @@ class PrevDocWrapper : public irs::DocIterator {
   }
 
   void FetchScoreArgs(uint16_t index) final { _it->FetchScoreArgs(index); }
+
+  IRS_DOC_ITERATOR_DEFAULTS
 
  private:
   DocIterator::ptr _it;
@@ -202,6 +206,8 @@ class ParentDocIterator : public irs::DocIterator {
   }
 
   void FetchScoreArgs(uint16_t /*index*/) final {}
+
+  IRS_DOC_ITERATOR_DEFAULTS
 
  private:
   std::vector<irs::doc_id_t> _parents;
@@ -669,14 +675,10 @@ TEST_P(NestedFilterTestCase, JoinAll0) {
   opts.child = MakeByNumericTerm(kCount, 2);
   opts.parent = MakeParentProvider(kParent);
   opts.match = [&](const irs::SubReader& segment) -> irs::DocIterator::ptr {
+    const irs::All all;
+    tests::PreparedFilter prepared{all, segment, nullptr, counter};
     return irs::memory::make_managed<ChildIterator>(
-      irs::All()
-        .prepare({
-          .index = segment,
-          .memory = counter,
-        })
-        ->execute({.segment = segment}),
-      std::set{6U, 13U, 15U, 20U});
+      prepared.Execute(0), std::set{6U, 13U, 15U, 20U});
   };
 
   {
@@ -688,14 +690,10 @@ TEST_P(NestedFilterTestCase, JoinAll0) {
 
   auto make_match = [&]() -> irs::ByNestedOptions::MatchType {
     return [&](const irs::SubReader& segment) -> irs::DocIterator::ptr {
+      const irs::All all;
+      tests::PreparedFilter prepared{all, segment, nullptr, counter};
       return irs::memory::make_managed<ChildIterator>(
-        irs::All()
-          .prepare({
-            .index = segment,
-            .memory = counter,
-          })
-          ->execute({.segment = segment}),
-        std::set{6U, 13U, 15U, 20U});
+        prepared.Execute(0), std::set{6U, 13U, 15U, 20U});
     };
   };
 

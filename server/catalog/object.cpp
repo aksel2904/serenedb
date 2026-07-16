@@ -23,17 +23,17 @@
 #include "app/app_server.h"
 #include "catalog/identifiers/object_id.h"
 #include "database/ticks.h"
-#include "general_server/state.h"
 
 namespace sdb::catalog {
 
 Object::~Object() = default;
 
-Object::Object(ObjectId parent_id, ObjectId id, std::string_view name,
-               ObjectType type)
+Object::Object(Permissions perm, ObjectId parent_id, ObjectId id,
+               std::string_view name, ObjectType type)
   : _name{name},
     _id{id != id::kInvalid ? id : NextId()},
     _parent_id{parent_id},
+    _perm{std::move(perm)},
     _type{type} {
   UpdateTickServer(GetId().id());
 }

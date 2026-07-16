@@ -1,0 +1,364 @@
+statement ok
+CREATE TABLE fo_rng (id INTEGER PRIMARY KEY, s VARCHAR, n INTEGER);
+
+statement ok
+CREATE INDEX fo_rng_idx ON fo_rng USING inverted(id, s, n);
+
+statement ok
+INSERT INTO fo_rng VALUES
+  (1, 'alpha', 1),
+  (2, 'beta',  2),
+  (3, 'gamma', 3),
+  (4, 'delta', 4);
+
+statement ok
+VACUUM (REFRESH_TABLE) fo_rng;
+
+query
+EXPLAIN SELECT id FROM fo_rng_idx WHERE s @@ ts_between('alpha', 'alpha', true, true);
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ─────╮
+│ Index: fo_rng_idx    │
+│ Lookup: table        │
+│ Filter:              │
+│ ╭─ Term ───────────╮ │
+│ │ Field: s(string) │ │
+│ │ Value: alpha     │ │
+│ ╰──────────────────╯ │
+│ Projections: id      │
+│ ~1 row               │
+╰──────────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_rng_idx WHERE s @@ ts_between('alpha', 'alpha', true, false);
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ──╮
+│ Index: fo_rng_idx │
+│ Lookup: table     │
+│ Filter:           │
+│ ╭─ Empty ─╮       │
+│ ╰─────────╯       │
+│ Projections: id   │
+│ ~0 rows           │
+╰───────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_rng_idx WHERE s @@ ts_between('alpha', 'gamma', true, true);
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ────────────╮
+│ Index: fo_rng_idx           │
+│ Lookup: table               │
+│ Filter:                     │
+│ ╭─ Range ─────────────────╮ │
+│ │ Field: s(string)        │ │
+│ │ Range: >=alpha, <=gamma │ │
+│ ╰─────────────────────────╯ │
+│ Projections: id             │
+│ ~1 row                      │
+╰─────────────────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_rng_idx WHERE n @@ ts_between(2, 2, true, true);
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ──────╮
+│ Index: fo_rng_idx     │
+│ Lookup: table         │
+│ Filter:               │
+│ ╭─ Term ────────────╮ │
+│ │ Field: n(numeric) │ │
+│ │ Value: 2          │ │
+│ ╰───────────────────╯ │
+│ Projections: id       │
+│ ~1 row                │
+╰───────────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_rng_idx WHERE n @@ ts_between(2, 2, true, false);
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ──╮
+│ Index: fo_rng_idx │
+│ Lookup: table     │
+│ Filter:           │
+│ ╭─ Empty ─╮       │
+│ ╰─────────╯       │
+│ Projections: id   │
+│ ~0 rows           │
+╰───────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_rng_idx WHERE n @@ ts_between(2, 4, true, true);
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ──────╮
+│ Index: fo_rng_idx     │
+│ Lookup: table         │
+│ Filter:               │
+│ ╭─ Granular Range ──╮ │
+│ │ Field: n(numeric) │ │
+│ │ Range: >=2, <=4   │ │
+│ ╰───────────────────╯ │
+│ Projections: id       │
+│ ~1 row                │
+╰───────────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_rng_idx WHERE s IN ('alpha');
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ─────╮
+│ Index: fo_rng_idx    │
+│ Lookup: table        │
+│ Filter:              │
+│ ╭─ Term ───────────╮ │
+│ │ Field: s(string) │ │
+│ │ Value: alpha     │ │
+│ ╰──────────────────╯ │
+│ Projections: id      │
+│ ~1 row               │
+╰──────────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_rng_idx WHERE s IN ('alpha', 'beta');
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ────────────╮
+│ Index: fo_rng_idx           │
+│ Lookup: table               │
+│ Filter:                     │
+│ ╭─ Terms ─────────────────╮ │
+│ │ Field: s(string)        │ │
+│ │ Values: 'alpha', 'beta' │ │
+│ │ Min Match: 1            │ │
+│ ╰─────────────────────────╯ │
+│ Projections: id             │
+│ ~1 row                      │
+╰─────────────────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_rng_idx WHERE s @@ ts_gt('alpha') AND s @@ ts_lt('gamma');
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ──────────╮
+│ Index: fo_rng_idx         │
+│ Lookup: table             │
+│ Filter:                   │
+│ ╭─ Range ───────────────╮ │
+│ │ Field: s(string)      │ │
+│ │ Range: >alpha, <gamma │ │
+│ │ Boost: 2              │ │
+│ ╰───────────────────────╯ │
+│ Projections: id           │
+│ ~1 row                    │
+╰───────────────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_rng_idx WHERE n @@ ts_gt(1) AND n @@ ts_lt(4);
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ──────╮
+│ Index: fo_rng_idx     │
+│ Lookup: table         │
+│ Filter:               │
+│ ╭─ Granular Range ──╮ │
+│ │ Field: n(numeric) │ │
+│ │ Range: >1, <4     │ │
+│ │ Boost: 2          │ │
+│ ╰───────────────────╯ │
+│ Projections: id       │
+│ ~1 row                │
+╰───────────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_rng_idx WHERE s @@ ts_ge('beta') AND s @@ ts_le('beta');
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ─────╮
+│ Index: fo_rng_idx    │
+│ Lookup: table        │
+│ Filter:              │
+│ ╭─ Term ───────────╮ │
+│ │ Field: s(string) │ │
+│ │ Value: beta      │ │
+│ │ Boost: 2         │ │
+│ ╰──────────────────╯ │
+│ Projections: id      │
+│ ~1 row               │
+╰──────────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_rng_idx WHERE s @@ ts_gt('beta') AND s @@ ts_le('beta');
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ──╮
+│ Index: fo_rng_idx │
+│ Lookup: table     │
+│ Filter:           │
+│ ╭─ Empty ─╮       │
+│ ╰─────────╯       │
+│ Projections: id   │
+│ ~0 rows           │
+╰───────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_rng_idx WHERE n @@ ts_ge(3) AND n @@ ts_le(3);
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ──────╮
+│ Index: fo_rng_idx     │
+│ Lookup: table         │
+│ Filter:               │
+│ ╭─ Term ────────────╮ │
+│ │ Field: n(numeric) │ │
+│ │ Value: 3          │ │
+│ │ Boost: 2          │ │
+│ ╰───────────────────╯ │
+│ Projections: id       │
+│ ~1 row                │
+╰───────────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_rng_idx WHERE s @@ ts_gt('alpha') AND n @@ ts_lt(4);
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ────────────────────────────╮
+│ Index: fo_rng_idx                           │
+│ Lookup: table                               │
+│ Filter:                                     │
+│ ╭─ And ────────────╮                        │
+│ ╰─────────┬────────╯                        │
+│           ├─────────────────────╮           │
+│ ╭─ Range ─┴────────╮  ╭─ Granular Range ──╮ │
+│ │ Field: s(string) │  │ Field: n(numeric) │ │
+│ │ Range: >alpha    │  │ Range: <4         │ │
+│ ╰──────────────────╯  ╰───────────────────╯ │
+│ Projections: id                             │
+│ ~1 row                                      │
+╰─────────────────────────────────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_rng_idx WHERE n @@ ts_gt(1) AND n @@ ts_lt(4) AND s @@ 'beta';
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ────────────────────────────╮
+│ Index: fo_rng_idx                           │
+│ Lookup: table                               │
+│ Filter:                                     │
+│ ╭─ And ─────────────╮                       │
+│ ╰─────────┬─────────╯                       │
+│           ├──────────────────────╮          │
+│ ╭─ Granular Range ──╮  ╭─ Term ──┴────────╮ │
+│ │ Field: n(numeric) │  │ Field: s(string) │ │
+│ │ Range: >1, <4     │  │ Value: beta      │ │
+│ │ Boost: 2          │  ╰──────────────────╯ │
+│ ╰───────────────────╯                       │
+│ Projections: id                             │
+│ ~1 row                                      │
+╰─────────────────────────────────────────────╯
+
+
+statement ok
+CREATE TABLE fo_rng_mt (id INTEGER PRIMARY KEY, s VARCHAR, n INTEGER);
+
+statement ok
+CREATE TEXT SEARCH DICTIONARY fo_low_en(
+    template = 'text', locale = 'en_US.UTF-8', case = 'none',
+    stemming = false, accent = false, frequency = true, position = true
+);
+
+statement ok
+CREATE INDEX fo_rng_mt_idx ON fo_rng_mt USING inverted(id, s fo_low_en, n);
+
+statement ok
+INSERT INTO fo_rng_mt VALUES
+  (1, 'alpha gamma', 1),
+  (2, 'beta beta',  2),
+  (3, 'gamma alpha', 3),
+  (4, 'delta', 4);
+
+statement ok
+VACUUM (REFRESH_TABLE) fo_rng_mt;
+
+
+query
+EXPLAIN SELECT id FROM fo_rng_mt_idx WHERE s @@ ts_gt('alpha') AND s @@ ts_lt('gamma');
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ───────────────────────────╮
+│ Index: fo_rng_mt_idx                       │
+│ Lookup: table                              │
+│ Filter:                                    │
+│ ╭─ And ────────────╮                       │
+│ ╰─────────┬────────╯                       │
+│           ├─────────────────────╮          │
+│ ╭─ Range ─┴────────╮  ╭─ Range ─┴────────╮ │
+│ │ Field: s(string) │  │ Field: s(string) │ │
+│ │ Range: >alpha    │  │ Range: <gamma    │ │
+│ ╰──────────────────╯  ╰──────────────────╯ │
+│ Projections: id                            │
+│ ~1 row                                     │
+╰────────────────────────────────────────────╯
+
+query
+SELECT id FROM fo_rng_mt_idx WHERE s @@ ts_gt('alpha') AND s @@ ts_lt('gamma') ORDER BY id;
+----
+id
+1
+2
+3
+4
+
+query
+SELECT id FROM fo_rng_mt_idx WHERE s @@ ts_gt('beta') AND s @@ ts_lt('beto') ORDER BY id;
+----
+id
+1
+3
+
+
+statement ok
+CREATE TABLE fo_rng_mix (id INTEGER PRIMARY KEY, k VARCHAR, a VARCHAR);
+
+statement ok
+CREATE INDEX fo_rng_mix_idx ON fo_rng_mix USING inverted(id, k, a fo_low_en);
+
+statement ok
+INSERT INTO fo_rng_mix VALUES
+  (1, 'beta', 'alpha gamma'),
+  (2, 'zeta', 'alpha gamma'),
+  (3, 'beta', 'delta'),
+  (4, 'beta', 'zeta');
+
+statement ok
+VACUUM (REFRESH_TABLE) fo_rng_mix;
+
+query
+EXPLAIN SELECT id FROM fo_rng_mix_idx WHERE k @@ ts_gt('alpha') AND k @@ ts_lt('gamma') AND a @@ ts_gt('alpha') AND a @@ ts_lt('gamma');
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ──────────────────────────────────────────────────────╮
+│ Index: fo_rng_mix_idx                                                 │
+│ Lookup: table                                                         │
+│ Filter:                                                               │
+│ ╭─ And ─────────────────╮                                             │
+│ ╰───────────┬───────────╯                                             │
+│             ├────────────────────────┬─────────────────────╮          │
+│ ╭─ Range ───┴───────────╮  ╭─ Range ─┴────────╮  ╭─ Range ─┴────────╮ │
+│ │ Field: k(string)      │  │ Field: a(string) │  │ Field: a(string) │ │
+│ │ Range: >alpha, <gamma │  │ Range: <gamma    │  │ Range: >alpha    │ │
+│ │ Boost: 2              │  ╰──────────────────╯  ╰──────────────────╯ │
+│ ╰───────────────────────╯                                             │
+│ Projections: id                                                       │
+│ ~1 row                                                                │
+╰───────────────────────────────────────────────────────────────────────╯
+
+query
+SELECT id FROM fo_rng_mix_idx WHERE k @@ ts_gt('alpha') AND k @@ ts_lt('gamma') AND a @@ ts_gt('alpha') AND a @@ ts_lt('gamma') ORDER BY id;
+----
+id
+1
+3

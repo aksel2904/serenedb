@@ -1,0 +1,219 @@
+statement ok
+CREATE TABLE fo_neg (id INTEGER PRIMARY KEY, s VARCHAR, n INTEGER, t VARCHAR);
+
+statement ok
+CREATE TEXT SEARCH DICTIONARY fo_neg_en(
+    template = 'text', locale = 'en_US.UTF-8', case = 'none',
+    stemming = false, accent = false, frequency = true, position = true
+);
+
+statement ok
+CREATE INDEX fo_neg_idx ON fo_neg USING inverted(id, s, n, t fo_neg_en);
+
+statement ok
+INSERT INTO fo_neg VALUES
+  (1, 'alpha', 1, 'alpha beta'),
+  (2, 'beta',  2, 'beta gamma'),
+  (3, 'gamma', 3, 'gamma delta'),
+  (4, 'delta', 4, 'delta alpha');
+
+statement ok
+VACUUM (REFRESH_TABLE) fo_neg;
+
+query
+EXPLAIN SELECT id FROM fo_neg_idx WHERE NOT (t @@ ts_phrase('alpha'));
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ─────╮
+│ Index: fo_neg_idx    │
+│ Lookup: table        │
+│ Filter:              │
+│ ╭─ Not ────────────╮ │
+│ ╰─────────┬────────╯ │
+│ ╭─ Term ──┴────────╮ │
+│ │ Field: t(string) │ │
+│ │ Value: alpha     │ │
+│ ╰──────────────────╯ │
+│ Projections: id      │
+│ ~1 row               │
+╰──────────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_neg_idx WHERE NOT (NOT (t @@ ts_phrase('alpha')));
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ─────╮
+│ Index: fo_neg_idx    │
+│ Lookup: table        │
+│ Filter:              │
+│ ╭─ Term ───────────╮ │
+│ │ Field: t(string) │ │
+│ │ Value: alpha     │ │
+│ ╰──────────────────╯ │
+│ Projections: id      │
+│ ~1 row               │
+╰──────────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_neg_idx WHERE NOT (NOT (NOT (NOT (t @@ ts_phrase('alpha')))));
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ─────╮
+│ Index: fo_neg_idx    │
+│ Lookup: table        │
+│ Filter:              │
+│ ╭─ Term ───────────╮ │
+│ │ Field: t(string) │ │
+│ │ Value: alpha     │ │
+│ ╰──────────────────╯ │
+│ Projections: id      │
+│ ~1 row               │
+╰──────────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_neg_idx WHERE NOT (NOT (NOT (t @@ ts_phrase('alpha'))));
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ─────╮
+│ Index: fo_neg_idx    │
+│ Lookup: table        │
+│ Filter:              │
+│ ╭─ Not ────────────╮ │
+│ ╰─────────┬────────╯ │
+│ ╭─ Term ──┴────────╮ │
+│ │ Field: t(string) │ │
+│ │ Value: alpha     │ │
+│ ╰──────────────────╯ │
+│ Projections: id      │
+│ ~1 row               │
+╰──────────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_neg_idx WHERE NOT (n @@ ts_between(NULL, NULL, true, true));
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ──╮
+│ Index: fo_neg_idx │
+│ Lookup: table     │
+│ Filter:           │
+│ ╭─ Empty ─╮       │
+│ ╰─────────╯       │
+│ Projections: id   │
+│ ~0 rows           │
+╰───────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_neg_idx WHERE NOT (n @@ ts_between(2, 2, false, false));
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ──╮
+│ Index: fo_neg_idx │
+│ Lookup: table     │
+│ Filter:           │
+│ ╭─ All ──╮        │
+│ ╰────────╯        │
+│ Projections: id   │
+│ ~4 rows           │
+╰───────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_neg_idx
+WHERE t @@ ts_phrase('alpha') AND NOT (t @@ ts_phrase('beta'));
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ───────────────────────────╮
+│ Index: fo_neg_idx                          │
+│ Lookup: table                              │
+│ Filter:                                    │
+│ ╭─ Exclusion ──────╮                       │
+│ ╰─────────┬────────╯                       │
+│           ├─────────────────────╮          │
+│ ╭─ Term ──┴────────╮  ╭─ Term ──┴────────╮ │
+│ │ Field: t(string) │  │ Field: t(string) │ │
+│ │ Value: alpha     │  │ Value: beta      │ │
+│ ╰──────────────────╯  ╰──────────────────╯ │
+│ Projections: id                            │
+│ ~1 row                                     │
+╰────────────────────────────────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_neg_idx WHERE t @@ (ts_phrase('alpha') && !!ts_phrase('beta'));
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ───────────────────────────╮
+│ Index: fo_neg_idx                          │
+│ Lookup: table                              │
+│ Filter:                                    │
+│ ╭─ Exclusion ──────╮                       │
+│ ╰─────────┬────────╯                       │
+│           ├─────────────────────╮          │
+│ ╭─ Term ──┴────────╮  ╭─ Term ──┴────────╮ │
+│ │ Field: t(string) │  │ Field: t(string) │ │
+│ │ Value: alpha     │  │ Value: beta      │ │
+│ ╰──────────────────╯  ╰──────────────────╯ │
+│ Projections: id                            │
+│ ~1 row                                     │
+╰────────────────────────────────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_neg_idx
+WHERE t @@ ts_phrase('alpha') AND NOT (t @@ ts_phrase('beta')) AND NOT (t @@ ts_phrase('gamma'));
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ─────────────────────────────────────────────────╮
+│ Index: fo_neg_idx                                                │
+│ Lookup: table                                                    │
+│ Filter:                                                          │
+│ ╭─ Exclusion ──────╮                                             │
+│ ╰─────────┬────────╯                                             │
+│           ├─────────────────────┬─────────────────────╮          │
+│ ╭─ Term ──┴────────╮  ╭─ Term ──┴────────╮  ╭─ Term ──┴────────╮ │
+│ │ Field: t(string) │  │ Field: t(string) │  │ Field: t(string) │ │
+│ │ Value: alpha     │  │ Value: gamma     │  │ Value: beta      │ │
+│ ╰──────────────────╯  ╰──────────────────╯  ╰──────────────────╯ │
+│ Projections: id                                                  │
+│ ~1 row                                                           │
+╰──────────────────────────────────────────────────────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_neg_idx
+WHERE NOT (t @@ ts_phrase('beta')) AND NOT (t @@ ts_phrase('gamma'));
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ───────────────────────────╮
+│ Index: fo_neg_idx                          │
+│ Lookup: table                              │
+│ Filter:                                    │
+│ ╭─ Not ────────────╮                       │
+│ ╰─────────┬────────╯                       │
+│           ├─────────────────────╮          │
+│ ╭─ Term ──┴────────╮  ╭─ Term ──┴────────╮ │
+│ │ Field: t(string) │  │ Field: t(string) │ │
+│ │ Value: beta      │  │ Value: gamma     │ │
+│ ╰──────────────────╯  ╰──────────────────╯ │
+│ Projections: id                            │
+│ ~1 row                                     │
+╰────────────────────────────────────────────╯
+
+query
+EXPLAIN SELECT id FROM fo_neg_idx
+WHERE s = 'alpha' AND n = 2 AND NOT (t @@ ts_phrase('gamma')) AND NOT (t @@ ts_phrase('delta'));
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ────────────────────────────────────────────────────────────────────────╮
+│ Index: fo_neg_idx                                                                       │
+│ Lookup: table                                                                           │
+│ Filter:                                                                                 │
+│ ╭─ Exclusion ───────╮                                                                   │
+│ ╰─────────┬─────────╯                                                                   │
+│           ├────────────────────────────────────────────┬─────────────────────╮          │
+│ ╭─ And ───┴─────────╮                        ╭─ Term ──┴────────╮  ╭─ Term ──┴────────╮ │
+│ ╰─────────┬─────────╯                        │ Field: t(string) │  │ Field: t(string) │ │
+│           ├──────────────────────╮           │ Value: gamma     │  │ Value: delta     │ │
+│ ╭─ Term ──┴─────────╮  ╭─ Term ──┴────────╮  ╰──────────────────╯  ╰──────────────────╯ │
+│ │ Field: n(numeric) │  │ Field: s(string) │                                             │
+│ │ Value: 2          │  │ Value: alpha     │                                             │
+│ ╰───────────────────╯  ╰──────────────────╯                                             │
+│ Projections: id                                                                         │
+│ ~1 row                                                                                  │
+╰─────────────────────────────────────────────────────────────────────────────────────────╯

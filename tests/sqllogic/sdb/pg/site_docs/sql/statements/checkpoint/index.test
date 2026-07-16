@@ -1,0 +1,50 @@
+control substitution on
+
+# DOCS_TEST: example_001
+
+# DOCS_TEST_BODY
+
+#statement ok
+#CHECKPOINT;
+
+# DOCS_TEST: example_002
+
+statement ok
+DETACH IF EXISTS db41;
+
+statement ok
+ATTACH '${__TEST_DIR__}/db41.db' AS db41;
+
+# DOCS_TEST_BODY
+
+#statement ok
+#CHECKPOINT file_db;
+
+# DOCS_TEST: example_003
+
+# DOCS_TEST_BODY
+
+#statement ok
+#FORCE CHECKPOINT;
+
+# DOCS_TEST: example_004
+
+statement ok
+DETACH IF EXISTS db42;
+
+# DOCS_TEST_BODY
+
+statement ok
+ATTACH ':memory:' AS db42 (COMPRESS);
+
+statement ok
+USE db42;
+
+statement ok
+USE postgres;
+
+statement ok
+DETACH IF EXISTS db42;
+
+statement ok
+DETACH IF EXISTS db41;

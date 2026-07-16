@@ -26,18 +26,26 @@
 #include "iresearch/index/iterators.hpp"
 #include "iresearch/search/all_filter.hpp"
 #include "iresearch/search/all_iterator.hpp"
+#include "iresearch/search/automaton_filter.hpp"
 #include "iresearch/search/bm25.hpp"
 #include "iresearch/search/boolean_filter.hpp"
+#include "iresearch/search/boolean_query.hpp"
 #include "iresearch/search/column_collector.hpp"
 #include "iresearch/search/conjunction.hpp"
 #include "iresearch/search/exclusion.hpp"
+#include "iresearch/search/filter_optimizer.hpp"
+#include "iresearch/search/levenshtein_filter.hpp"
 #include "iresearch/search/make_disjunction.hpp"
+#include "iresearch/search/prefix_filter.hpp"
 #include "iresearch/search/range_filter.hpp"
+#include "iresearch/search/regexp_filter.hpp"
 #include "iresearch/search/score_function.hpp"
 #include "iresearch/search/scorer.hpp"
 #include "iresearch/search/term_filter.hpp"
 #include "iresearch/search/term_query.hpp"
 #include "iresearch/search/tfidf.hpp"
+#include "iresearch/search/wildcard_filter.hpp"
+#include "iresearch/utils/automaton_utils.hpp"
 #include "iresearch/utils/type_limits.hpp"
 #include "tests_shared.hpp"
 
@@ -177,6 +185,8 @@ class BasicDocIterator : public irs::DocIterator {
     return _doc;
   }
 
+  IRS_DOC_ITERATOR_DEFAULTS
+
  private:
   std::map<irs::TypeInfo::type_id, irs::Attribute*> _attrs;
   irs::CostAttr _est;
@@ -223,19 +233,19 @@ struct SeekDoc {
 };
 
 struct Boosted : public irs::FilterWithBoost {
-  struct Prepared : irs::Filter::Query {
-    explicit Prepared(const BasicDocIterator::DocidsT& docs, irs::score_t boost)
-      : docs{docs}, _boost{boost} {}
+  struct Prepared : irs::QueryBuilder {
+    explicit Prepared(const irs::SubReader& segment,
+                      const BasicDocIterator::DocidsT& docs, irs::score_t boost)
+      : QueryBuilder{segment}, docs{docs}, _boost{boost} {}
 
-    irs::DocIterator::ptr execute(
-      const irs::ExecutionContext& ctx) const final {
+    irs::DocIterator::ptr Execute(const irs::ExecutionContext&,
+                                  const irs::StatsBuffer&) const final {
       Boosted::gExecuteCount++;
       return irs::memory::make_managed<BasicDocIterator>(
         docs.begin(), docs.end(), stats.c_str(), Boost());
     }
 
-    void visit(const irs::SubReader&, irs::PreparedStateVisitor&,
-               irs::score_t) const final {
+    void Visit(irs::PreparedStateVisitor&, irs::score_t) const final {
       // No terms to visit
     }
 
@@ -248,8 +258,9 @@ struct Boosted : public irs::FilterWithBoost {
     irs::score_t _boost;
   };
 
-  irs::Filter::Query::ptr prepare(const irs::PrepareContext& ctx) const final {
-    return irs::memory::make_managed<Boosted::Prepared>(docs,
+  irs::QueryBuilder::ptr PrepareSegment(
+    const irs::SubReader& segment, const irs::PrepareContext& ctx) const final {
+    return irs::memory::make_managed<Boosted::Prepared>(segment, docs,
                                                         ctx.boost * Boost());
   }
 
@@ -318,11 +329,9 @@ TEST(boolean_query_boost, hierarchy) {
       sub.boost(value);
     }
 
-    auto prep =
-      root.prepare({.index = irs::SubReader::empty(), .scorer = &sort});
+    tests::PreparedFilter prep{root, irs::SubReader::empty(), &sort};
 
-    auto docs =
-      prep->execute({.segment = irs::SubReader::empty(), .scorer = &sort});
+    auto docs = prep.Execute(0);
 
     const auto& scr = docs->PrepareScore({
       .scorer = &sort,
@@ -333,7 +342,7 @@ TEST(boolean_query_boost, hierarchy) {
     /* the first hit should be scored as 2*value^3 +2*value^3+value^2 since it
      * exists in all results */
     {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       docs->FetchScoreArgs(0);
       const auto doc_boost = scr.Score();
       ASSERT_EQ(4 * value * value * value + value * value, doc_boost);
@@ -342,13 +351,13 @@ TEST(boolean_query_boost, hierarchy) {
     /* the second hit should be scored as 2*value^3+value^2 since it
      * exists in all results */
     {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       docs->FetchScoreArgs(0);
       const auto doc_boost = scr.Score();
       ASSERT_EQ(4 * value * value * value + value * value, doc_boost);
     }
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
   }
 
   // hierarchy of boosted subqueries (multiple Or's)
@@ -402,11 +411,9 @@ TEST(boolean_query_boost, hierarchy) {
       node.docs = {1, 2, 3};
     }
 
-    auto prep =
-      root.prepare({.index = irs::SubReader::empty(), .scorer = &sort});
+    tests::PreparedFilter prep{root, irs::SubReader::empty(), &sort};
 
-    auto docs =
-      prep->execute({.segment = irs::SubReader::empty(), .scorer = &sort});
+    auto docs = prep.Execute(0);
 
     const auto& scr = docs->PrepareScore({
       .scorer = &sort,
@@ -417,7 +424,7 @@ TEST(boolean_query_boost, hierarchy) {
     /* the first hit should be scored as 2*value^3+value^2+3*value^2+value
      * since it exists in all results */
     {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       docs->FetchScoreArgs(0);
       const auto doc_boost = scr.Score();
       ASSERT_EQ(2 * value * value * value + 4 * value * value + value,
@@ -427,7 +434,7 @@ TEST(boolean_query_boost, hierarchy) {
     /* the second hit should be scored as value^3+value^2+2*value^2 since it
      * exists in all results */
     {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       docs->FetchScoreArgs(0);
       const auto doc_boost = scr.Score();
       ASSERT_EQ(value * value * value + 3 * value * value + value, doc_boost);
@@ -436,13 +443,13 @@ TEST(boolean_query_boost, hierarchy) {
     /* the third hit should be scored as value^3+value^2 since it
      * exists in all results */
     {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       docs->FetchScoreArgs(0);
       const auto doc_boost = scr.Score();
       ASSERT_EQ(value * value * value + value * value + value, doc_boost);
     }
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
   }
 
   // hierarchy of boosted subqueries (multiple And's)
@@ -495,11 +502,9 @@ TEST(boolean_query_boost, hierarchy) {
       node.docs = {1, 2, 3};
     }
 
-    auto prep =
-      root.prepare({.index = irs::SubReader::empty(), .scorer = &sort});
+    tests::PreparedFilter prep{root, irs::SubReader::empty(), &sort};
 
-    auto docs =
-      prep->execute({.segment = irs::SubReader::empty(), .scorer = &sort});
+    auto docs = prep.Execute(0);
 
     const auto& scr = docs->PrepareScore({
       .scorer = &sort,
@@ -509,7 +514,7 @@ TEST(boolean_query_boost, hierarchy) {
 
     // the first hit should be scored as value^3+2*value^2+3*value^2+value
     {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       docs->FetchScoreArgs(0);
       const auto doc_boost = scr.Score();
       ASSERT_EQ(value * value * value + 5 * value * value + value, doc_boost);
@@ -517,7 +522,7 @@ TEST(boolean_query_boost, hierarchy) {
 
     // the second hit should be scored as value
     {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       docs->FetchScoreArgs(0);
       const auto doc_boost = scr.Score();
       ASSERT_EQ(value, doc_boost);
@@ -525,39 +530,18 @@ TEST(boolean_query_boost, hierarchy) {
 
     // the third hit should be scored as value
     {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       docs->FetchScoreArgs(0);
       const auto doc_boost = scr.Score();
       ASSERT_EQ(value, doc_boost);
     }
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
   }
 }
 
 TEST(boolean_query_boost, and_filter) {
-  // empty boolean unboosted query
-  {
-    irs::And root;
-
-    auto prep = root.prepare({.index = irs::SubReader::empty()});
-
-    ASSERT_EQ(irs::kNoBoost, prep->Boost());
-  }
-
-  // boosted empty boolean query
-  {
-    const irs::score_t value = 5;
-
-    irs::And root;
-    root.boost(value);
-
-    auto prep = root.prepare({.index = irs::SubReader::empty()});
-
-    ASSERT_EQ(irs::kNoBoost, prep->Boost());
-  }
-
-  // single boosted subquery
+  // single boosted subquery (And collapses to its child after optimization)
   {
     const irs::score_t value = 5;
 
@@ -570,25 +554,24 @@ TEST(boolean_query_boost, and_filter) {
       node.boost(value);
     }
 
-    auto prep =
-      root.prepare({.index = irs::SubReader::empty(), .scorer = &sort});
+    auto opt = tests::Optimized(std::move(root), &sort);
+    tests::PreparedFilter prep{*opt, irs::SubReader::empty(), &sort};
 
-    auto docs =
-      prep->execute({.segment = irs::SubReader::empty(), .scorer = &sort});
+    auto docs = prep.Execute(0);
 
     const auto& scr = docs->PrepareScore({
       .scorer = &sort,
       .segment = &irs::SubReader::empty(),
     });
     ASSERT_FALSE(scr.IsDefault());
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     const auto doc_boost = scr.Score();
     ASSERT_EQ(value, doc_boost);
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
   }
 
-  // boosted root & single boosted subquery
+  // boosted root & single boosted subquery (root boost folds into the child)
   {
     const irs::score_t value = 5;
 
@@ -602,22 +585,21 @@ TEST(boolean_query_boost, and_filter) {
     }
     root.boost(value);
 
-    auto prep =
-      root.prepare({.index = irs::SubReader::empty(), .scorer = &sort});
+    auto opt = tests::Optimized(std::move(root), &sort);
+    tests::PreparedFilter prep{*opt, irs::SubReader::empty(), &sort};
 
-    auto docs =
-      prep->execute({.segment = irs::SubReader::empty(), .scorer = &sort});
+    auto docs = prep.Execute(0);
 
     const auto& scr = docs->PrepareScore({
       .scorer = &sort,
       .segment = &irs::SubReader::empty(),
     });
     ASSERT_FALSE(scr.IsDefault());
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     const auto doc_boost = scr.Score();
     ASSERT_EQ(value * value, doc_boost);
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
   }
 
   // boosted root & several boosted subqueries
@@ -639,11 +621,9 @@ TEST(boolean_query_boost, and_filter) {
     }
     root.boost(value);
 
-    auto prep =
-      root.prepare({.index = irs::SubReader::empty(), .scorer = &sort});
+    tests::PreparedFilter prep{root, irs::SubReader::empty(), &sort};
 
-    auto docs =
-      prep->execute({.segment = irs::SubReader::empty(), .scorer = &sort});
+    auto docs = prep.Execute(0);
 
     /* the first hit should be scored as value*value + value*value since it
      * exists in both results */
@@ -652,12 +632,12 @@ TEST(boolean_query_boost, and_filter) {
       .segment = &irs::SubReader::empty(),
     });
     ASSERT_FALSE(scr.IsDefault());
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     const auto doc_boost = scr.Score();
     ASSERT_EQ(2 * value * value, doc_boost);
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
   }
 
   // boosted root & several boosted subqueries
@@ -688,22 +668,20 @@ TEST(boolean_query_boost, and_filter) {
       node.boost(value);
     }
 
-    auto prep =
-      root.prepare({.index = irs::SubReader::empty(), .scorer = &sort});
-    auto docs =
-      prep->execute({.segment = irs::SubReader::empty(), .scorer = &sort});
+    tests::PreparedFilter prep{root, irs::SubReader::empty(), &sort};
+    auto docs = prep.Execute(0);
 
     const auto& scr = docs->PrepareScore({
       .scorer = &sort,
       .segment = &irs::SubReader::empty(),
     });
     ASSERT_FALSE(scr.IsDefault());
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     const auto doc_boost = scr.Score();
     ASSERT_EQ(3 * value * value + value, doc_boost);
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
   }
 
   // unboosted root & several boosted subqueries
@@ -734,22 +712,20 @@ TEST(boolean_query_boost, and_filter) {
       node.boost(value);
     }
 
-    auto prep =
-      root.prepare({.index = irs::SubReader::empty(), .scorer = &sort});
-    auto docs =
-      prep->execute({.segment = irs::SubReader::empty(), .scorer = &sort});
+    tests::PreparedFilter prep{root, irs::SubReader::empty(), &sort};
+    auto docs = prep.Execute(0);
 
     const auto& scr = docs->PrepareScore({
       .scorer = &sort,
       .segment = &irs::SubReader::empty(),
     });
     ASSERT_FALSE(scr.IsDefault());
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     const auto doc_boost = scr.Score();
     ASSERT_EQ(3 * value, doc_boost);
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
   }
 
   // unboosted root & several unboosted subqueries
@@ -778,48 +754,25 @@ TEST(boolean_query_boost, and_filter) {
       node.boost(0.f);
     }
 
-    auto prep =
-      root.prepare({.index = irs::SubReader::empty(), .scorer = &sort});
-    auto docs =
-      prep->execute({.segment = irs::SubReader::empty(), .scorer = &sort});
+    tests::PreparedFilter prep{root, irs::SubReader::empty(), &sort};
+    auto docs = prep.Execute(0);
 
     const auto& scr = docs->PrepareScore({
       .scorer = &sort,
       .segment = &irs::SubReader::empty(),
     });
     ASSERT_FALSE(scr.IsDefault());
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     const auto doc_boost = scr.Score();
     ASSERT_EQ(irs::score_t(0), doc_boost);
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
   }
 }
 
 TEST(boolean_query_boost, or_filter) {
-  // single unboosted query
-  {
-    irs::Or root;
-
-    auto prep = root.prepare({.index = irs::SubReader::empty()});
-
-    ASSERT_EQ(irs::kNoBoost, prep->Boost());
-  }
-
-  // empty single boosted query
-  {
-    const irs::score_t value = 5;
-
-    irs::Or root;
-    root.boost(value);
-
-    auto prep = root.prepare({.index = irs::SubReader::empty()});
-
-    ASSERT_EQ(irs::kNoBoost, prep->Boost());
-  }
-
-  // boosted empty single query
+  // single boosted subquery (Or collapses to its child after optimization)
   {
     const irs::score_t value = 5;
 
@@ -832,24 +785,23 @@ TEST(boolean_query_boost, or_filter) {
     }
     root.boost(value);
 
-    auto prep =
-      root.prepare({.index = irs::SubReader::empty(), .scorer = &sort});
-    auto docs =
-      prep->execute({.segment = irs::SubReader::empty(), .scorer = &sort});
+    auto opt = tests::Optimized(std::move(root), &sort);
+    tests::PreparedFilter prep{*opt, irs::SubReader::empty(), &sort};
+    auto docs = prep.Execute(0);
 
     const auto& scr = docs->PrepareScore({
       .scorer = &sort,
       .segment = &irs::SubReader::empty(),
     });
     ASSERT_FALSE(scr.IsDefault());
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     const auto doc_boost = scr.Score();
     ASSERT_EQ(value, doc_boost);
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
   }
 
-  // boosted single query & subquery
+  // boosted root & single boosted subquery (root boost folds into the child)
   {
     const irs::score_t value = 5;
 
@@ -863,22 +815,21 @@ TEST(boolean_query_boost, or_filter) {
     }
     root.boost(value);
 
-    auto prep =
-      root.prepare({.index = irs::SubReader::empty(), .scorer = &sort});
+    auto opt = tests::Optimized(std::move(root), &sort);
+    tests::PreparedFilter prep{*opt, irs::SubReader::empty(), &sort};
 
-    auto docs =
-      prep->execute({.segment = irs::SubReader::empty(), .scorer = &sort});
+    auto docs = prep.Execute(0);
 
     const auto& scr = docs->PrepareScore({
       .scorer = &sort,
       .segment = &irs::SubReader::empty(),
     });
     ASSERT_FALSE(scr.IsDefault());
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     const auto doc_boost = scr.Score();
     ASSERT_EQ(value * value, doc_boost);
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
   }
 
   // boosted single query & several subqueries
@@ -900,10 +851,8 @@ TEST(boolean_query_boost, or_filter) {
     }
     root.boost(value);
 
-    auto prep =
-      root.prepare({.index = irs::SubReader::empty(), .scorer = &sort});
-    auto docs =
-      prep->execute({.segment = irs::SubReader::empty(), .scorer = &sort});
+    tests::PreparedFilter prep{root, irs::SubReader::empty(), &sort};
+    auto docs = prep.Execute(0);
 
     const auto& scr = docs->PrepareScore({
       .scorer = &sort,
@@ -914,7 +863,7 @@ TEST(boolean_query_boost, or_filter) {
     // the first hit should be scored as value*value + value*value since it
     // exists in both results
     {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       docs->FetchScoreArgs(0);
       const auto doc_boost = scr.Score();
       ASSERT_EQ(2 * value * value, doc_boost);
@@ -923,13 +872,13 @@ TEST(boolean_query_boost, or_filter) {
     // the second hit should be scored as value*value since it
     // exists in second result only
     {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       docs->FetchScoreArgs(0);
       const auto doc_boost = scr.Score();
       ASSERT_EQ(value * value, doc_boost);
     }
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
   }
 
   // boosted root & several boosted subqueries
@@ -961,10 +910,8 @@ TEST(boolean_query_boost, or_filter) {
       node.boost(value);
     }
 
-    auto prep =
-      root.prepare({.index = irs::SubReader::empty(), .scorer = &sort});
-    auto docs =
-      prep->execute({.segment = irs::SubReader::empty(), .scorer = &sort});
+    tests::PreparedFilter prep{root, irs::SubReader::empty(), &sort};
+    auto docs = prep.Execute(0);
 
     const auto& scr = docs->PrepareScore({
       .scorer = &sort,
@@ -974,7 +921,7 @@ TEST(boolean_query_boost, or_filter) {
 
     // first hit
     {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       docs->FetchScoreArgs(0);
       const auto doc_boost = scr.Score();
       ASSERT_EQ(3 * value * value + value, doc_boost);
@@ -982,13 +929,13 @@ TEST(boolean_query_boost, or_filter) {
 
     // second hit
     {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       docs->FetchScoreArgs(0);
       const auto doc_boost = scr.Score();
       ASSERT_EQ(2 * value * value + value, doc_boost);
     }
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
   }
 
   // unboosted root & several boosted subqueries
@@ -1020,10 +967,8 @@ TEST(boolean_query_boost, or_filter) {
       node.boost(value);
     }
 
-    auto prep =
-      root.prepare({.index = irs::SubReader::empty(), .scorer = &sort});
-    auto docs =
-      prep->execute({.segment = irs::SubReader::empty(), .scorer = &sort});
+    tests::PreparedFilter prep{root, irs::SubReader::empty(), &sort};
+    auto docs = prep.Execute(0);
 
     const auto& scr = docs->PrepareScore({
       .scorer = &sort,
@@ -1033,7 +978,7 @@ TEST(boolean_query_boost, or_filter) {
 
     // first hit
     {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       docs->FetchScoreArgs(0);
       const auto doc_boost = scr.Score();
       ASSERT_EQ(3 * value, doc_boost);
@@ -1041,13 +986,13 @@ TEST(boolean_query_boost, or_filter) {
 
     // second hit
     {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       docs->FetchScoreArgs(0);
       const auto doc_boost = scr.Score();
       ASSERT_EQ(2 * value, doc_boost);
     }
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
   }
 
   // unboosted root & several unboosted subqueries
@@ -1076,10 +1021,8 @@ TEST(boolean_query_boost, or_filter) {
       node.boost(0.f);
     }
 
-    auto prep =
-      root.prepare({.index = irs::SubReader::empty(), .scorer = &sort});
-    auto docs =
-      prep->execute({.segment = irs::SubReader::empty(), .scorer = &sort});
+    tests::PreparedFilter prep{root, irs::SubReader::empty(), &sort};
+    auto docs = prep.Execute(0);
 
     const auto& scr = docs->PrepareScore({
       .scorer = &sort,
@@ -1089,7 +1032,7 @@ TEST(boolean_query_boost, or_filter) {
 
     // first hit
     {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       docs->FetchScoreArgs(0);
       const auto doc_boost = scr.Score();
       ASSERT_EQ(irs::score_t(0), doc_boost);
@@ -1097,13 +1040,13 @@ TEST(boolean_query_boost, or_filter) {
 
     // second hit
     {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       docs->FetchScoreArgs(0);
       const auto doc_boost = scr.Score();
       ASSERT_EQ(irs::score_t(0), doc_boost);
     }
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
   }
 }
 
@@ -1136,22 +1079,28 @@ struct Unestimated : public irs::FilterWithBoost {
       // prevent iterator to filter out
       return irs::doc_limits::invalid();
     }
+
+    IRS_DOC_ITERATOR_DEFAULTS
   };
 
-  struct Prepared : public irs::Filter::Query {
-    irs::DocIterator::ptr execute(const irs::ExecutionContext&) const final {
+  struct Prepared : public irs::QueryBuilder {
+    explicit Prepared(const irs::SubReader& segment) : QueryBuilder{segment} {}
+
+    irs::DocIterator::ptr Execute(const irs::ExecutionContext&,
+                                  const irs::StatsBuffer&) const final {
       return irs::memory::make_managed<Unestimated::DocIteratorImpl>();
     }
-    void visit(const irs::SubReader&, irs::PreparedStateVisitor&,
-               irs::score_t) const final {
+    void Visit(irs::PreparedStateVisitor&, irs::score_t) const final {
       // No terms to visit
     }
 
     irs::score_t Boost() const noexcept final { return irs::kNoBoost; }
   };
 
-  Filter::Query::ptr prepare(const irs::PrepareContext& /*ctx*/) const final {
-    return irs::memory::make_managed<Unestimated::Prepared>();
+  irs::QueryBuilder::ptr PrepareSegment(
+    const irs::SubReader& segment,
+    const irs::PrepareContext& /*ctx*/) const final {
+    return irs::memory::make_managed<Unestimated::Prepared>(segment);
   }
 
   irs::TypeInfo::type_id type() const noexcept final {
@@ -1179,20 +1128,23 @@ struct Estimated : public irs::FilterWithBoost {
       return nullptr;
     }
 
+    IRS_DOC_ITERATOR_DEFAULTS
+
     irs::CostAttr cost;
   };
 
-  struct Prepared : public irs::Filter::Query {
-    explicit Prepared(irs::CostAttr::Type est, bool* evaluated)
-      : evaluated(evaluated), est(est) {}
+  struct Prepared : public irs::QueryBuilder {
+    explicit Prepared(const irs::SubReader& segment, irs::CostAttr::Type est,
+                      bool* evaluated)
+      : QueryBuilder{segment}, evaluated(evaluated), est(est) {}
 
-    irs::DocIterator::ptr execute(const irs::ExecutionContext&) const final {
+    irs::DocIterator::ptr Execute(const irs::ExecutionContext&,
+                                  const irs::StatsBuffer&) const final {
       return irs::memory::make_managed<Estimated::DocIteratorImpl>(est,
                                                                    evaluated);
     }
 
-    void visit(const irs::SubReader&, irs::PreparedStateVisitor&,
-               irs::score_t) const final {
+    void Visit(irs::PreparedStateVisitor&, irs::score_t) const final {
       // No terms to visit
     }
 
@@ -1202,8 +1154,11 @@ struct Estimated : public irs::FilterWithBoost {
     irs::CostAttr::Type est;
   };
 
-  Filter::Query::ptr prepare(const irs::PrepareContext& /*ctx*/) const final {
-    return irs::memory::make_managed<Estimated::Prepared>(est, &evaluated);
+  irs::QueryBuilder::ptr PrepareSegment(
+    const irs::SubReader& segment,
+    const irs::PrepareContext& /*ctx*/) const final {
+    return irs::memory::make_managed<Estimated::Prepared>(segment, est,
+                                                          &evaluated);
   }
 
   irs::TypeInfo::type_id type() const noexcept final {
@@ -1228,13 +1183,10 @@ TEST(boolean_query_estimation, or_filter) {
     root.add<detail::Estimated>().est = 1;
     root.add<detail::Estimated>().est = 100;
 
-    auto prep = root.prepare({
-      .index = irs::SubReader::empty(),
-      .memory = counter,
-    });
-
     detail::SegmentReaderMock segment_reader{1000};
-    auto docs = prep->execute({.segment = segment_reader});
+    tests::PreparedFilter prep{root, segment_reader, nullptr, counter};
+
+    auto docs = prep.Execute(0);
 
     // check that subqueries were not estimated
     for (auto it = root.begin(), end = root.end(); it != end; ++it) {
@@ -1264,9 +1216,9 @@ TEST(boolean_query_estimation, or_filter) {
     root.add<detail::Unestimated>();
     root.add<detail::Unestimated>();
 
-    auto prep = root.prepare({.index = irs::SubReader::empty()});
+    tests::PreparedFilter prep{root, irs::SubReader::empty()};
 
-    auto docs = prep->execute({.segment = irs::SubReader::empty()});
+    auto docs = prep.Execute(0);
     ASSERT_EQ(0, irs::CostAttr::extract(*docs));
   }
 
@@ -1282,10 +1234,10 @@ TEST(boolean_query_estimation, or_filter) {
     root.add<detail::Estimated>().est = 100;
     root.add<detail::Unestimated>();
 
-    auto prep = root.prepare({.index = irs::SubReader::empty()});
-
     detail::SegmentReaderMock segment_reader{1000};
-    auto docs = prep->execute({.segment = segment_reader});
+    tests::PreparedFilter prep{root, segment_reader};
+
+    auto docs = prep.Execute(0);
 
     /* check that subqueries were not estimated */
     for (auto it = root.begin(), end = root.end(); it != end; ++it) {
@@ -1309,16 +1261,22 @@ TEST(boolean_query_estimation, or_filter) {
   // estimated/unestimated/negative subqueries
   {
     irs::Or root;
-    root.add<detail::Estimated>().est = 100;
-    root.add<detail::Estimated>().est = 320;
-    root.add<irs::Not>().filter<detail::Estimated>().est = 3;
+    std::vector<detail::Estimated*> estimated;
+    auto add_estimated = [&](irs::CostAttr::Type est) {
+      auto& node = root.add<detail::Estimated>();
+      node.est = est;
+      estimated.emplace_back(&node);
+    };
+    add_estimated(100);
+    add_estimated(320);
+    root.add<irs::Exclusion>().exclude<detail::Estimated>().est = 3;
     root.add<detail::Unestimated>();
-    root.add<detail::Estimated>().est = 10;
+    add_estimated(10);
     root.add<detail::Unestimated>();
-    root.add<detail::Estimated>().est = 7;
-    root.add<detail::Estimated>().est = 100;
-    root.add<irs::Not>().filter<detail::Unestimated>();
-    root.add<irs::Not>().filter<detail::Estimated>().est = 0;
+    add_estimated(7);
+    add_estimated(100);
+    root.add<irs::Exclusion>().exclude<detail::Unestimated>();
+    root.add<irs::Exclusion>().exclude<detail::Estimated>().est = 0;
     root.add<detail::Unestimated>();
 
     // we need order to suppress optimization
@@ -1326,30 +1284,20 @@ TEST(boolean_query_estimation, or_filter) {
     tests::sort::Boost impl;
     const irs::Scorer* sort{&impl};
 
-    auto prep =
-      root.prepare({.index = irs::SubReader::empty(), .scorer = sort});
+    auto optimized = tests::Optimized(std::move(root), sort);
 
     detail::SegmentReaderMock segment_reader{1000};
-    auto docs = prep->execute({.segment = segment_reader});
+    tests::PreparedFilter prep{*optimized, segment_reader, sort};
 
-    // check that subqueries were not estimated
-    for (auto it = root.begin(), end = root.end(); it != end; ++it) {
-      auto* est_query = dynamic_cast<detail::Estimated*>(it->get());
-      if (est_query) {
-        ASSERT_FALSE(est_query->evaluated);
-      }
-    }
+    auto docs = prep.Execute(0);
 
     // Each Not(x) adds AllDocs to incl group; AllDocs cost = docs_count (1000).
     // Sum (1000+537) > docs_count, so cost is capped to docs_count.
     ASSERT_EQ(1000, irs::CostAttr::extract(*docs));
 
     // check that subqueries were estimated
-    for (auto it = root.begin(), end = root.end(); it != end; ++it) {
-      auto* est_query = dynamic_cast<detail::Estimated*>(it->get());
-      if (est_query) {
-        ASSERT_TRUE(est_query->evaluated);
-      }
+    for (auto* est_query : estimated) {
+      ASSERT_TRUE(est_query->evaluated);
     }
   }
 
@@ -1357,9 +1305,10 @@ TEST(boolean_query_estimation, or_filter) {
   {
     irs::Or root;
 
-    auto prep = root.prepare({.index = irs::SubReader::empty()});
+    tests::PreparedFilter prep{*tests::Optimized(std::move(root)),
+                               irs::SubReader::empty()};
 
-    auto docs = prep->execute({.segment = irs::SubReader::empty()});
+    auto docs = prep.Execute(0);
     ASSERT_EQ(0, irs::CostAttr::extract(*docs));
   }
 }
@@ -1374,9 +1323,9 @@ TEST(boolean_query_estimation, and_filter) {
     root.add<detail::Estimated>().est = 1;
     root.add<detail::Estimated>().est = 100;
 
-    auto prep = root.prepare({.index = irs::SubReader::empty()});
+    tests::PreparedFilter prep{root, irs::SubReader::empty()};
 
-    auto docs = prep->execute({.segment = irs::SubReader::empty()});
+    auto docs = prep.Execute(0);
 
     // check that subqueries were estimated
     for (auto it = root.begin(), end = root.end(); it != end; ++it) {
@@ -1397,9 +1346,9 @@ TEST(boolean_query_estimation, and_filter) {
     root.add<detail::Unestimated>();
     root.add<detail::Unestimated>();
 
-    auto prep = root.prepare({.index = irs::SubReader::empty()});
+    tests::PreparedFilter prep{root, irs::SubReader::empty()};
 
-    auto docs = prep->execute({.segment = irs::SubReader::empty()});
+    auto docs = prep.Execute(0);
 
     // check that subqueries were estimated
     for (auto it = root.begin(), end = root.end(); it != end; ++it) {
@@ -1425,9 +1374,9 @@ TEST(boolean_query_estimation, and_filter) {
     root.add<detail::Estimated>().est = 100;
     root.add<detail::Unestimated>();
 
-    auto prep = root.prepare({.index = irs::SubReader::empty()});
+    tests::PreparedFilter prep{root, irs::SubReader::empty()};
 
-    auto docs = prep->execute({.segment = irs::SubReader::empty()});
+    auto docs = prep.Execute(0);
 
     // check that subqueries were estimated
     for (auto it = root.begin(), end = root.end(); it != end; ++it) {
@@ -1443,28 +1392,32 @@ TEST(boolean_query_estimation, and_filter) {
   // estimated/unestimated/negative subqueries
   {
     irs::And root;
-    root.add<detail::Estimated>().est = 100;
-    root.add<detail::Estimated>().est = 320;
-    root.add<irs::Not>().filter<detail::Estimated>().est = 3;
+    std::vector<detail::Estimated*> estimated;
+    auto add_estimated = [&](irs::CostAttr::Type est) {
+      auto& node = root.add<detail::Estimated>();
+      node.est = est;
+      estimated.emplace_back(&node);
+    };
+    add_estimated(100);
+    add_estimated(320);
+    root.add<irs::Exclusion>().exclude<detail::Estimated>().est = 3;
     root.add<detail::Unestimated>();
-    root.add<detail::Estimated>().est = 10;
+    add_estimated(10);
     root.add<detail::Unestimated>();
-    root.add<detail::Estimated>().est = 7;
-    root.add<detail::Estimated>().est = 100;
-    root.add<irs::Not>().filter<detail::Unestimated>();
-    root.add<irs::Not>().filter<detail::Estimated>().est = 0;
+    add_estimated(7);
+    add_estimated(100);
+    root.add<irs::Exclusion>().exclude<detail::Unestimated>();
+    root.add<irs::Exclusion>().exclude<detail::Estimated>().est = 0;
     root.add<detail::Unestimated>();
 
-    auto prep = root.prepare({.index = irs::SubReader::empty()});
+    auto optimized = tests::Optimized(std::move(root));
+    tests::PreparedFilter prep{*optimized, irs::SubReader::empty()};
 
-    auto docs = prep->execute({.segment = irs::SubReader::empty()});
+    auto docs = prep.Execute(0);
 
     // check that subqueries were estimated
-    for (auto it = root.begin(), end = root.end(); it != end; ++it) {
-      auto* est_query = dynamic_cast<detail::Estimated*>(it->get());
-      if (est_query) {
-        ASSERT_TRUE(est_query->evaluated);
-      }
+    for (auto* est_query : estimated) {
+      ASSERT_TRUE(est_query->evaluated);
     }
 
     ASSERT_EQ(7, irs::CostAttr::extract(*docs));
@@ -1473,9 +1426,10 @@ TEST(boolean_query_estimation, and_filter) {
   // empty case
   {
     irs::And root;
-    auto prep = root.prepare({.index = irs::SubReader::empty()});
+    tests::PreparedFilter prep{*tests::Optimized(std::move(root)),
+                               irs::SubReader::empty()};
 
-    auto docs = prep->execute({.segment = irs::SubReader::empty()});
+    auto docs = prep.Execute(0);
     ASSERT_EQ(0, irs::CostAttr::extract(*docs));
   }
 }
@@ -1510,11 +1464,11 @@ TEST(basic_disjunction, next) {
 
       ASSERT_EQ(first.size() + last.size(), irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -1531,10 +1485,10 @@ TEST(basic_disjunction, next) {
       EXPECT_EQ(compute_count(first, last), first.size());
       ASSERT_EQ(first.size() + last.size(), irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -1551,10 +1505,10 @@ TEST(basic_disjunction, next) {
       EXPECT_EQ(compute_count(first, last), last.size());
       ASSERT_EQ(first.size() + last.size(), irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(last, result);
@@ -1570,10 +1524,10 @@ TEST(basic_disjunction, next) {
       EXPECT_EQ(compute_count(first, last), first.size());
       ASSERT_EQ(first.size() + last.size(), irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(first, result);
@@ -1589,10 +1543,10 @@ TEST(basic_disjunction, next) {
       EXPECT_EQ(compute_count(first, last), first.size());
       ASSERT_EQ(first.size() + last.size(), irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(first, result);
@@ -1609,10 +1563,10 @@ TEST(basic_disjunction, next) {
       EXPECT_EQ(compute_count(first, last), expected.size());
       ASSERT_EQ(first.size() + last.size(), irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -1744,16 +1698,16 @@ TEST(basic_disjunction_test, seek_next) {
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
     ASSERT_EQ(5, it.seek(5));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     ASSERT_EQ(11, it.seek(10));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 }
@@ -1788,19 +1742,19 @@ TEST(basic_disjunction_test, scored_seek_next) {
     ASSERT_EQ(first.size() + last.size(), irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     ASSERT_EQ(5, it.seek(5));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     ASSERT_EQ(11, it.seek(10));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -1838,7 +1792,7 @@ TEST(basic_disjunction_test, scored_seek_next) {
     ASSERT_EQ(1, irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -1846,24 +1800,24 @@ TEST(basic_disjunction_test, scored_seek_next) {
     ASSERT_EQ(5, it.seek(5));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1 + 2
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 2
     ASSERT_EQ(6, it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1
     ASSERT_EQ(11, it.seek(10));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -1901,7 +1855,7 @@ TEST(basic_disjunction_test, scored_seek_next) {
     ASSERT_EQ(1, irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -1909,24 +1863,24 @@ TEST(basic_disjunction_test, scored_seek_next) {
     ASSERT_EQ(5, it.seek(5));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(1, 2)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(2)
     ASSERT_EQ(6, it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(1)
     ASSERT_EQ(11, it.seek(10));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(1)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(1)
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -1964,7 +1918,7 @@ TEST(basic_disjunction_test, scored_seek_next) {
     ASSERT_EQ(first.size() + last.size(), irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     irs::score_t tmp;
     tmp = score.Score();
     ASSERT_EQ(1, it.value());
@@ -1973,24 +1927,24 @@ TEST(basic_disjunction_test, scored_seek_next) {
     ASSERT_EQ(5, it.seek(5));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
     ASSERT_EQ(6, it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
     ASSERT_EQ(11, it.seek(10));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     tmp = score.Score();
     ASSERT_EQ(45, it.value());
     ASSERT_EQ(0, tmp);
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -2028,7 +1982,7 @@ TEST(basic_disjunction_test, scored_seek_next) {
     ASSERT_EQ(first.size() + last.size(), irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -2036,24 +1990,24 @@ TEST(basic_disjunction_test, scored_seek_next) {
     ASSERT_EQ(5, it.seek(5));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
     ASSERT_EQ(6, it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
     ASSERT_EQ(11, it.seek(10));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -2091,7 +2045,7 @@ TEST(basic_disjunction_test, scored_seek_next) {
     ASSERT_EQ(first.size() + last.size(), irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -2099,24 +2053,24 @@ TEST(basic_disjunction_test, scored_seek_next) {
     ASSERT_EQ(5, it.seek(5));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
     ASSERT_EQ(11, it.seek(10));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -2154,7 +2108,7 @@ TEST(basic_disjunction_test, scored_seek_next) {
     ASSERT_EQ(first.size() + last.size(), irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -2162,24 +2116,24 @@ TEST(basic_disjunction_test, scored_seek_next) {
     ASSERT_EQ(5, it.seek(5));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
     ASSERT_EQ(11, it.seek(10));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -2217,7 +2171,7 @@ TEST(basic_disjunction_test, scored_seek_next) {
     ASSERT_EQ(first.size() + last.size(), irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -2225,24 +2179,24 @@ TEST(basic_disjunction_test, scored_seek_next) {
     ASSERT_EQ(5, it.seek(5));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
     ASSERT_EQ(11, it.seek(10));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -2280,7 +2234,7 @@ TEST(basic_disjunction_test, scored_seek_next) {
     ASSERT_EQ(first.size() + last.size(), irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -2288,24 +2242,24 @@ TEST(basic_disjunction_test, scored_seek_next) {
     ASSERT_EQ(5, it.seek(5));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
     ASSERT_EQ(11, it.seek(10));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 }
@@ -2323,7 +2277,7 @@ TEST(small_disjunction_test, next) {
     Disjunction it(Disjunction::Adapters{}, irs::doc_limits::eof());
     ASSERT_EQ(0, irs::CostAttr::extract(it));
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
   }
 
@@ -2339,10 +2293,10 @@ TEST(small_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -2359,10 +2313,10 @@ TEST(small_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -2380,10 +2334,10 @@ TEST(small_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs[0], result);
@@ -2399,10 +2353,10 @@ TEST(small_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs[0], result);
@@ -2419,10 +2373,10 @@ TEST(small_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_TRUE(!irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -2441,10 +2395,10 @@ TEST(small_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -2468,10 +2422,10 @@ TEST(small_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -2489,10 +2443,10 @@ TEST(small_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -2511,10 +2465,10 @@ TEST(small_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs.front(), result);
@@ -2533,10 +2487,10 @@ TEST(small_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs[0], result);
@@ -2554,10 +2508,10 @@ TEST(small_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -2683,10 +2637,10 @@ TEST(small_disjunction_test, seek) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -2710,10 +2664,10 @@ TEST(small_disjunction_test, seek) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -2731,10 +2685,10 @@ TEST(small_disjunction_test, seek) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -2753,10 +2707,10 @@ TEST(small_disjunction_test, seek) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs.front(), result);
@@ -2775,10 +2729,10 @@ TEST(small_disjunction_test, seek) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs[0], result);
@@ -2796,10 +2750,10 @@ TEST(small_disjunction_test, seek) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -2825,16 +2779,16 @@ TEST(small_disjunction_test, seek_next) {
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
     ASSERT_EQ(5, it.seek(5));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     ASSERT_EQ(29, it.seek(27));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 }
@@ -2867,16 +2821,16 @@ TEST(small_disjunction_test, scored_seek_next) {
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
     ASSERT_EQ(5, it.seek(5));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     ASSERT_EQ(29, it.seek(27));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -2912,7 +2866,7 @@ TEST(small_disjunction_test, scored_seek_next) {
     ASSERT_EQ(1, irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -2920,24 +2874,24 @@ TEST(small_disjunction_test, scored_seek_next) {
     ASSERT_EQ(5, it.seek(5));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1+2+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 2+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1
     ASSERT_EQ(29, it.seek(27));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 2
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -2973,7 +2927,7 @@ TEST(small_disjunction_test, scored_seek_next) {
     ASSERT_EQ(1, irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -2981,24 +2935,24 @@ TEST(small_disjunction_test, scored_seek_next) {
     ASSERT_EQ(5, it.seek(5));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(1, 2, 4)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(2, 4)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(1)
     ASSERT_EQ(29, it.seek(27));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(2)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(1)
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -3034,7 +2988,7 @@ TEST(small_disjunction_test, scored_seek_next) {
     ASSERT_EQ(1, irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     it.FetchScoreArgs(0);
@@ -3044,12 +2998,12 @@ TEST(small_disjunction_test, scored_seek_next) {
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
@@ -3058,14 +3012,14 @@ TEST(small_disjunction_test, scored_seek_next) {
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  //
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -3101,7 +3055,7 @@ TEST(small_disjunction_test, scored_seek_next) {
     ASSERT_EQ(1, irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -3109,24 +3063,24 @@ TEST(small_disjunction_test, scored_seek_next) {
     ASSERT_EQ(5, it.seek(5));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(1, 4)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(4)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(1)
     ASSERT_EQ(29, it.seek(27));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // default value
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(1)
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -3163,7 +3117,7 @@ TEST(small_disjunction_test, scored_seek_next) {
     ASSERT_EQ(1, irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     it.FetchScoreArgs(0);
@@ -3173,12 +3127,12 @@ TEST(small_disjunction_test, scored_seek_next) {
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
@@ -3187,14 +3141,14 @@ TEST(small_disjunction_test, scored_seek_next) {
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  //
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -3230,7 +3184,7 @@ TEST(small_disjunction_test, scored_seek_next) {
     ASSERT_EQ(1, irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -3238,24 +3192,24 @@ TEST(small_disjunction_test, scored_seek_next) {
     ASSERT_EQ(5, it.seek(5));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
     ASSERT_EQ(29, it.seek(27));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 }
@@ -3365,13 +3319,13 @@ TEST(block_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      while (it.next()) {
+      while (!irs::doc_limits::eof(it.advance())) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -3396,13 +3350,13 @@ TEST(block_disjunction_test, next) {
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -3428,13 +3382,13 @@ TEST(block_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -3459,13 +3413,13 @@ TEST(block_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -3491,13 +3445,13 @@ TEST(block_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -3524,13 +3478,13 @@ TEST(block_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -3558,13 +3512,13 @@ TEST(block_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -3587,13 +3541,13 @@ TEST(block_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs[0], result);
@@ -3614,13 +3568,13 @@ TEST(block_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs[0], result);
@@ -3642,13 +3596,13 @@ TEST(block_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_TRUE(!irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -3660,7 +3614,7 @@ TEST(block_disjunction_test, next) {
     ASSERT_EQ(0, irs::CostAttr::extract(it));
     ASSERT_EQ(0, it.MatchCount());
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(0, it.MatchCount());
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
   }
@@ -3682,13 +3636,13 @@ TEST(block_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -3716,13 +3670,13 @@ TEST(block_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -3744,13 +3698,13 @@ TEST(block_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -3774,13 +3728,13 @@ TEST(block_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs.front(), result);
@@ -3804,13 +3758,13 @@ TEST(block_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs[0], result);
@@ -3833,13 +3787,13 @@ TEST(block_disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -3857,13 +3811,13 @@ TEST(block_disjunction_test, next) {
     Disjunction it{std::move(itrs), irs::doc_limits::eof()};
     ASSERT_EQ(0, irs::CostAttr::extract(it));
     ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-    for (; it.next();) {
+    for (; !irs::doc_limits::eof(it.advance());) {
       result.push_back(it.value());
       ASSERT_EQ(1, it.MatchCount());
     }
     ASSERT_EQ(0, it.MatchCount());
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     ASSERT_EQ(expected, result);
   }
@@ -3915,13 +3869,13 @@ TEST(block_disjunction_test, next_scored) {
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       ASSERT_EQ(1, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      while (it.next()) {
+      while (!irs::doc_limits::eof(it.advance())) {
         result.emplace_back(it.value(), 0);
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -3972,7 +3926,7 @@ TEST(block_disjunction_test, next_scored) {
 
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       ASSERT_EQ(1, irs::CostAttr::extract(it));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         irs::score_t score_value{};
         score_value = score.Score();
@@ -3981,7 +3935,7 @@ TEST(block_disjunction_test, next_scored) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -4034,7 +3988,7 @@ TEST(block_disjunction_test, next_scored) {
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       ASSERT_EQ(2, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         irs::score_t score_value{};
         score_value = score.Score();
@@ -4043,7 +3997,7 @@ TEST(block_disjunction_test, next_scored) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -4095,14 +4049,14 @@ TEST(block_disjunction_test, next_scored) {
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       ASSERT_EQ(2, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         result.emplace_back(it.value(), 0);
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -4153,7 +4107,7 @@ TEST(block_disjunction_test, next_scored) {
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       ASSERT_EQ(2, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         irs::score_t score_value{};
         score_value = score.Score();
@@ -4162,7 +4116,7 @@ TEST(block_disjunction_test, next_scored) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -4226,7 +4180,7 @@ TEST(block_disjunction_test, next_scored) {
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       ASSERT_EQ(2, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         irs::score_t score_value{};
         score_value = score.Score();
@@ -4235,7 +4189,7 @@ TEST(block_disjunction_test, next_scored) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -4299,7 +4253,7 @@ TEST(block_disjunction_test, next_scored) {
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       ASSERT_EQ(2, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         irs::score_t score_value{};
         score_value = score.Score();
@@ -4308,7 +4262,7 @@ TEST(block_disjunction_test, next_scored) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -4360,7 +4314,7 @@ TEST(block_disjunction_test, next_scored) {
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       ASSERT_EQ(2, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         irs::score_t score_value{};
         score_value = score.Score();
@@ -4369,7 +4323,7 @@ TEST(block_disjunction_test, next_scored) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -4415,7 +4369,7 @@ TEST(block_disjunction_test, next_scored) {
 
       ASSERT_EQ(2, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         result.push_back(it.value());
         irs::score_t score_value{};
@@ -4425,7 +4379,7 @@ TEST(block_disjunction_test, next_scored) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs.front(), result);
@@ -4469,7 +4423,7 @@ TEST(block_disjunction_test, next_scored) {
 
       ASSERT_EQ(2, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         result.push_back(it.value());
         irs::score_t score_value{};
@@ -4479,7 +4433,7 @@ TEST(block_disjunction_test, next_scored) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs.front(), result);
@@ -4522,7 +4476,7 @@ TEST(block_disjunction_test, next_scored) {
 
       ASSERT_EQ(0, irs::CostAttr::extract(it));
       ASSERT_TRUE(!irs::doc_limits::valid(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
@@ -4547,7 +4501,7 @@ TEST(block_disjunction_test, next_scored) {
     ASSERT_EQ(0, irs::CostAttr::extract(it));
     ASSERT_EQ(0, it.MatchCount());
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(0, it.MatchCount());
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
   }
@@ -4594,7 +4548,7 @@ TEST(block_disjunction_test, next_scored) {
 
       ASSERT_EQ(3, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         irs::score_t score_value{};
         score_value = score.Score();
@@ -4603,7 +4557,7 @@ TEST(block_disjunction_test, next_scored) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -4654,7 +4608,7 @@ TEST(block_disjunction_test, next_scored) {
 
       ASSERT_EQ(3, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         irs::score_t score_value{};
         score_value = score.Score();
@@ -4663,7 +4617,7 @@ TEST(block_disjunction_test, next_scored) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -4710,7 +4664,7 @@ TEST(block_disjunction_test, next_scored) {
 
       ASSERT_EQ(3, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         irs::score_t score_value{};
         score_value = score.Score();
@@ -4719,7 +4673,7 @@ TEST(block_disjunction_test, next_scored) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -4765,7 +4719,7 @@ TEST(block_disjunction_test, next_scored) {
 
       ASSERT_EQ(3, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         result.push_back(it.value());
         irs::score_t score_value{};
@@ -4775,7 +4729,7 @@ TEST(block_disjunction_test, next_scored) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs.front(), result);
@@ -4819,9 +4773,9 @@ TEST(block_disjunction_test, next_scored) {
 
     ASSERT_EQ(3, irs::CostAttr::extract(it));
     ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
   }
 }
@@ -4870,14 +4824,14 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       ASSERT_EQ(1, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      while (it.next()) {
+      while (!irs::doc_limits::eof(it.advance())) {
         it.FetchScoreArgs(0);
         result.emplace_back(it.value(), 0);
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -4927,7 +4881,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
 
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       ASSERT_EQ(1, irs::CostAttr::extract(it));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         irs::score_t score_value{};
         score_value = score.Score();
@@ -4936,7 +4890,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -4987,7 +4941,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       ASSERT_EQ(2, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         irs::score_t score_value{};
         score_value = score.Score();
@@ -4996,7 +4950,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -5046,14 +5000,14 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       ASSERT_EQ(2, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         result.emplace_back(it.value(), 0);
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -5105,7 +5059,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       ASSERT_EQ(2, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         irs::score_t score_value{};
         score_value = score.Score();
@@ -5114,7 +5068,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -5179,7 +5133,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       ASSERT_EQ(2, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         irs::score_t score_value{};
         score_value = score.Score();
@@ -5188,7 +5142,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -5253,7 +5207,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       ASSERT_EQ(2, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         irs::score_t score_value{};
         score_value = score.Score();
@@ -5262,7 +5216,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -5315,7 +5269,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       ASSERT_EQ(2, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         irs::score_t score_value{};
         score_value = score.Score();
@@ -5324,7 +5278,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -5369,7 +5323,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
 
       ASSERT_EQ(2, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         result.push_back(it.value());
         irs::score_t score_value{};
@@ -5379,7 +5333,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs.front(), result);
@@ -5422,7 +5376,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
 
       ASSERT_EQ(2, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         result.push_back(it.value());
         irs::score_t score_value{};
@@ -5432,7 +5386,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs.front(), result);
@@ -5476,7 +5430,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
 
       ASSERT_EQ(0, irs::CostAttr::extract(it));
       ASSERT_TRUE(!irs::doc_limits::valid(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
@@ -5513,7 +5467,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
     ASSERT_EQ(0, irs::CostAttr::extract(it));
     ASSERT_EQ(0, it.MatchCount());
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(0, it.MatchCount());
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
   }
@@ -5560,7 +5514,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
 
       ASSERT_EQ(3, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         irs::score_t score_value{};
         score_value = score.Score();
@@ -5569,7 +5523,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -5620,7 +5574,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
 
       ASSERT_EQ(3, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         irs::score_t score_value{};
         score_value = score.Score();
@@ -5629,7 +5583,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -5676,7 +5630,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
 
       ASSERT_EQ(3, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         irs::score_t score_value{};
         score_value = score.Score();
@@ -5685,7 +5639,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -5731,7 +5685,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
 
       ASSERT_EQ(3, irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         it.FetchScoreArgs(0);
         result.push_back(it.value());
         irs::score_t score_value{};
@@ -5741,7 +5695,7 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs.front(), result);
@@ -5785,9 +5739,9 @@ TEST(block_disjunction_test, next_scored_two_blocks) {
 
     ASSERT_EQ(3, irs::CostAttr::extract(it));
     ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
   }
 }
@@ -5815,13 +5769,13 @@ TEST(block_disjunction_test, min_match_next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      while (it.next()) {
+      while (!irs::doc_limits::eof(it.advance())) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -5841,7 +5795,7 @@ TEST(block_disjunction_test, min_match_next) {
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
   }
@@ -5859,13 +5813,13 @@ TEST(block_disjunction_test, min_match_next) {
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -5886,13 +5840,13 @@ TEST(block_disjunction_test, min_match_next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -5914,13 +5868,13 @@ TEST(block_disjunction_test, min_match_next) {
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       auto match_count = match_counts.begin();
-      for (; it.next(); ++match_count) {
+      for (; !irs::doc_limits::eof(it.advance()); ++match_count) {
         result.push_back(it.value());
         ASSERT_EQ(*match_count, it.MatchCount());
       }
       ASSERT_EQ(match_count, match_counts.end());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -5943,14 +5897,14 @@ TEST(block_disjunction_test, min_match_next) {
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       auto match_count = match_counts.begin();
-      for (; it.next(); ++match_count) {
+      for (; !irs::doc_limits::eof(it.advance()); ++match_count) {
         result.push_back(it.value());
         ASSERT_EQ(*match_count, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_EQ(match_count, match_counts.end());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -5973,14 +5927,14 @@ TEST(block_disjunction_test, min_match_next) {
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       auto match_count = match_counts.begin();
-      for (; it.next(); ++match_count) {
+      for (; !irs::doc_limits::eof(it.advance()); ++match_count) {
         result.push_back(it.value());
         ASSERT_EQ(*match_count, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_EQ(match_count, match_counts.end());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -6005,14 +5959,14 @@ TEST(block_disjunction_test, min_match_next) {
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       auto match_count = match_counts.begin();
-      for (; it.next(); ++match_count) {
+      for (; !irs::doc_limits::eof(it.advance()); ++match_count) {
         result.push_back(it.value());
         ASSERT_EQ(*match_count, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_EQ(match_count, match_counts.end());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -6031,10 +5985,10 @@ TEST(block_disjunction_test, min_match_next) {
     ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
               irs::CostAttr::extract(it));
     ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(0, it.MatchCount());
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
   }
 
@@ -6057,14 +6011,14 @@ TEST(block_disjunction_test, min_match_next) {
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       auto match_count = match_counts.begin();
-      for (; it.next(); ++match_count) {
+      for (; !irs::doc_limits::eof(it.advance()); ++match_count) {
         result.push_back(it.value());
         ASSERT_EQ(*match_count, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_EQ(match_count, match_counts.end());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -6089,14 +6043,14 @@ TEST(block_disjunction_test, min_match_next) {
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       auto match_count = match_counts.begin();
-      for (; it.next(); ++match_count) {
+      for (; !irs::doc_limits::eof(it.advance()); ++match_count) {
         result.push_back(it.value());
         ASSERT_EQ(*match_count, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_EQ(match_count, match_counts.end());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -6123,14 +6077,14 @@ TEST(block_disjunction_test, min_match_next) {
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       auto match_count = match_counts.begin();
-      for (; it.next(); ++match_count) {
+      for (; !irs::doc_limits::eof(it.advance()); ++match_count) {
         result.push_back(it.value());
         ASSERT_EQ(*match_count, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_EQ(match_count, match_counts.end());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -6155,14 +6109,14 @@ TEST(block_disjunction_test, min_match_next) {
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       auto match_count = match_counts.begin();
-      for (; it.next(); ++match_count) {
+      for (; !irs::doc_limits::eof(it.advance()); ++match_count) {
         result.push_back(it.value());
         ASSERT_EQ(*match_count, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_EQ(match_count, match_counts.end());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -6180,13 +6134,13 @@ TEST(block_disjunction_test, min_match_next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(2, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs[0], result);
@@ -6202,13 +6156,13 @@ TEST(block_disjunction_test, min_match_next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs[0], result);
@@ -6225,13 +6179,13 @@ TEST(block_disjunction_test, min_match_next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(3, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs[0], result);
@@ -6246,7 +6200,7 @@ TEST(block_disjunction_test, min_match_next) {
               irs::CostAttr::extract(it));
     ASSERT_EQ(0, it.MatchCount());
     ASSERT_TRUE(!irs::doc_limits::valid(it.value()));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(0, it.MatchCount());
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
   }
@@ -6256,7 +6210,7 @@ TEST(block_disjunction_test, min_match_next) {
     Disjunction it(Disjunction::Adapters{}, irs::doc_limits::eof());
     ASSERT_EQ(0, irs::CostAttr::extract(it));
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
   }
 
@@ -6274,13 +6228,13 @@ TEST(block_disjunction_test, min_match_next) {
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       auto match_count = match_counts.begin();
-      for (; it.next(); ++match_count) {
+      for (; !irs::doc_limits::eof(it.advance()); ++match_count) {
         result.push_back(it.value());
         ASSERT_EQ(*match_count, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
@@ -6308,13 +6262,13 @@ TEST(block_disjunction_test, min_match_next) {
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       auto match_count = match_counts.begin();
-      for (; it.next(); ++match_count) {
+      for (; !irs::doc_limits::eof(it.advance()); ++match_count) {
         result.push_back(it.value());
         ASSERT_EQ(*match_count, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
@@ -6333,13 +6287,13 @@ TEST(block_disjunction_test, min_match_next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
@@ -6359,13 +6313,13 @@ TEST(block_disjunction_test, min_match_next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
@@ -6385,13 +6339,13 @@ TEST(block_disjunction_test, min_match_next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(3, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
@@ -6408,7 +6362,7 @@ TEST(block_disjunction_test, min_match_next) {
               irs::CostAttr::extract(it));
     ASSERT_EQ(0, it.MatchCount());
     ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(0, it.MatchCount());
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
   }
@@ -6437,13 +6391,13 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      while (it.next()) {
+      while (!irs::doc_limits::eof(it.advance())) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -6463,7 +6417,7 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
   }
@@ -6481,13 +6435,13 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -6508,13 +6462,13 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -6536,13 +6490,13 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       auto match_count = match_counts.begin();
-      for (; it.next(); ++match_count) {
+      for (; !irs::doc_limits::eof(it.advance()); ++match_count) {
         result.push_back(it.value());
         ASSERT_EQ(*match_count, it.MatchCount());
       }
       ASSERT_EQ(match_count, match_counts.end());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -6565,14 +6519,14 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       auto match_count = match_counts.begin();
-      for (; it.next(); ++match_count) {
+      for (; !irs::doc_limits::eof(it.advance()); ++match_count) {
         result.push_back(it.value());
         ASSERT_EQ(*match_count, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_EQ(match_count, match_counts.end());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -6595,14 +6549,14 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       auto match_count = match_counts.begin();
-      for (; it.next(); ++match_count) {
+      for (; !irs::doc_limits::eof(it.advance()); ++match_count) {
         result.push_back(it.value());
         ASSERT_EQ(*match_count, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_EQ(match_count, match_counts.end());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -6627,14 +6581,14 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       auto match_count = match_counts.begin();
-      for (; it.next(); ++match_count) {
+      for (; !irs::doc_limits::eof(it.advance()); ++match_count) {
         result.push_back(it.value());
         ASSERT_EQ(*match_count, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_EQ(match_count, match_counts.end());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -6653,10 +6607,10 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
     ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
               irs::CostAttr::extract(it));
     ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(0, it.MatchCount());
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
   }
 
@@ -6679,14 +6633,14 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       auto match_count = match_counts.begin();
-      for (; it.next(); ++match_count) {
+      for (; !irs::doc_limits::eof(it.advance()); ++match_count) {
         result.push_back(it.value());
         ASSERT_EQ(*match_count, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_EQ(match_count, match_counts.end());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -6711,14 +6665,14 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       auto match_count = match_counts.begin();
-      for (; it.next(); ++match_count) {
+      for (; !irs::doc_limits::eof(it.advance()); ++match_count) {
         result.push_back(it.value());
         ASSERT_EQ(*match_count, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_EQ(match_count, match_counts.end());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -6745,14 +6699,14 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       auto match_count = match_counts.begin();
-      for (; it.next(); ++match_count) {
+      for (; !irs::doc_limits::eof(it.advance()); ++match_count) {
         result.push_back(it.value());
         ASSERT_EQ(*match_count, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_EQ(match_count, match_counts.end());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -6777,14 +6731,14 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       auto match_count = match_counts.begin();
-      for (; it.next(); ++match_count) {
+      for (; !irs::doc_limits::eof(it.advance()); ++match_count) {
         result.push_back(it.value());
         ASSERT_EQ(*match_count, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_EQ(match_count, match_counts.end());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -6802,13 +6756,13 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(2, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs[0], result);
@@ -6824,13 +6778,13 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs[0], result);
@@ -6847,13 +6801,13 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(3, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs[0], result);
@@ -6868,7 +6822,7 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
               irs::CostAttr::extract(it));
     ASSERT_EQ(0, it.MatchCount());
     ASSERT_TRUE(!irs::doc_limits::valid(it.value()));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(0, it.MatchCount());
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
   }
@@ -6878,7 +6832,7 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
     Disjunction it(Disjunction::Adapters{}, irs::doc_limits::eof());
     ASSERT_EQ(0, irs::CostAttr::extract(it));
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
   }
 
@@ -6896,13 +6850,13 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       auto match_count = match_counts.begin();
-      for (; it.next(); ++match_count) {
+      for (; !irs::doc_limits::eof(it.advance()); ++match_count) {
         result.push_back(it.value());
         ASSERT_EQ(*match_count, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
@@ -6930,13 +6884,13 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
       auto match_count = match_counts.begin();
-      for (; it.next(); ++match_count) {
+      for (; !irs::doc_limits::eof(it.advance()); ++match_count) {
         result.push_back(it.value());
         ASSERT_EQ(*match_count, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
@@ -6955,13 +6909,13 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
@@ -6981,13 +6935,13 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(1, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
@@ -7007,13 +6961,13 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         ASSERT_EQ(3, it.MatchCount());
       }
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_EQ(0, it.MatchCount());
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
@@ -7030,7 +6984,7 @@ TEST(block_disjunction_test, min_match_next_two_blocks) {
               irs::CostAttr::extract(it));
     ASSERT_EQ(0, it.MatchCount());
     ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(0, it.MatchCount());
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
   }
@@ -7409,7 +7363,7 @@ TEST(block_disjunction_test, seek_no_readahead) {
     ASSERT_EQ(irs::doc_limits::eof(), it.seek(1));
     ASSERT_EQ(0, it.MatchCount());
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     ASSERT_EQ(expected, result);
   }
@@ -10815,16 +10769,16 @@ TEST(block_disjunction_test, seek_next_no_readahead) {
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
     ASSERT_EQ(5, it.seek(5));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     ASSERT_EQ(29, it.seek(27));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -10842,12 +10796,12 @@ TEST(block_disjunction_test, seek_next_no_readahead) {
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
     ASSERT_EQ(45, it.seek(45));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(256, it.value());
     ASSERT_EQ(1145, it.seek(1144));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 }
@@ -10874,20 +10828,20 @@ TEST(block_disjunction_test, next_seek_no_readahead) {
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
 
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     ASSERT_EQ(5, it.seek(4));
     ASSERT_EQ(5, it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(67, it.seek(64));
     ASSERT_EQ(67, it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(80, it.value());
     ASSERT_EQ(84, it.seek(83));
     ASSERT_EQ(84, it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 }
@@ -10913,16 +10867,16 @@ TEST(block_disjunction_test, seek_next_no_readahead_two_blocks) {
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
     ASSERT_EQ(5, it.seek(5));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     ASSERT_EQ(29, it.seek(27));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -10940,12 +10894,12 @@ TEST(block_disjunction_test, seek_next_no_readahead_two_blocks) {
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
     ASSERT_EQ(45, it.seek(45));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(170, it.value());
     ASSERT_EQ(1145, it.seek(1144));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 }
@@ -10992,16 +10946,16 @@ TEST(block_disjunction_test, scored_seek_next_no_readahead) {
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
     ASSERT_EQ(5, it.seek(5));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     ASSERT_EQ(29, it.seek(27));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -11045,7 +10999,7 @@ TEST(block_disjunction_test, scored_seek_next_no_readahead) {
     ASSERT_EQ(1, irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp = 0;
     it.FetchScoreArgs(0);
@@ -11055,12 +11009,12 @@ TEST(block_disjunction_test, scored_seek_next_no_readahead) {
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(7, tmp);  // 1+2+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(6, tmp);  // 2+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
@@ -11069,14 +11023,14 @@ TEST(block_disjunction_test, scored_seek_next_no_readahead) {
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(2, tmp);  // 2
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(1, tmp);  // 1
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -11120,7 +11074,7 @@ TEST(block_disjunction_test, scored_seek_next_no_readahead) {
     ASSERT_EQ(1, irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     it.FetchScoreArgs(0);
@@ -11130,12 +11084,12 @@ TEST(block_disjunction_test, scored_seek_next_no_readahead) {
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(4, tmp);  // std::max(1,2,4)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(4, tmp);  // std::max(2,4)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
@@ -11144,14 +11098,14 @@ TEST(block_disjunction_test, scored_seek_next_no_readahead) {
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(2, tmp);  // std::max(2)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(1, tmp);  // std::max(1)
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -11195,7 +11149,7 @@ TEST(block_disjunction_test, scored_seek_next_no_readahead) {
     ASSERT_EQ(1, irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     it.FetchScoreArgs(0);
@@ -11205,12 +11159,12 @@ TEST(block_disjunction_test, scored_seek_next_no_readahead) {
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(5, tmp);  // 1+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(4, tmp);  // 4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
@@ -11219,14 +11173,14 @@ TEST(block_disjunction_test, scored_seek_next_no_readahead) {
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  //
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(1, tmp);  // 1
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -11270,7 +11224,7 @@ TEST(block_disjunction_test, scored_seek_next_no_readahead) {
     ASSERT_EQ(1, irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     it.FetchScoreArgs(0);
@@ -11280,12 +11234,12 @@ TEST(block_disjunction_test, scored_seek_next_no_readahead) {
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(4, tmp);  // std::max(1,4)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(4, tmp);  // std::max(4)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
@@ -11294,14 +11248,14 @@ TEST(block_disjunction_test, scored_seek_next_no_readahead) {
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  //
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(1, tmp);  // std::max(1)
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -11344,19 +11298,19 @@ TEST(block_disjunction_test, scored_seek_next_no_readahead) {
     ASSERT_EQ(1, irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     ASSERT_EQ(5, it.seek(5));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     ASSERT_EQ(29, it.seek(27));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -11400,19 +11354,19 @@ TEST(block_disjunction_test, scored_seek_next_no_readahead) {
     ASSERT_EQ(1, irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     ASSERT_EQ(5, it.seek(5));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     ASSERT_EQ(29, it.seek(27));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 }
@@ -11449,13 +11403,13 @@ TEST(disjunction_test, next) {
         *pval = *pval + 1;
         return true;
       };
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
         it.visit(&heap, visitor);
       }
       ASSERT_GT(heap, 0);  // some iterators should be visited
       heap = 0;
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       it.visit(&heap, visitor);
       ASSERT_EQ(0, heap);  // nothing to visit
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
@@ -11474,10 +11428,10 @@ TEST(disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
 
@@ -11495,10 +11449,10 @@ TEST(disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs[0], result);
@@ -11514,10 +11468,10 @@ TEST(disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs[0], result);
@@ -11534,10 +11488,10 @@ TEST(disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_TRUE(!irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -11548,7 +11502,7 @@ TEST(disjunction_test, next) {
     Disjunction it(Disjunction::Adapters{}, irs::doc_limits::eof());
     ASSERT_EQ(0, irs::CostAttr::extract(it));
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_TRUE(irs::doc_limits::eof(it.value()));
   }
 
@@ -11570,10 +11524,10 @@ TEST(disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -11602,10 +11556,10 @@ TEST(disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -11623,10 +11577,10 @@ TEST(disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -11645,10 +11599,10 @@ TEST(disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs.front(), result);
@@ -11672,10 +11626,10 @@ TEST(disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs[0], result);
@@ -11693,10 +11647,10 @@ TEST(disjunction_test, next) {
       ASSERT_EQ(std::accumulate(docs.begin(), docs.end(), size_t(0), sum),
                 irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -11965,16 +11919,16 @@ TEST(disjunction_test, seek_next) {
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
     ASSERT_EQ(5, it.seek(5));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     ASSERT_EQ(29, it.seek(27));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 }
@@ -12015,16 +11969,16 @@ TEST(disjunction_test, scored_seek_next) {
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
     ASSERT_EQ(5, it.seek(5));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     ASSERT_EQ(29, it.seek(27));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -12062,7 +12016,7 @@ TEST(disjunction_test, scored_seek_next) {
     ASSERT_EQ(1, irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -12070,24 +12024,24 @@ TEST(disjunction_test, scored_seek_next) {
     ASSERT_EQ(5, it.seek(5));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1+2+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 2+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1
     ASSERT_EQ(29, it.seek(27));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 2
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -12125,7 +12079,7 @@ TEST(disjunction_test, scored_seek_next) {
     ASSERT_EQ(1, irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -12133,24 +12087,24 @@ TEST(disjunction_test, scored_seek_next) {
     ASSERT_EQ(5, it.seek(5));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(1,2,4)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(2,4)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(1)
     ASSERT_EQ(29, it.seek(27));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(2)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(1)
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -12188,7 +12142,7 @@ TEST(disjunction_test, scored_seek_next) {
     ASSERT_EQ(1, irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     it.FetchScoreArgs(0);
@@ -12198,12 +12152,12 @@ TEST(disjunction_test, scored_seek_next) {
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
@@ -12212,14 +12166,14 @@ TEST(disjunction_test, scored_seek_next) {
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  //
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -12257,7 +12211,7 @@ TEST(disjunction_test, scored_seek_next) {
     ASSERT_EQ(1, irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -12265,24 +12219,24 @@ TEST(disjunction_test, scored_seek_next) {
     ASSERT_EQ(5, it.seek(5));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(1,4)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(4)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(1)
     ASSERT_EQ(29, it.seek(27));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  //
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(1)
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -12320,7 +12274,7 @@ TEST(disjunction_test, scored_seek_next) {
     ASSERT_EQ(1, irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     it.FetchScoreArgs(0);
@@ -12330,12 +12284,12 @@ TEST(disjunction_test, scored_seek_next) {
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
@@ -12344,14 +12298,14 @@ TEST(disjunction_test, scored_seek_next) {
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  //
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -12389,7 +12343,7 @@ TEST(disjunction_test, scored_seek_next) {
     ASSERT_EQ(1, irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -12397,24 +12351,24 @@ TEST(disjunction_test, scored_seek_next) {
     ASSERT_EQ(5, it.seek(5));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(7, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
     ASSERT_EQ(29, it.seek(27));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(45, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 }
@@ -12436,10 +12390,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof());
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(docs.front(), result);
@@ -12452,10 +12406,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof());
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(docs.front(), result);
@@ -12469,10 +12423,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof());
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(docs.front(), result);
@@ -12486,10 +12440,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it{detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof()};
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(docs.front(), result);
@@ -12504,10 +12458,10 @@ TEST(min_match_disjunction_test, next) {
                        min_match_count, irs::doc_limits::eof()};
 
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(docs.front(), result);
@@ -12531,10 +12485,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it{detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof()};
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(expected, result);
@@ -12548,10 +12502,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it{detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof()};
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(expected, result);
@@ -12565,10 +12519,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it{detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof()};
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(expected, result);
@@ -12582,10 +12536,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof());
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(expected, result);
@@ -12600,10 +12554,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof());
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(expected, result);
@@ -12618,10 +12572,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof());
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(expected, result);
@@ -12636,10 +12590,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof());
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(expected, result);
@@ -12664,10 +12618,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof());
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(expected, result);
@@ -12682,10 +12636,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof());
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(expected, result);
@@ -12699,10 +12653,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof());
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(expected, result);
@@ -12716,10 +12670,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof());
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(expected, result);
@@ -12734,10 +12688,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof());
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(expected, result);
@@ -12752,10 +12706,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof());
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(expected, result);
@@ -12770,10 +12724,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof());
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(expected, result);
@@ -12797,10 +12751,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof());
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(docs.front(), result);
@@ -12814,10 +12768,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof());
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(docs.front(), result);
@@ -12830,10 +12784,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof());
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(docs.front(), result);
@@ -12846,10 +12800,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof());
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(docs.front(), result);
@@ -12863,10 +12817,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof());
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(docs.front(), result);
@@ -12880,10 +12834,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof());
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(docs.front(), result);
@@ -12897,10 +12851,10 @@ TEST(min_match_disjunction_test, next) {
         Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs),
                        min_match_count, irs::doc_limits::eof());
         ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-        for (; it.next();) {
+        for (; !irs::doc_limits::eof(it.advance());) {
           result.push_back(it.value());
         }
-        ASSERT_FALSE(it.next());
+        ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
         ASSERT_TRUE(irs::doc_limits::eof(it.value()));
       }
       ASSERT_EQ(docs.front(), result);
@@ -12920,10 +12874,10 @@ TEST(min_match_disjunction_test, next) {
           Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs), 0U,
                          irs::doc_limits::eof());
           ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-          for (; it.next();) {
+          for (; !irs::doc_limits::eof(it.advance());) {
             result.push_back(it.value());
           }
-          ASSERT_FALSE(it.next());
+          ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
           ASSERT_TRUE(irs::doc_limits::eof(it.value()));
         }
         ASSERT_EQ(docs.front(), result);
@@ -12935,10 +12889,10 @@ TEST(min_match_disjunction_test, next) {
           Disjunction it(detail::ExecuteAll<irs::CostAdapter>(docs), 1U,
                          irs::doc_limits::eof());
           ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-          for (; it.next();) {
+          for (; !irs::doc_limits::eof(it.advance());) {
             result.push_back(it.value());
           }
-          ASSERT_FALSE(it.next());
+          ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
           ASSERT_TRUE(irs::doc_limits::eof(it.value()));
         }
         ASSERT_EQ(docs.front(), result);
@@ -12951,10 +12905,10 @@ TEST(min_match_disjunction_test, next) {
                          std::numeric_limits<size_t>::max(),
                          irs::doc_limits::eof());
           ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-          for (; it.next();) {
+          for (; !irs::doc_limits::eof(it.advance());) {
             result.push_back(it.value());
           }
-          ASSERT_FALSE(it.next());
+          ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
           ASSERT_TRUE(irs::doc_limits::eof(it.value()));
         }
         ASSERT_EQ(docs.front(), result);
@@ -13364,14 +13318,14 @@ TEST(min_match_disjunction_test, seek_next) {
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
 
     ASSERT_EQ(5, it.seek(5));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(9, it.value());
     ASSERT_EQ(29, it.seek(27));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 }
@@ -13389,13 +13343,13 @@ TEST(min_match_disjunction_test, match_count) {
     // cost
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
 
-    ASSERT_TRUE(it.next());  // |1,1,1,1
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));  // |1,1,1,1
     ASSERT_EQ(1, it.value());
-    ASSERT_TRUE(it.next());  // 3,3,3|2
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));  // 3,3,3|2
     ASSERT_EQ(2, it.value());
     ASSERT_EQ(4, it.seek(4));       // 3,3,3|4
     ASSERT_EQ(3, it.MatchCount());  // 3,3,3|4
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
   }
 }
 
@@ -13436,14 +13390,14 @@ TEST(min_match_disjunction_test, scored_seek_next) {
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
     ASSERT_EQ(5, it.seek(5));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(9, it.value());
     ASSERT_EQ(29, it.seek(27));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -13482,7 +13436,7 @@ TEST(min_match_disjunction_test, scored_seek_next) {
               irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -13490,20 +13444,20 @@ TEST(min_match_disjunction_test, scored_seek_next) {
     ASSERT_EQ(5, it.seek(5));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1+2+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 2+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(9, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1+4
     ASSERT_EQ(29, it.seek(27));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 2+4
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -13542,7 +13496,7 @@ TEST(min_match_disjunction_test, scored_seek_next) {
               irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -13550,20 +13504,20 @@ TEST(min_match_disjunction_test, scored_seek_next) {
     ASSERT_EQ(5, it.seek(5));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(1,2,4)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(2,4)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(9, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(1,4)
     ASSERT_EQ(29, it.seek(27));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // std::max(2,4)
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -13602,7 +13556,7 @@ TEST(min_match_disjunction_test, scored_seek_next) {
               irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -13610,20 +13564,20 @@ TEST(min_match_disjunction_test, scored_seek_next) {
     ASSERT_EQ(5, it.seek(5));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1+2+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 2+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(9, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1+4
     ASSERT_EQ(29, it.seek(27));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 2+4
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -13662,7 +13616,7 @@ TEST(min_match_disjunction_test, scored_seek_next) {
               irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -13670,20 +13624,20 @@ TEST(min_match_disjunction_test, scored_seek_next) {
     ASSERT_EQ(5, it.seek(5));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(9, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
     ASSERT_EQ(29, it.seek(27));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -13722,7 +13676,7 @@ TEST(min_match_disjunction_test, scored_seek_next) {
               irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -13730,20 +13684,20 @@ TEST(min_match_disjunction_test, scored_seek_next) {
     ASSERT_EQ(5, it.seek(5));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1+2+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 2+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(9, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1+4
     ASSERT_EQ(29, it.seek(27));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 2+4
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -13781,7 +13735,7 @@ TEST(min_match_disjunction_test, scored_seek_next) {
               irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -13789,20 +13743,20 @@ TEST(min_match_disjunction_test, scored_seek_next) {
     ASSERT_EQ(5, it.seek(5));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(6, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(9, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
     ASSERT_EQ(29, it.seek(27));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 }
@@ -13835,10 +13789,10 @@ TEST(conjunction_test, next) {
       ASSERT_EQ(std::min_element(docs.begin(), docs.end(), shortest)->size(),
                 irs::CostAttr::extract(it));
       ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -13861,10 +13815,10 @@ TEST(conjunction_test, next) {
       ASSERT_EQ(std::min_element(docs.begin(), docs.end(), shortest)->size(),
                 irs::CostAttr::extract(it));
       ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -13888,10 +13842,10 @@ TEST(conjunction_test, next) {
       ASSERT_EQ(std::min_element(docs.begin(), docs.end(), shortest)->size(),
                 irs::CostAttr::extract(it));
       ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -13915,10 +13869,10 @@ TEST(conjunction_test, next) {
       ASSERT_EQ(std::min_element(docs.begin(), docs.end(), shortest)->size(),
                 irs::CostAttr::extract(it));
       ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -13941,10 +13895,10 @@ TEST(conjunction_test, next) {
       ASSERT_EQ(std::min_element(docs.begin(), docs.end(), shortest)->size(),
                 irs::CostAttr::extract(it));
       ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs.front(), result);
@@ -13964,10 +13918,10 @@ TEST(conjunction_test, next) {
       ASSERT_EQ(std::min_element(docs.begin(), docs.end(), shortest)->size(),
                 irs::CostAttr::extract(it));
       ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(docs.front(), result);
@@ -13991,10 +13945,10 @@ TEST(conjunction_test, next) {
       ASSERT_EQ(std::min_element(docs.begin(), docs.end(), shortest)->size(),
                 irs::CostAttr::extract(it));
       ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -14014,10 +13968,10 @@ TEST(conjunction_test, next) {
       ASSERT_EQ(std::min_element(docs.begin(), docs.end(), shortest)->size(),
                 irs::CostAttr::extract(it));
       ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -14200,14 +14154,14 @@ TEST(conjunction_test, seek_next) {
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
     ASSERT_EQ(4, it.seek(3));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(5, it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(8, it.value());
     ASSERT_EQ(14, it.seek(14));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 }
@@ -14244,7 +14198,7 @@ TEST(conjunction_test, scored_seek_next) {
     ASSERT_EQ(docs[2].size(), irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     it.FetchScoreArgs(0);
@@ -14254,12 +14208,12 @@ TEST(conjunction_test, scored_seek_next) {
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(7, tmp);  // 1+2+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(5, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(7, tmp);  // 1+2+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(8, it.value());
     it.FetchScoreArgs(0);
     tmp = score.Score();
@@ -14268,9 +14222,9 @@ TEST(conjunction_test, scored_seek_next) {
     it.FetchScoreArgs(0);
     tmp = score.Score();
     ASSERT_EQ(7, tmp);  // 1+2+4
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -14306,14 +14260,14 @@ TEST(conjunction_test, scored_seek_next) {
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
     ASSERT_EQ(4, it.seek(3));
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(5, it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(8, it.value());
     ASSERT_EQ(14, it.seek(14));
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -14350,7 +14304,7 @@ TEST(conjunction_test, scored_seek_next) {
     ASSERT_EQ(docs[2].size(), irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -14358,20 +14312,20 @@ TEST(conjunction_test, scored_seek_next) {
     ASSERT_EQ(4, it.seek(3));
     tmp = score.Score();
     ASSERT_EQ(12, tmp);  // 1+2+4+5
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(5, it.value());
     tmp = score.Score();
     ASSERT_EQ(12, tmp);  // 1+2+4+5
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(8, it.value());
     tmp = score.Score();
     ASSERT_EQ(12, tmp);  // 1+2+4+5
     ASSERT_EQ(14, it.seek(14));
     tmp = score.Score();
     ASSERT_EQ(12, tmp);  // 1+2+4+5
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -14406,7 +14360,7 @@ TEST(conjunction_test, scored_seek_next) {
     ASSERT_EQ(docs[2].size(), irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -14414,20 +14368,20 @@ TEST(conjunction_test, scored_seek_next) {
     ASSERT_EQ(4, it.seek(3));
     tmp = score.Score();
     ASSERT_EQ(4, tmp);  // std::max(1,2,4)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(5, it.value());
     tmp = score.Score();
     ASSERT_EQ(4, tmp);  // std::max(1,2,4)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(8, it.value());
     tmp = score.Score();
     ASSERT_EQ(4, tmp);  // std::max(1,2,4)
     ASSERT_EQ(14, it.seek(14));
     tmp = score.Score();
     ASSERT_EQ(4, tmp);  // std::max(1,2,4)
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -14462,7 +14416,7 @@ TEST(conjunction_test, scored_seek_next) {
     ASSERT_EQ(docs[2].size(), irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -14470,20 +14424,20 @@ TEST(conjunction_test, scored_seek_next) {
     ASSERT_EQ(4, it.seek(3));
     tmp = score.Score();
     ASSERT_EQ(7, tmp);  // 1+2+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(5, it.value());
     tmp = score.Score();
     ASSERT_EQ(7, tmp);  // 1+2+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(8, it.value());
     tmp = score.Score();
     ASSERT_EQ(7, tmp);  // 1+2+4
     ASSERT_EQ(14, it.seek(14));
     tmp = score.Score();
     ASSERT_EQ(7, tmp);  // 1+2+4
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -14518,7 +14472,7 @@ TEST(conjunction_test, scored_seek_next) {
     ASSERT_EQ(docs[2].size(), irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -14526,20 +14480,20 @@ TEST(conjunction_test, scored_seek_next) {
     ASSERT_EQ(4, it.seek(3));
     tmp = score.Score();
     ASSERT_EQ(4, tmp);  // std::max(1,2,4)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(5, it.value());
     tmp = score.Score();
     ASSERT_EQ(4, tmp);  // std::max(1,2,4)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(8, it.value());
     tmp = score.Score();
     ASSERT_EQ(4, tmp);  // std::max(1,2,4)
     ASSERT_EQ(14, it.seek(14));
     tmp = score.Score();
     ASSERT_EQ(4, tmp);  // std::max(1,2,4)
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -14574,7 +14528,7 @@ TEST(conjunction_test, scored_seek_next) {
     ASSERT_EQ(docs[2].size(), irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -14582,20 +14536,20 @@ TEST(conjunction_test, scored_seek_next) {
     ASSERT_EQ(4, it.seek(3));
     tmp = score.Score();
     ASSERT_EQ(1, tmp);  // 1
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(5, it.value());
     tmp = score.Score();
     ASSERT_EQ(1, tmp);  // 1
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(8, it.value());
     tmp = score.Score();
     ASSERT_EQ(1, tmp);  // 1
     ASSERT_EQ(14, it.seek(14));
     tmp = score.Score();
     ASSERT_EQ(1, tmp);  // 1
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -14630,7 +14584,7 @@ TEST(conjunction_test, scored_seek_next) {
     ASSERT_EQ(docs[2].size(), irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -14638,20 +14592,20 @@ TEST(conjunction_test, scored_seek_next) {
     ASSERT_EQ(4, it.seek(3));
     tmp = score.Score();
     ASSERT_EQ(1, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(5, it.value());
     tmp = score.Score();
     ASSERT_EQ(1, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(8, it.value());
     tmp = score.Score();
     ASSERT_EQ(1, tmp);
     ASSERT_EQ(14, it.seek(14));
     tmp = score.Score();
     ASSERT_EQ(1, tmp);
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -14686,7 +14640,7 @@ TEST(conjunction_test, scored_seek_next) {
     ASSERT_EQ(docs[1].size(), irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -14694,20 +14648,20 @@ TEST(conjunction_test, scored_seek_next) {
     ASSERT_EQ(4, it.seek(3));
     tmp = score.Score();
     ASSERT_EQ(5, tmp);  // 1+2+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(5, it.value());
     tmp = score.Score();
     ASSERT_EQ(5, tmp);  // 1+2+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(8, it.value());
     tmp = score.Score();
     ASSERT_EQ(5, tmp);  // 1+2+4
     ASSERT_EQ(14, it.seek(14));
     tmp = score.Score();
     ASSERT_EQ(5, tmp);  // 1+2+4
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -14742,7 +14696,7 @@ TEST(conjunction_test, scored_seek_next) {
     ASSERT_EQ(docs[1].size(), irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -14750,20 +14704,20 @@ TEST(conjunction_test, scored_seek_next) {
     ASSERT_EQ(4, it.seek(3));
     tmp = score.Score();
     ASSERT_EQ(4, tmp);  // std::max(1,2,4)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(5, it.value());
     tmp = score.Score();
     ASSERT_EQ(4, tmp);  // std::max(1,2,4)
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(8, it.value());
     tmp = score.Score();
     ASSERT_EQ(4, tmp);  // std::max(1,2,4)
     ASSERT_EQ(14, it.seek(14));
     tmp = score.Score();
     ASSERT_EQ(4, tmp);  // std::max(1,2,4)
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -14797,7 +14751,7 @@ TEST(conjunction_test, scored_seek_next) {
     ASSERT_EQ(docs[2].size(), irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -14805,20 +14759,20 @@ TEST(conjunction_test, scored_seek_next) {
     ASSERT_EQ(4, it.seek(3));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1+2+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(5, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1+2+4
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(8, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1+2+4
     ASSERT_EQ(14, it.seek(14));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);  // 1+2+4
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 
@@ -14852,7 +14806,7 @@ TEST(conjunction_test, scored_seek_next) {
     ASSERT_EQ(docs[2].size(), irs::CostAttr::extract(it));
 
     ASSERT_EQ(irs::doc_limits::invalid(), it.value());
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(1, it.value());
     irs::score_t tmp;
     tmp = score.Score();
@@ -14860,20 +14814,20 @@ TEST(conjunction_test, scored_seek_next) {
     ASSERT_EQ(4, it.seek(3));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(5, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_TRUE(it.next());
+    ASSERT_TRUE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(8, it.value());
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
     ASSERT_EQ(14, it.seek(14));
     tmp = score.Score();
     ASSERT_EQ(0, tmp);
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
-    ASSERT_FALSE(it.next());
+    ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
     ASSERT_EQ(irs::doc_limits::eof(), it.value());
   }
 }
@@ -14888,15 +14842,16 @@ TEST(exclusion_test, next) {
     std::vector<irs::doc_id_t> expected{2, 7, 9, 11, 45};
     std::vector<irs::doc_id_t> result;
     {
-      irs::Exclusion it(MakeScoreAdapter(included), MakeScoreAdapter(excluded));
+      irs::ExclusionIterator it(MakeScoreAdapter(included),
+                                MakeScoreAdapter(excluded));
 
       // cost
       ASSERT_EQ(included.size(), irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -14908,13 +14863,14 @@ TEST(exclusion_test, next) {
     std::vector<irs::doc_id_t> excluded{};
     std::vector<irs::doc_id_t> result;
     {
-      irs::Exclusion it(MakeScoreAdapter(included), MakeScoreAdapter(excluded));
+      irs::ExclusionIterator it(MakeScoreAdapter(included),
+                                MakeScoreAdapter(excluded));
       ASSERT_EQ(included.size(), irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(included, result);
@@ -14926,12 +14882,13 @@ TEST(exclusion_test, next) {
     std::vector<irs::doc_id_t> excluded{1, 5, 6, 12, 29};
     std::vector<irs::doc_id_t> result;
     {
-      irs::Exclusion it(MakeScoreAdapter(included), MakeScoreAdapter(excluded));
+      irs::ExclusionIterator it(MakeScoreAdapter(included),
+                                MakeScoreAdapter(excluded));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(included, result);
@@ -14944,12 +14901,13 @@ TEST(exclusion_test, next) {
     std::vector<irs::doc_id_t> expected{};
     std::vector<irs::doc_id_t> result;
     {
-      irs::Exclusion it(MakeScoreAdapter(included), MakeScoreAdapter(excluded));
+      irs::ExclusionIterator it(MakeScoreAdapter(included),
+                                MakeScoreAdapter(excluded));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -14961,13 +14919,14 @@ TEST(exclusion_test, next) {
     std::vector<irs::doc_id_t> excluded{};
     std::vector<irs::doc_id_t> result;
     {
-      irs::Exclusion it(MakeScoreAdapter(included), MakeScoreAdapter(excluded));
+      irs::ExclusionIterator it(MakeScoreAdapter(included),
+                                MakeScoreAdapter(excluded));
       ASSERT_EQ(included.size(), irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(included, result);
@@ -14980,13 +14939,14 @@ TEST(exclusion_test, next) {
     std::vector<irs::doc_id_t> expected{};
     std::vector<irs::doc_id_t> result;
     {
-      irs::Exclusion it(MakeScoreAdapter(included), MakeScoreAdapter(excluded));
+      irs::ExclusionIterator it(MakeScoreAdapter(included),
+                                MakeScoreAdapter(excluded));
       ASSERT_EQ(included.size(), irs::CostAttr::extract(it));
       ASSERT_FALSE(irs::doc_limits::valid(it.value()));
-      for (; it.next();) {
+      for (; !irs::doc_limits::eof(it.advance());) {
         result.push_back(it.value());
       }
-      ASSERT_FALSE(it.next());
+      ASSERT_FALSE(!irs::doc_limits::eof(it.advance()));
       ASSERT_TRUE(irs::doc_limits::eof(it.value()));
     }
     ASSERT_EQ(expected, result);
@@ -15008,7 +14968,8 @@ TEST(exclusion_test, seek) {
       {45, 45},
       {43, 45},
       {57, irs::doc_limits::eof()}};
-    irs::Exclusion it(MakeScoreAdapter(included), MakeScoreAdapter(excluded));
+    irs::ExclusionIterator it(MakeScoreAdapter(included),
+                              MakeScoreAdapter(excluded));
     ASSERT_EQ(included.size(), irs::CostAttr::extract(it));
 
     for (const auto& target : expected) {
@@ -15025,7 +14986,8 @@ TEST(exclusion_test, seek) {
       {irs::doc_limits::invalid(), irs::doc_limits::invalid()},
       {6, irs::doc_limits::eof()},
       {irs::doc_limits::invalid(), irs::doc_limits::eof()}};
-    irs::Exclusion it(MakeScoreAdapter(included), MakeScoreAdapter(excluded));
+    irs::ExclusionIterator it(MakeScoreAdapter(included),
+                              MakeScoreAdapter(excluded));
     ASSERT_EQ(included.size(), irs::CostAttr::extract(it));
 
     for (const auto& target : expected) {
@@ -15046,7 +15008,8 @@ TEST(exclusion_test, seek) {
       {13, irs::doc_limits::eof()},
       {45, irs::doc_limits::eof()},
       {57, irs::doc_limits::eof()}};
-    irs::Exclusion it(MakeScoreAdapter(included), MakeScoreAdapter(excluded));
+    irs::ExclusionIterator it(MakeScoreAdapter(included),
+                              MakeScoreAdapter(excluded));
     ASSERT_EQ(included.size(), irs::CostAttr::extract(it));
 
     for (const auto& target : expected) {
@@ -15066,7 +15029,8 @@ TEST(exclusion_test, seek) {
       {irs::doc_limits::invalid(), 11},
       {45, 45},
       {57, irs::doc_limits::eof()}};
-    irs::Exclusion it(MakeScoreAdapter(included), MakeScoreAdapter(excluded));
+    irs::ExclusionIterator it(MakeScoreAdapter(included),
+                              MakeScoreAdapter(excluded));
     ASSERT_EQ(included.size(), irs::CostAttr::extract(it));
 
     for (const auto& target : expected) {
@@ -15128,29 +15092,26 @@ TEST_P(BooleanFilterTestCase, or_sequential_multiple_segments) {
     Append<irs::ByTerm>(root, kFieldName, "F");
     Append<irs::ByTerm>(root, kFieldName, "I");
 
-    auto prep = root.prepare({.index = rdr});
-    auto segment = rdr.begin();
+    tests::PreparedFilter prep{root, rdr};
     {
-      auto docs = prep->execute({.segment = *segment});
-      ASSERT_TRUE(docs->next());
+      auto docs = prep.Execute(0);
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       ASSERT_EQ(2, docs->value());
-      ASSERT_FALSE(docs->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     }
 
-    ++segment;
     {
-      auto docs = prep->execute({.segment = *segment});
-      ASSERT_TRUE(docs->next());
+      auto docs = prep.Execute(1);
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       ASSERT_EQ(2, docs->value());
-      ASSERT_FALSE(docs->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     }
 
-    ++segment;
     {
-      auto docs = prep->execute({.segment = *segment});
-      ASSERT_TRUE(docs->next());
+      auto docs = prep.Execute(2);
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       ASSERT_EQ(2, docs->value());
-      ASSERT_FALSE(docs->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     }
   }
 }
@@ -15165,16 +15126,11 @@ TEST_P(BooleanFilterTestCase, or_sequential) {
 
   auto rdr = open_reader();
 
-  // empty query
-  {
-    CheckQuery(irs::Or(), Docs{}, rdr);
-  }
-
   {
     irs::Or root;
     Append<irs::ByTerm>(root, kFieldName, "V");  // 22
 
-    CheckQuery(root, Docs{22}, rdr);
+    CheckQuery(*tests::Optimized(std::move(root)), Docs{22}, rdr);
   }
 
   // name=W OR name=Z
@@ -15183,7 +15139,7 @@ TEST_P(BooleanFilterTestCase, or_sequential) {
     Append<irs::ByTerm>(root, kFieldName, "W");  // 23
     Append<irs::ByTerm>(root, kFieldName, "C");  // 3
 
-    CheckQuery(root, Docs{3, 23}, rdr);
+    CheckQuery(*tests::Optimized(std::move(root)), Docs{3, 23}, rdr);
   }
 
   // name=A OR name=Q OR name=Z
@@ -15193,7 +15149,7 @@ TEST_P(BooleanFilterTestCase, or_sequential) {
     Append<irs::ByTerm>(root, kFieldName, "Q");  // 17
     Append<irs::ByTerm>(root, kFieldName, "Z");  // 26
 
-    CheckQuery(root, Docs{1, 17, 26}, rdr);
+    CheckQuery(*tests::Optimized(std::move(root)), Docs{1, 17, 26}, rdr);
   }
 
   // name=A OR name=Q OR same!=xyz
@@ -15201,12 +15157,12 @@ TEST_P(BooleanFilterTestCase, or_sequential) {
     irs::Or root;
     Append<irs::ByTerm>(root, kFieldName, "A");  // 1
     Append<irs::ByTerm>(root, kFieldName, "Q");  // 17
-    root.add<irs::Or>().add<irs::Not>().filter<irs::ByTerm>() =
+    root.add<irs::Or>().add<irs::Exclusion>().exclude<irs::ByTerm>() =
       MakeFilter<irs::ByTerm>(kFieldSame,
                               "xyz");  // none (not within an OR must be
                                        // wrapped inside a single-branch OR)
 
-    CheckQuery(root, Docs{1, 17}, rdr);
+    CheckQuery(*tests::Optimized(std::move(root)), Docs{1, 17}, rdr);
   }
 
   // (name=A OR name=Q) OR same!=xyz
@@ -15214,12 +15170,12 @@ TEST_P(BooleanFilterTestCase, or_sequential) {
     irs::Or root;
     Append<irs::ByTerm>(root, kFieldName, "A");  // 1
     Append<irs::ByTerm>(root, kFieldName, "Q");  // 17
-    root.add<irs::Or>().add<irs::Not>().filter<irs::ByTerm>() =
+    root.add<irs::Or>().add<irs::Exclusion>().exclude<irs::ByTerm>() =
       MakeFilter<irs::ByTerm>(kFieldSame,
                               "xyz");  // none (not within an OR must be
                                        // wrapped inside a single-branch OR)
 
-    CheckQuery(root, Docs{1, 17}, rdr);
+    CheckQuery(*tests::Optimized(std::move(root)), Docs{1, 17}, rdr);
   }
 
   // name=A OR name=Q OR name=Z OR same=invalid_term OR invalid_field=V
@@ -15231,7 +15187,7 @@ TEST_P(BooleanFilterTestCase, or_sequential) {
     Append<irs::ByTerm>(root, kFieldSame, "invalid_term");
     Append<irs::ByTerm>(root, kFieldInvalid, "V");
 
-    CheckQuery(root, Docs{1, 17, 26}, rdr);
+    CheckQuery(*tests::Optimized(std::move(root)), Docs{1, 17, 26}, rdr);
   }
 
   // search : all terms
@@ -15243,33 +15199,11 @@ TEST_P(BooleanFilterTestCase, or_sequential) {
     Append<irs::ByTerm>(root, kFieldSame, "xyz");  // 1..32
     Append<irs::ByTerm>(root, kFieldSame, "invalid_term");
 
-    CheckQuery(root, Docs{1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11,
-                          12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                          23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
-               rdr);
-  }
-
-  // min match count == 0
-  {
-    irs::Or root;
-    root.min_match_count(0);
-    Append<irs::ByTerm>(root, kFieldName, "V");  // 22
-
-    CheckQuery(root, Docs{1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11,
-                          12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                          23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
-               rdr);
-  }
-
-  // min match count == 0
-  {
-    irs::Or root;
-    root.min_match_count(0);
-
-    CheckQuery(root, Docs{1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11,
-                          12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                          23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
-               rdr);
+    CheckQuery(
+      *tests::Optimized(std::move(root)),
+      Docs{1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16,
+           17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
+      rdr);
   }
 
   // min match count is geater than a number of conditions
@@ -15282,7 +15216,7 @@ TEST_P(BooleanFilterTestCase, or_sequential) {
     Append<irs::ByTerm>(root, kFieldSame, "invalid_term");
     root.min_match_count(root.size() + 1);
 
-    CheckQuery(root, Docs{}, rdr);
+    CheckQuery(*tests::Optimized(std::move(root)), Docs{}, rdr);
   }
 
   // name=A OR false
@@ -15291,31 +15225,33 @@ TEST_P(BooleanFilterTestCase, or_sequential) {
     Append<irs::ByTerm>(root, kFieldName, "A");  // 1
     root.add<irs::Empty>();
 
-    CheckQuery(root, Docs{1}, rdr);
+    CheckQuery(*tests::Optimized(std::move(root)), Docs{1}, rdr);
   }
 
   // name!=A OR false
   {
     irs::Or root;
-    root.add<irs::Not>().filter<irs::ByTerm>() =
+    root.add<irs::Exclusion>().exclude<irs::ByTerm>() =
       MakeFilter<irs::ByTerm>(kFieldName, "A");  // 1
     root.add<irs::Empty>();
 
     CheckQuery(
-      root, Docs{2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17,
-                 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
+      *tests::Optimized(std::move(root)),
+      Docs{2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17,
+           18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
       rdr);
   }
 
   // Not with impossible name!=A OR same="NOT POSSIBLE"
   {
     irs::Or root;
-    root.add<irs::Not>().filter<irs::ByTerm>() =
+    root.add<irs::Exclusion>().exclude<irs::ByTerm>() =
       MakeFilter<irs::ByTerm>(kFieldName, "A");  // 1
     Append<irs::ByTerm>(root, kFieldSame, "NOT POSSIBLE");
     CheckQuery(
-      root, Docs{2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17,
-                 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
+      *tests::Optimized(std::move(root)),
+      Docs{2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17,
+           18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
       rdr);
   }
 
@@ -15328,7 +15264,7 @@ TEST_P(BooleanFilterTestCase, or_sequential) {
     root.add<irs::All>();
     Append<irs::ByTerm>(root, kFieldDuplicated, "abcd");
     root.min_match_count(5);
-    CheckQuery(root, Docs{1}, rdr);
+    CheckQuery(*tests::Optimized(std::move(root)), Docs{1}, rdr);
   }
 
   // optimization should adjust min_match same but with score to check scored
@@ -15342,7 +15278,8 @@ TEST_P(BooleanFilterTestCase, or_sequential) {
     Append<irs::ByTerm>(root, kFieldDuplicated, "abcd");
     root.min_match_count(5);
     irs::Scorer::ptr sort{std::make_unique<sort::CustomSort>()};
-    CheckQuery(root, std::span{&sort, 1}, Docs{1}, rdr);
+    CheckQuery(*tests::Optimized(std::move(root)), std::span{&sort, 1}, Docs{1},
+               rdr);
   }
 
   // optimization should adjust min_match
@@ -15362,10 +15299,11 @@ TEST_P(BooleanFilterTestCase, or_sequential) {
     root.add<irs::All>();
     Append<irs::ByTerm>(root, kFieldDuplicated, "abcd");
     root.min_match_count(3);
-    CheckQuery(root, Docs{1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11,
-                          12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                          23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
-               rdr);
+    CheckQuery(
+      *tests::Optimized(std::move(root)),
+      Docs{1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16,
+           17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
+      rdr);
   }
 
   // scored
@@ -15389,7 +15327,8 @@ TEST_P(BooleanFilterTestCase, or_sequential) {
                   12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
                   23, 24, 25, 26, 27, 28, 29, 30, 31, 32};
 
-    CheckQuery(root, std::span{&sort, 1}, expected, rdr);
+    CheckQuery(*tests::Optimized(std::move(root)), std::span{&sort, 1},
+               expected, rdr);
   }
 }
 
@@ -15420,7 +15359,7 @@ TEST_P(BooleanFilterTestCase, and_schemas) {
     irs::And root;
     Append<irs::ByTerm>(root, kFieldNameUpper, "Product");
     Append<irs::ByTerm>(root, kFieldSource, "AdventureWor3ks2014");
-    CheckQuery(root, Docs{}, rdr);
+    CheckQuery(*tests::Optimized(std::move(root)), Docs{}, rdr);
   }
 }
 
@@ -15434,17 +15373,12 @@ TEST_P(BooleanFilterTestCase, and_sequential) {
 
   auto rdr = open_reader();
 
-  // empty query
-  {
-    CheckQuery(irs::And(), Docs{}, rdr);
-  }
-
   // name=V
   {
     irs::And root;
     Append<irs::ByTerm>(root, kFieldName, "V");  // 22
 
-    CheckQuery(root, Docs{22}, rdr);
+    CheckQuery(*tests::Optimized(std::move(root)), Docs{22}, rdr);
   }
 
   // duplicated=abcd AND same=xyz
@@ -15452,7 +15386,8 @@ TEST_P(BooleanFilterTestCase, and_sequential) {
     irs::And root;
     Append<irs::ByTerm>(root, kFieldDuplicated, "abcd");  // 1,5,11,21,27,31
     Append<irs::ByTerm>(root, kFieldSame, "xyz");         // 1..32
-    CheckQuery(root, Docs{1, 5, 11, 21, 27, 31}, rdr);
+    CheckQuery(*tests::Optimized(std::move(root)), Docs{1, 5, 11, 21, 27, 31},
+               rdr);
   }
 
   // duplicated=abcd AND same=xyz AND name=A
@@ -15461,7 +15396,7 @@ TEST_P(BooleanFilterTestCase, and_sequential) {
     Append<irs::ByTerm>(root, kFieldDuplicated, "abcd");  // 1,5,11,21,27,31
     Append<irs::ByTerm>(root, kFieldSame, "xyz");         // 1..32
     Append<irs::ByTerm>(root, kFieldName, "A");           // 1
-    CheckQuery(root, Docs{1}, rdr);
+    CheckQuery(*tests::Optimized(std::move(root)), Docs{1}, rdr);
   }
 
   // duplicated=abcd AND same=xyz AND name=B
@@ -15470,7 +15405,7 @@ TEST_P(BooleanFilterTestCase, and_sequential) {
     Append<irs::ByTerm>(root, kFieldDuplicated, "abcd");  // 1,5,11,21,27,31
     Append<irs::ByTerm>(root, kFieldSame, "xyz");         // 1..32
     Append<irs::ByTerm>(root, kFieldName, "B");           // 2
-    CheckQuery(root, Docs{}, rdr);
+    CheckQuery(*tests::Optimized(std::move(root)), Docs{}, rdr);
   }
 }
 
@@ -15492,8 +15427,8 @@ TEST_P(BooleanFilterTestCase, not_standalone_sequential_ordered) {
                                            20, 19, 18, 17, 16, 15, 14, 13, 12,
                                            10, 9,  8,  7,  6,  4,  3,  2};
 
-    irs::Not not_node;
-    not_node.filter<irs::ByTerm>() =
+    irs::Exclusion not_node;
+    not_node.exclude<irs::ByTerm>() =
       MakeFilter<irs::ByTerm>(column_name, "abcd");
 
     size_t collector_finish_count = 0;
@@ -15518,14 +15453,14 @@ TEST_P(BooleanFilterTestCase, not_standalone_sequential_ordered) {
       *score = cur_doc;
     };
 
-    auto prepared_filter = not_node.prepare({.index = *rdr, .scorer = &sort});
+    tests::PreparedFilter prepared_filter{
+      *tests::Optimized(std::move(not_node), &sort), *rdr, &sort};
     std::multimap<irs::score_t, irs::doc_id_t, std::greater<>> scored_result;
 
     ASSERT_EQ(1, rdr->size());
     auto& segment = (*rdr)[0];
 
-    auto filter_itr =
-      prepared_filter->execute({.segment = segment, .scorer = &sort});
+    auto filter_itr = prepared_filter.Execute(0);
     ASSERT_EQ(32, irs::CostAttr::extract(*filter_itr));
 
     auto score = filter_itr->PrepareScore({
@@ -15535,7 +15470,7 @@ TEST_P(BooleanFilterTestCase, not_standalone_sequential_ordered) {
 
     size_t docs_count = 0;
 
-    while (filter_itr->next()) {
+    while (!irs::doc_limits::eof(filter_itr->advance())) {
       cur_doc = filter_itr->value();
       filter_itr->FetchScoreArgs(0);
       irs::score_t score_value{};
@@ -15578,7 +15513,7 @@ TEST_P(BooleanFilterTestCase, not_sequential_ordered) {
                                            10, 9,  8,  7,  6,  4,  3,  2};
 
     irs::And root;
-    root.add<irs::Not>().filter<irs::ByTerm>() =
+    root.add<irs::Exclusion>().exclude<irs::ByTerm>() =
       MakeFilter<irs::ByTerm>(column_name, "abcd");
 
     size_t collector_finish_count = 0;
@@ -15603,14 +15538,14 @@ TEST_P(BooleanFilterTestCase, not_sequential_ordered) {
       *score = cur_doc;
     };
 
-    auto prepared_filter = root.prepare({.index = *rdr, .scorer = &sort});
+    tests::PreparedFilter prepared_filter{
+      *tests::Optimized(std::move(root), &sort), *rdr, &sort};
     std::multimap<irs::score_t, irs::doc_id_t, std::greater<>> scored_result;
 
     ASSERT_EQ(1, rdr->size());
     auto& segment = (*rdr)[0];
 
-    auto filter_itr =
-      prepared_filter->execute({.segment = segment, .scorer = &sort});
+    auto filter_itr = prepared_filter.Execute(0);
     ASSERT_EQ(32, irs::CostAttr::extract(*filter_itr));
 
     auto score = filter_itr->PrepareScore({
@@ -15620,7 +15555,7 @@ TEST_P(BooleanFilterTestCase, not_sequential_ordered) {
 
     size_t docs_count = 0;
 
-    while (filter_itr->next()) {
+    while (!irs::doc_limits::eof(filter_itr->advance())) {
       cur_doc = filter_itr->value();
       filter_itr->FetchScoreArgs(0);
       irs::score_t score_value{};
@@ -15656,37 +15591,43 @@ TEST_P(BooleanFilterTestCase, not_sequential) {
 
   // empty query
   {
-    CheckQuery(irs::Not(), Docs{}, rdr);
+    CheckQuery(
+      *tests::Optimized(irs::Exclusion()),
+      Docs{1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16,
+           17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
+      rdr);
   }
 
   // single not statement - empty result
   {
-    irs::Not root;
-    root.filter<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldSame, "xyz");
+    irs::Exclusion root;
+    root.exclude<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldSame, "xyz");
 
-    CheckQuery(root, Docs{}, rdr);
+    CheckQuery(*tests::Optimized(std::move(root)), Docs{}, rdr);
   }
 
   // duplicated=abcd AND (NOT ( NOT name=A ))
   {
     irs::And root;
     root.add<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldDuplicated, "abcd");
-    root.add<irs::Not>().filter<irs::Not>().filter<irs::ByTerm>() =
-      MakeFilter<irs::ByTerm>(kFieldName, "A");
-    CheckQuery(root, Docs{1}, rdr);
+    root.add<irs::Exclusion>()
+      .exclude<irs::Exclusion>()
+      .exclude<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldName, "A");
+    CheckQuery(*tests::Optimized(std::move(root)), Docs{1}, rdr);
   }
 
   // duplicated=abcd AND (NOT ( NOT (NOT (NOT ( NOT name=A )))))
   {
     irs::And root;
     root.add<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldDuplicated, "abcd");
-    root.add<irs::Not>()
-      .filter<irs::Not>()
-      .filter<irs::Not>()
-      .filter<irs::Not>()
-      .filter<irs::Not>()
-      .filter<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldName, "A");
-    CheckQuery(root, Docs{5, 11, 21, 27, 31}, rdr);
+    root.add<irs::Exclusion>()
+      .exclude<irs::Exclusion>()
+      .exclude<irs::Exclusion>()
+      .exclude<irs::Exclusion>()
+      .exclude<irs::Exclusion>()
+      .exclude<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldName, "A");
+    CheckQuery(*tests::Optimized(std::move(root)), Docs{5, 11, 21, 27, 31},
+               rdr);
   }
 
   // * AND NOT *
@@ -15694,15 +15635,19 @@ TEST_P(BooleanFilterTestCase, not_sequential) {
     {
       irs::And root;
       root.add<irs::All>();
-      root.add<irs::Not>().filter<irs::All>();
-      CheckQuery(root, Docs{}, rdr);
+      root.add<irs::Exclusion>().exclude<irs::All>();
+      CheckQuery(*tests::Optimized(std::move(root)), Docs{}, rdr);
     }
 
     {
       irs::Or root;
       root.add<irs::All>();
-      root.add<irs::Not>().filter<irs::All>();
-      CheckQuery(root, Docs{}, rdr);
+      root.add<irs::Exclusion>().exclude<irs::All>();
+      CheckQuery(
+        *tests::Optimized(std::move(root)),
+        Docs{1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16,
+             17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
+        rdr);
     }
 
   }  // namespace tests
@@ -15713,45 +15658,23 @@ TEST_P(BooleanFilterTestCase, not_sequential) {
       irs::And root;
       root.add<irs::ByTerm>() =
         MakeFilter<irs::ByTerm>(kFieldDuplicated, "abcd");
-      root.add<irs::Not>().filter<irs::ByTerm>() =
+      root.add<irs::Exclusion>().exclude<irs::ByTerm>() =
         MakeFilter<irs::ByTerm>(kFieldName, "A");
-      CheckQuery(root, Docs{5, 11, 21, 27, 31}, rdr);
+      CheckQuery(*tests::Optimized(std::move(root)), Docs{5, 11, 21, 27, 31},
+                 rdr);
     }
 
     {
       irs::Or root;
       root.add<irs::ByTerm>() =
         MakeFilter<irs::ByTerm>(kFieldDuplicated, "abcd");
-      root.add<irs::Not>().filter<irs::ByTerm>() =
+      root.add<irs::Exclusion>().exclude<irs::ByTerm>() =
         MakeFilter<irs::ByTerm>(kFieldName, "A");
-      CheckQuery(root, Docs{2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12,
-                            13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                            24, 25, 26, 27, 28, 29, 30, 31, 32},
-                 rdr);
-    }
-    // check 'all' filter added for Not nodes does not affects score
-    {
-      irs::Or root;
-      auto& left_branch = root.add<irs::And>();
-      // this three filters fire at same doc so it will get score = 3
-      Append<irs::ByTerm>(left_branch, kFieldName, "A");
-      Append<irs::ByTerm>(left_branch, kFieldDuplicated, "abcd");
-      Append<irs::ByTerm>(left_branch, kFieldSame, "xyz");
-
-      auto& right_branch = root.add<irs::And>();
-      Append<irs::ByTerm>(right_branch, kFieldName, "B");  // +1 score
-      auto& sub = right_branch.add<irs::Or>();    // this OR we actually test
-      Append<irs::ByTerm>(sub, kFieldName, "B");  // +1 score
-      // will exclude some docs (but A will stay) and produce 'all'
-      sub.add<irs::Not>().filter<irs::ByTerm>() =
-        MakeFilter<irs::ByTerm>(kFieldPrefix, "abcde");
-      // will exclude some docs (but A will stay) and produce another 'all'
-      sub.add<irs::Not>().filter<irs::ByTerm>() =
-        MakeFilter<irs::ByTerm>(kFieldDuplicated, "abcd");
-      // if 'all' will add at least 1 to score totals score will be 3 and
-      // expected order will break
-      irs::Scorer::ptr sort{std::make_unique<tests::sort::Boost>()};
-      CheckQuery(root, std::span{&sort, 1}, Docs{2, 1}, rdr);
+      CheckQuery(
+        *tests::Optimized(std::move(root)),
+        Docs{1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16,
+             17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
+        rdr);
     }
   }
 
@@ -15761,25 +15684,27 @@ TEST_P(BooleanFilterTestCase, not_sequential) {
       irs::And root;
       root.add<irs::ByTerm>() =
         MakeFilter<irs::ByTerm>(kFieldDuplicated, "abcd");
-      root.add<irs::Not>().filter<irs::ByTerm>() =
+      root.add<irs::Exclusion>().exclude<irs::ByTerm>() =
         MakeFilter<irs::ByTerm>(kFieldName, "A");
-      root.add<irs::Not>().filter<irs::ByTerm>() =
+      root.add<irs::Exclusion>().exclude<irs::ByTerm>() =
         MakeFilter<irs::ByTerm>(kFieldName, "A");
-      CheckQuery(root, Docs{5, 11, 21, 27, 31}, rdr);
+      CheckQuery(*tests::Optimized(std::move(root)), Docs{5, 11, 21, 27, 31},
+                 rdr);
     }
 
     {
       irs::Or root;
       root.add<irs::ByTerm>() =
         MakeFilter<irs::ByTerm>(kFieldDuplicated, "abcd");
-      root.add<irs::Not>().filter<irs::ByTerm>() =
+      root.add<irs::Exclusion>().exclude<irs::ByTerm>() =
         MakeFilter<irs::ByTerm>(kFieldName, "A");
-      root.add<irs::Not>().filter<irs::ByTerm>() =
+      root.add<irs::Exclusion>().exclude<irs::ByTerm>() =
         MakeFilter<irs::ByTerm>(kFieldName, "A");
-      CheckQuery(root, Docs{2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12,
-                            13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                            24, 25, 26, 27, 28, 29, 30, 31, 32},
-                 rdr);
+      CheckQuery(
+        *tests::Optimized(std::move(root)),
+        Docs{1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16,
+             17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
+        rdr);
     }
   }
 
@@ -15789,25 +15714,26 @@ TEST_P(BooleanFilterTestCase, not_sequential) {
       irs::And root;
       root.add<irs::ByTerm>() =
         MakeFilter<irs::ByTerm>(kFieldDuplicated, "abcd");
-      root.add<irs::Not>().filter<irs::ByTerm>() =
+      root.add<irs::Exclusion>().exclude<irs::ByTerm>() =
         MakeFilter<irs::ByTerm>(kFieldName, "A");
-      root.add<irs::Not>().filter<irs::ByTerm>() =
+      root.add<irs::Exclusion>().exclude<irs::ByTerm>() =
         MakeFilter<irs::ByTerm>(kFieldName, "E");
-      CheckQuery(root, Docs{11, 21, 27, 31}, rdr);
+      CheckQuery(*tests::Optimized(std::move(root)), Docs{11, 21, 27, 31}, rdr);
     }
 
     {
       irs::Or root;
       root.add<irs::ByTerm>() =
         MakeFilter<irs::ByTerm>(kFieldDuplicated, "abcd");
-      root.add<irs::Not>().filter<irs::ByTerm>() =
+      root.add<irs::Exclusion>().exclude<irs::ByTerm>() =
         MakeFilter<irs::ByTerm>(kFieldName, "A");
-      root.add<irs::Not>().filter<irs::ByTerm>() =
+      root.add<irs::Exclusion>().exclude<irs::ByTerm>() =
         MakeFilter<irs::ByTerm>(kFieldPrefix, "abcd");
-      CheckQuery(root, Docs{2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12,
-                            13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                            24, 25, 26, 27, 28, 29, 30, 31, 32},
-                 rdr);
+      CheckQuery(
+        *tests::Optimized(std::move(root)),
+        Docs{1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16,
+             17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
+        rdr);
     }
   }
 }
@@ -15830,23 +15756,25 @@ TEST_P(BooleanFilterTestCase, not_and_conjunction_regression) {
   }
   auto rdr = open_reader();
 
-  irs::Not root;
-  auto& conj = root.filter<irs::And>();
+  irs::Exclusion root;
+  auto& conj = root.exclude<irs::And>();
   conj.add<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldSame, "xyz");
   conj.add<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldDuplicated, "abcd");
 
   // duplicated=abcd matches {1, 5, 11, 21, 27, 31}; same=xyz matches
   // all 32 docs; the And matches the abcd set; Not is the complement.
-  CheckQuery(root, Docs{2,  3,  4,  6,  7,  8,  9,  10, 12, 13, 14, 15, 16,
-                        17, 18, 19, 20, 22, 23, 24, 25, 26, 28, 29, 30, 32},
+  irs::Filter::ptr optimized = tests::Optimized(std::move(root));
+  CheckQuery(*optimized,
+             Docs{2,  3,  4,  6,  7,  8,  9,  10, 12, 13, 14, 15, 16,
+                  17, 18, 19, 20, 22, 23, 24, 25, 26, 28, 29, 30, 32},
              rdr);
 
   // Also exercise seek() across the result set -- this is the path
   // that drove the SQL-side crash, since the table scan repeatedly
   // re-enters Exclusion::converge with the next incl doc.
-  auto prepared = root.prepare({.index = rdr});
-  for (const auto& sub : rdr) {
-    auto docs = prepared->execute({.segment = sub});
+  tests::PreparedFilter prepared{*optimized, rdr};
+  for (size_t i = 0, n = prepared.size(); i < n; ++i) {
+    auto docs = prepared.Execute(i);
     for (irs::doc_id_t target : {2, 5, 6, 11, 12, 21, 22, 27, 28, 31, 32}) {
       const auto landed = docs->seek(target);
       EXPECT_GE(landed, target);
@@ -15869,50 +15797,153 @@ TEST_P(BooleanFilterTestCase, not_standalone_sequential) {
 
   // empty query
   {
-    CheckQuery(irs::Not(), Docs{}, rdr);
+    CheckQuery(
+      *tests::Optimized(irs::Exclusion()),
+      Docs{1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16,
+           17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
+      rdr);
   }
 
   // single not statement - empty result
   {
-    irs::Not not_node;
-    not_node.filter<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldSame, "xyz"),
+    irs::Exclusion not_node;
+    not_node.exclude<irs::ByTerm>() =
+      MakeFilter<irs::ByTerm>(kFieldSame, "xyz"),
 
-    CheckQuery(not_node, Docs{}, rdr);
+    CheckQuery(*tests::Optimized(std::move(not_node)), Docs{}, rdr);
   }
 
   // single not statement - all docs
   {
-    irs::Not not_node;
-    not_node.filter<irs::ByTerm>() =
+    irs::Exclusion not_node;
+    not_node.exclude<irs::ByTerm>() =
       MakeFilter<irs::ByTerm>(kFieldSame, "invalid_term"),
 
-    CheckQuery(not_node, Docs{1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11,
-                              12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                              23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
-               rdr);
+    CheckQuery(
+      *tests::Optimized(std::move(not_node)),
+      Docs{1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16,
+           17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
+      rdr);
   }
 
   // (NOT (NOT name=A))
   {
-    irs::Not not_node;
-    not_node.filter<irs::Not>().filter<irs::ByTerm>() =
+    irs::Exclusion not_node;
+    not_node.exclude<irs::Exclusion>().exclude<irs::ByTerm>() =
       MakeFilter<irs::ByTerm>(kFieldName, "A");
-    CheckQuery(not_node, Docs{1}, rdr);
+    CheckQuery(*tests::Optimized(std::move(not_node)), Docs{1}, rdr);
   }
 
   // (NOT (NOT (NOT (NOT (NOT name=A)))))
   {
-    irs::Not not_node;
-    not_node.filter<irs::Not>()
-      .filter<irs::Not>()
-      .filter<irs::Not>()
-      .filter<irs::Not>()
-      .filter<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldName, "A");
+    irs::Exclusion not_node;
+    not_node.exclude<irs::Exclusion>()
+      .exclude<irs::Exclusion>()
+      .exclude<irs::Exclusion>()
+      .exclude<irs::Exclusion>()
+      .exclude<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldName, "A");
 
-    CheckQuery(not_node, Docs{2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12,
-                              13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
-                              24, 25, 26, 27, 28, 29, 30, 31, 32},
+    CheckQuery(
+      *tests::Optimized(std::move(not_node)),
+      Docs{2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17,
+           18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
+      rdr);
+  }
+}
+
+TEST_P(BooleanFilterTestCase, exclusion_sequential) {
+  {
+    tests::JsonDocGenerator gen(resource("simple_sequential.json"),
+                                &tests::GenericJsonFieldFactory);
+    add_segment(gen);
+  }
+
+  auto rdr = open_reader();
+
+  {
+    irs::Exclusion root;
+    CheckQuery(
+      *tests::Optimized(std::move(root)),
+      Docs{1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16,
+           17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
+      rdr);
+  }
+
+  {
+    irs::Exclusion root;
+    root.exclude<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldName, "A");
+    CheckQuery(
+      *tests::Optimized(std::move(root)),
+      Docs{2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17,
+           18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
+      rdr);
+  }
+
+  {
+    irs::Exclusion root;
+    root.include<irs::ByTerm>() =
+      MakeFilter<irs::ByTerm>(kFieldDuplicated, "abcd");
+    CheckQuery(*tests::Optimized(std::move(root)), Docs{1, 5, 11, 21, 27, 31},
                rdr);
+  }
+
+  {
+    irs::Exclusion root;
+    root.include<irs::ByTerm>() =
+      MakeFilter<irs::ByTerm>(kFieldDuplicated, "abcd");
+    root.exclude<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldName, "A");
+    CheckQuery(*tests::Optimized(std::move(root)), Docs{5, 11, 21, 27, 31},
+               rdr);
+  }
+
+  {
+    irs::Exclusion root;
+    root.include<irs::ByTerm>() =
+      MakeFilter<irs::ByTerm>(kFieldDuplicated, "abcd");
+    auto& any = root.exclude<irs::Or>();
+    any.add<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldName, "A");
+    any.add<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldName, "E");
+    CheckQuery(*tests::Optimized(std::move(root)), Docs{11, 21, 27, 31}, rdr);
+  }
+
+  {
+    irs::Exclusion root;
+    root.exclude<irs::Exclusion>().exclude<irs::ByTerm>() =
+      MakeFilter<irs::ByTerm>(kFieldName, "A");
+    CheckQuery(*tests::Optimized(std::move(root)), Docs{1}, rdr);
+  }
+
+  {
+    irs::And root;
+    Append<irs::ByTerm>(root, kFieldSame, "xyz");
+    root.add<irs::Exclusion>().exclude<irs::ByTerm>() =
+      MakeFilter<irs::ByTerm>(kFieldName, "A");
+    CheckQuery(
+      *tests::Optimized(std::move(root)),
+      Docs{2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17,
+           18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
+      rdr);
+  }
+
+  {
+    irs::And root;
+    Append<irs::ByTerm>(root, kFieldSame, "xyz");
+    root.add<irs::Exclusion>().exclude<irs::ByTerm>() =
+      MakeFilter<irs::ByTerm>(kFieldName, "A");
+    CheckQuery(
+      *tests::Optimized(std::move(root)),
+      Docs{2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16, 17,
+           18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
+      rdr);
+  }
+
+  {
+    irs::Exclusion root;
+    root.include<irs::ByTerm>() =
+      MakeFilter<irs::ByTerm>(kFieldDuplicated, "abcd");
+    root.exclude<irs::Exclusion>().exclude<irs::ByTerm>() =
+      MakeFilter<irs::ByTerm>(kFieldName, "A");
+    CheckQuery(*tests::Optimized(std::move(root)), Docs{1}, rdr);
   }
 }
 
@@ -15945,8 +15976,8 @@ TEST_P(BooleanFilterTestCase, mixed) {
         Append<irs::ByTerm>(child, kFieldDuplicated, "vczc");
       }
 
-      CheckQuery(root, Docs{1, 2, 3, 5, 8, 11, 14, 17, 19, 21, 24, 27, 31},
-                 rdr);
+      CheckQuery(*tests::Optimized(std::move(root)),
+                 Docs{1, 2, 3, 5, 8, 11, 14, 17, 19, 21, 24, 27, 31}, rdr);
     }
 
     // ((same=xyz AND duplicated=abcd) OR (same=xyz AND duplicated=vczc)) AND
@@ -15975,7 +16006,7 @@ TEST_P(BooleanFilterTestCase, mixed) {
         }
       }
 
-      CheckQuery(root, Docs{24}, rdr);
+      CheckQuery(*tests::Optimized(std::move(root)), Docs{24}, rdr);
     }
 
     // ((same=xyz AND duplicated=abcd) OR (name=A or name=C or NAME=P or
@@ -16026,8 +16057,8 @@ TEST_P(BooleanFilterTestCase, mixed) {
         }
       }
 
-      CheckQuery(root, Docs{1, 2, 3, 5, 8, 11, 14, 16, 17, 19, 21, 24, 27, 31},
-                 rdr);
+      CheckQuery(*tests::Optimized(std::move(root)),
+                 Docs{1, 2, 3, 5, 8, 11, 14, 16, 17, 19, 21, 24, 27, 31}, rdr);
     }
 
     // (same=xyz AND duplicated=abcd) OR (same=xyz AND duplicated=vczc) AND *
@@ -16051,10 +16082,11 @@ TEST_P(BooleanFilterTestCase, mixed) {
         Append<irs::ByTerm>(child, kFieldDuplicated, "vczc");
       }
 
-      CheckQuery(root, Docs{1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11,
-                            12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
-                            23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
-                 rdr);
+      CheckQuery(
+        *tests::Optimized(std::move(root)),
+        Docs{1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15, 16,
+             17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32},
+        rdr);
     }
 
     // (same=xyz AND duplicated=abcd) OR (same=xyz AND duplicated=vczc) OR NOT
@@ -16063,7 +16095,7 @@ TEST_P(BooleanFilterTestCase, mixed) {
       irs::Or root;
 
       // NOT *
-      root.add<irs::Not>().filter<irs::All>();
+      root.add<irs::Exclusion>().exclude<irs::All>();
 
       // same=xyz AND duplicated=abcd
       {
@@ -16079,7 +16111,8 @@ TEST_P(BooleanFilterTestCase, mixed) {
         Append<irs::ByTerm>(child, kFieldDuplicated, "vczc");
       }
 
-      CheckQuery(root, Docs{}, rdr);
+      CheckQuery(*tests::Optimized(std::move(root)),
+                 Docs{1, 2, 3, 5, 8, 11, 14, 17, 19, 21, 24, 27, 31}, rdr);
     }
   }
 }
@@ -16115,16 +16148,17 @@ TEST_P(BooleanFilterTestCase, mixed_ordered) {
 
     irs::TFIDF tfidf_scorer;
 
-    auto prepared = root.prepare({.index = *rdr, .scorer = &tfidf_scorer});
-    ASSERT_NE(nullptr, prepared);
+    tests::PreparedFilter prepared{
+      *tests::Optimized(std::move(root), &tfidf_scorer), *rdr, &tfidf_scorer};
+    ASSERT_NE(nullptr, prepared.Query(0));
 
     std::vector<irs::doc_id_t> expected_docs{
       1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
       16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 29, 30, 31, 32};
 
     auto expected_doc = expected_docs.begin();
-    for (const auto& sub : rdr) {
-      auto docs = prepared->execute({.segment = sub, .scorer = &tfidf_scorer});
+    for (size_t i = 0, n = prepared.size(); i < n; ++i) {
+      auto docs = prepared.Execute(i);
 
       const auto& scr = docs->PrepareScore({
         .scorer = &tfidf_scorer,
@@ -16132,7 +16166,7 @@ TEST_P(BooleanFilterTestCase, mixed_ordered) {
       });
 
       std::vector<irs::bstring> scores;
-      while (docs->next()) {
+      while (!irs::doc_limits::eof(docs->advance())) {
         EXPECT_EQ(*expected_doc, docs->value());
         ++expected_doc;
 
@@ -16147,36 +16181,95 @@ TEST_P(BooleanFilterTestCase, mixed_ordered) {
   }
 }
 
-TEST(Not_test, ctor) {
-  irs::Not q;
-  ASSERT_EQ(irs::Type<irs::Not>::id(), q.type());
-  ASSERT_EQ(nullptr, q.filter());
+TEST(Exclusion_test, ctor) {
+  irs::Exclusion q;
+  ASSERT_EQ(irs::Type<irs::Exclusion>::id(), q.type());
+  ASSERT_EQ(nullptr, q.GetInclude());
+  ASSERT_TRUE(q.GetExcludes().empty());
+  ASSERT_TRUE(q.empty());
   ASSERT_EQ(irs::kNoBoost, q.Boost());
 }
 
-TEST(Not_test, equal) {
+TEST(Exclusion_test, equal) {
   {
-    irs::Not lhs, rhs;
+    irs::Exclusion lhs, rhs;
     ASSERT_EQ(lhs, rhs);
   }
 
   {
-    irs::Not lhs;
-    lhs.filter<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldAbc, "def");
+    irs::Exclusion lhs;
+    lhs.exclude<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldAbc, "def");
 
-    irs::Not rhs;
-    rhs.filter<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldAbc, "def");
+    irs::Exclusion rhs;
+    rhs.exclude<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldAbc, "def");
     ASSERT_EQ(lhs, rhs);
   }
 
   {
-    irs::Not lhs;
-    lhs.filter<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldAbc, "def");
+    irs::Exclusion lhs;
+    lhs.include<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldAbcd, "def");
+    lhs.exclude<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldAbc, "def");
 
-    irs::Not rhs;
-    rhs.filter<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldAbcd, "def");
+    irs::Exclusion rhs;
+    rhs.include<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldAbcd, "def");
+    rhs.exclude<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldAbc, "def");
+    ASSERT_EQ(lhs, rhs);
+  }
+
+  {
+    irs::Exclusion lhs;
+    lhs.exclude<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldAbc, "def");
+
+    irs::Exclusion rhs;
+    rhs.exclude<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldAbcd, "def");
     ASSERT_NE(lhs, rhs);
   }
+
+  {
+    irs::Exclusion lhs;
+    lhs.exclude<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldAbc, "def");
+
+    irs::Exclusion rhs;
+    rhs.include<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldAbc, "def");
+    rhs.exclude<irs::ByTerm>() = MakeFilter<irs::ByTerm>(kFieldAbc, "def");
+    ASSERT_NE(lhs, rhs);
+  }
+}
+
+TEST(Not_helper_test, shape) {
+  auto inner =
+    std::make_unique<irs::ByTerm>(MakeFilter<irs::ByTerm>(kFieldAbc, "def"));
+  const auto* inner_raw = inner.get();
+
+  irs::Filter::ptr filter = std::make_unique<irs::Not>(std::move(inner));
+  ASSERT_NE(nullptr, filter);
+  ASSERT_EQ(irs::Type<irs::Not>::id(), filter->type());
+
+  const auto* not_filter = dynamic_cast<const irs::Not*>(filter.get());
+  ASSERT_NE(nullptr, not_filter);
+  ASSERT_EQ(inner_raw, not_filter->filter());
+}
+
+TEST(Not_helper_test, equal) {
+  irs::Not expected{
+    std::make_unique<irs::ByTerm>(MakeFilter<irs::ByTerm>(kFieldAbc, "def"))};
+
+  irs::Not filter{
+    std::make_unique<irs::ByTerm>(MakeFilter<irs::ByTerm>(kFieldAbc, "def"))};
+  ASSERT_EQ(expected, filter);
+}
+
+TEST(Not_helper_test, optimize_double_negation) {
+  auto root = std::make_unique<irs::And>();
+  root->add(std::make_unique<irs::Not>(
+    std::make_unique<irs::Not>(std::make_unique<irs::ByTerm>(
+      MakeFilter<irs::ByTerm>(kFieldTestField, "test_term")))));
+
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter);
+
+  tests::PreparedFilter prepared{*filter, irs::SubReader::empty()};
+  ASSERT_NE(nullptr, dynamic_cast<const irs::TermQuery*>(prepared.Query(0)));
 }
 
 TEST(And_test, ctor) {
@@ -16237,19 +16330,14 @@ TEST(And_test, equal) {
 }
 
 TEST(And_test, optimize_double_negation) {
-  irs::And root;
-  root.add<irs::Not>().filter<irs::Not>().filter<irs::ByTerm>() =
+  auto root = std::make_unique<irs::And>();
+  root->add<irs::Exclusion>().exclude<irs::Exclusion>().exclude<irs::ByTerm>() =
     MakeFilter<irs::ByTerm>(kFieldTestField, "test_term");
 
-  auto prepared = root.prepare({.index = irs::SubReader::empty()});
-  ASSERT_NE(nullptr, dynamic_cast<const irs::TermQuery*>(prepared.get()));
-}
-
-TEST(And_test, prepare_empty_filter) {
-  irs::And root;
-  auto prepared = root.prepare({.index = irs::SubReader::empty()});
-  ASSERT_NE(nullptr, prepared);
-  ASSERT_EQ(typeid(irs::Filter::Query::empty().get()), typeid(prepared.get()));
+  irs::Filter::ptr f = std::move(root);
+  irs::Optimize(f);
+  tests::PreparedFilter prepared{*f, irs::SubReader::empty()};
+  ASSERT_NE(nullptr, dynamic_cast<const irs::TermQuery*>(prepared.Query(0)));
 }
 
 TEST(And_test, optimize_single_node) {
@@ -16258,8 +16346,9 @@ TEST(And_test, optimize_single_node) {
     irs::And root;
     Append<irs::ByTerm>(root, kFieldTestField, "test_term");
 
-    auto prepared = root.prepare({.index = irs::SubReader::empty()});
-    ASSERT_NE(nullptr, dynamic_cast<const irs::TermQuery*>(prepared.get()));
+    tests::PreparedFilter prepared{*tests::Optimized(std::move(root)),
+                                   irs::SubReader::empty()};
+    ASSERT_NE(nullptr, dynamic_cast<const irs::TermQuery*>(prepared.Query(0)));
   }
 
   // complex hierarchy
@@ -16268,8 +16357,9 @@ TEST(And_test, optimize_single_node) {
     root.add<irs::And>().add<irs::And>().add<irs::ByTerm>() =
       MakeFilter<irs::ByTerm>(kFieldTestField, "test_term");
 
-    auto prepared = root.prepare({.index = irs::SubReader::empty()});
-    ASSERT_NE(nullptr, dynamic_cast<const irs::TermQuery*>(prepared.get()));
+    tests::PreparedFilter prepared{*tests::Optimized(std::move(root)),
+                                   irs::SubReader::empty()};
+    ASSERT_NE(nullptr, dynamic_cast<const irs::TermQuery*>(prepared.Query(0)));
   }
 }
 
@@ -16279,51 +16369,48 @@ TEST(And_test, optimize_all_filters) {
     irs::And root;
     root.add<irs::All>().boost(5.f);
 
-    auto prepared = root.prepare({.index = irs::SubReader::empty()});
-    ASSERT_EQ(
-      typeid(irs::All().prepare({.index = irs::SubReader::empty()}).get()),
-      typeid(prepared.get()));
-    ASSERT_EQ(5.f, prepared->Boost());
+    tests::PreparedFilter prepared{*tests::Optimized(std::move(root)),
+                                   irs::SubReader::empty()};
+    const irs::All all;
+    tests::PreparedFilter all_prepared{all, irs::SubReader::empty()};
+    ASSERT_EQ(typeid(all_prepared.Query(0)), typeid(prepared.Query(0)));
+    ASSERT_EQ(5.f, prepared.Query(0)->Boost());
   }
 
   // multiple `all` filters
   {
-    irs::And root;
-    root.add<irs::All>().boost(5.f);
-    root.add<irs::All>().boost(2.f);
-    root.add<irs::All>().boost(3.f);
+    auto root = std::make_unique<irs::And>();
+    root->add<irs::All>().boost(5.f);
+    root->add<irs::All>().boost(2.f);
+    root->add<irs::All>().boost(3.f);
+    irs::Filter::ptr f = std::move(root);
+    irs::Optimize(f);
 
-    auto prepared = root.prepare({.index = irs::SubReader::empty()});
-    ASSERT_EQ(
-      typeid(irs::All().prepare({.index = irs::SubReader::empty()}).get()),
-      typeid(prepared.get()));
-    ASSERT_EQ(10.f, prepared->Boost());
+    tests::PreparedFilter prepared{*f, irs::SubReader::empty()};
+    const irs::All all;
+    tests::PreparedFilter all_prepared{all, irs::SubReader::empty()};
+    ASSERT_EQ(typeid(all_prepared.Query(0)), typeid(prepared.Query(0)));
+    ASSERT_EQ(10.f, prepared.Query(0)->Boost());
   }
 
   // multiple `all` filters + term filter
   {
-    irs::And root;
-    root.add<irs::All>().boost(5.f);
-    root.add<irs::All>().boost(2.f);
-    Append<irs::ByTerm>(root, kFieldTestField, "test_term");
+    auto root = std::make_unique<irs::And>();
+    root->add<irs::All>().boost(5.f);
+    root->add<irs::All>().boost(2.f);
+    Append<irs::ByTerm>(*root, kFieldTestField, "test_term");
+    irs::Filter::ptr f = std::move(root);
+    irs::Optimize(f, {.scored = true});
 
     tests::sort::Boost sort{};
-    auto prepared =
-      root.prepare({.index = irs::SubReader::empty(), .scorer = &sort});
-    ASSERT_NE(nullptr, dynamic_cast<const irs::TermQuery*>(prepared.get()));
-    ASSERT_EQ(8.f, prepared->Boost());
-  }
-
-  // `all` filter + term filter
-  {
-    tests::sort::Boost sort{};
-    irs::And root;
-    Append<irs::ByTerm>(root, kFieldTestField, "test_term");
-    root.add<irs::All>().boost(5.f);
-    auto prepared =
-      root.prepare({.index = irs::SubReader::empty(), .scorer = &sort});
-    ASSERT_NE(nullptr, dynamic_cast<const irs::TermQuery*>(prepared.get()));
-    ASSERT_EQ(6.f, prepared->Boost());
+    tests::PreparedFilter prepared{*f, irs::SubReader::empty(), &sort};
+    ASSERT_NE(nullptr, dynamic_cast<const irs::AndQuery*>(prepared.Query(0)));
+    auto& and_query = sdb::basics::downCast<irs::AndQuery>(*prepared.Query(0));
+    ASSERT_EQ(and_query.size(), 2);
+    auto it = and_query.begin();
+    ASSERT_NE(nullptr, dynamic_cast<const irs::TermQuery*>(it->get()));
+    it++;
+    ASSERT_EQ(7.f, (*it)->Boost());
   }
 }
 
@@ -16331,32 +16418,34 @@ TEST(And_test, not_boosted) {
   tests::sort::Boost sort{};
   irs::And root;
   {
-    auto& neg = root.add<irs::Not>();
-    auto& node = neg.filter<detail::Boosted>();
-    node.docs = {5, 6};
-    node.boost(4);
+    auto& neg = root.add<irs::Exclusion>();
+    {
+      auto& node = neg.include<detail::Boosted>();
+      node.docs = {1};
+      node.boost(5);
+    }
+    {
+      auto& node = neg.exclude<detail::Boosted>();
+      node.docs = {5, 6};
+      node.boost(4);
+    }
   }
-  {
-    auto& node = root.add<detail::Boosted>();
-    node.docs = {1};
-    node.boost(5);
-  }
-  auto prep = root.prepare({.index = irs::SubReader::empty(), .scorer = &sort});
-  auto docs =
-    prep->execute({.segment = irs::SubReader::empty(), .scorer = &sort});
+  tests::PreparedFilter prep{*tests::Optimized(std::move(root), &sort),
+                             irs::SubReader::empty(), &sort};
+  auto docs = prep.Execute(0);
   const auto& scr = docs->PrepareScore({
     .scorer = &sort,
     .segment = &irs::SubReader::empty(),
   });
   ASSERT_FALSE(scr.IsDefault());
 
-  ASSERT_TRUE(docs->next());
+  ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
   docs->FetchScoreArgs(0);
   const auto doc_boost = scr.Score();
   ASSERT_EQ(5., doc_boost);  // FIXME: should be 9 if we will boost negation
   ASSERT_EQ(1, docs->value());
 
-  ASSERT_FALSE(docs->next());
+  ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
 }
 
 TEST(Or_test, ctor) {
@@ -16418,12 +16507,14 @@ TEST(Or_test, equal) {
 }
 
 TEST(Or_test, optimize_double_negation) {
-  irs::Or root;
-  root.add<irs::Not>().filter<irs::Not>().filter<irs::ByTerm>() =
+  auto root = std::make_unique<irs::Or>();
+  root->add<irs::Exclusion>().exclude<irs::Exclusion>().exclude<irs::ByTerm>() =
     MakeFilter<irs::ByTerm>(kFieldTestField, "test_term");
 
-  auto prepared = root.prepare({.index = irs::SubReader::empty()});
-  ASSERT_NE(nullptr, dynamic_cast<const irs::TermQuery*>(prepared.get()));
+  irs::Filter::ptr f = std::move(root);
+  irs::Optimize(f);
+  tests::PreparedFilter prepared{*f, irs::SubReader::empty()};
+  ASSERT_NE(nullptr, dynamic_cast<const irs::TermQuery*>(prepared.Query(0)));
 }
 
 TEST(Or_test, optimize_single_node) {
@@ -16432,8 +16523,9 @@ TEST(Or_test, optimize_single_node) {
     irs::Or root;
     Append<irs::ByTerm>(root, kFieldTestField, "test_term");
 
-    auto prepared = root.prepare({.index = irs::SubReader::empty()});
-    ASSERT_NE(nullptr, dynamic_cast<const irs::TermQuery*>(prepared.get()));
+    tests::PreparedFilter prepared{*tests::Optimized(std::move(root)),
+                                   irs::SubReader::empty()};
+    ASSERT_NE(nullptr, dynamic_cast<const irs::TermQuery*>(prepared.Query(0)));
   }
 
   // complex hierarchy
@@ -16442,61 +16534,450 @@ TEST(Or_test, optimize_single_node) {
     root.add<irs::Or>().add<irs::Or>().add<irs::ByTerm>() =
       MakeFilter<irs::ByTerm>(kFieldTestField, "test_term");
 
-    auto prepared = root.prepare({.index = irs::SubReader::empty()});
-    ASSERT_NE(nullptr, dynamic_cast<const irs::TermQuery*>(prepared.get()));
+    tests::PreparedFilter prepared{*tests::Optimized(std::move(root)),
+                                   irs::SubReader::empty()};
+    ASSERT_NE(nullptr, dynamic_cast<const irs::TermQuery*>(prepared.Query(0)));
   }
 }
 
 TEST(Or_test, optimize_all_unscored) {
-  irs::Or root;
+  auto root = std::make_unique<irs::Or>();
   detail::Boosted::gExecuteCount = 0;
   {
-    auto& node = root.add<detail::Boosted>();
+    auto& node = root->add<detail::Boosted>();
     node.docs = {1};
   }
   {
-    auto& node = root.add<detail::Boosted>();
+    auto& node = root->add<detail::Boosted>();
     node.docs = {2};
   }
   {
-    auto& node = root.add<detail::Boosted>();
+    auto& node = root->add<detail::Boosted>();
     node.docs = {3};
   }
-  root.add<irs::All>();
-  root.add<irs::Empty>();
-  root.add<irs::All>();
-  root.add<irs::Empty>();
+  root->add<irs::All>();
+  root->add<irs::Empty>();
+  root->add<irs::All>();
+  root->add<irs::Empty>();
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter);
 
-  auto prep = root.prepare({.index = irs::SubReader::empty()});
+  tests::PreparedFilter prep{*filter, irs::SubReader::empty()};
 
-  prep->execute({.segment = irs::SubReader::empty()});
+  prep.Execute(0);
   ASSERT_EQ(
     0, detail::Boosted::gExecuteCount);  // specific filters should be opt out
 }
 
+namespace {
+
+irs::bytes_view B(std::string_view value) {
+  return irs::ViewCast<irs::byte_type>(value);
+}
+
+const irs::AutomatonFilter* FusedOf(const irs::Filter::ptr& filter) {
+  return dynamic_cast<const irs::AutomatonFilter*>(filter.get());
+}
+
+bool FusedAccepts(const irs::AutomatonFilter& fused, std::string_view term) {
+  return bool(irs::Accept(fused.options().compiled->acceptor, B(term)));
+}
+
+}  // namespace
+
+TEST(OrAcceptorFusion_test, fuses_mixed_acceptors) {
+  auto root = std::make_unique<irs::Or>();
+  Append<irs::ByTerm>(*root, kFieldTestField, "kiwi");
+  Append<irs::ByPrefix>(*root, kFieldTestField, "ax");
+  Append<irs::ByWildcard>(*root, kFieldTestField, "b_n%");
+  auto& re = root->add<irs::ByRegexp>();
+  *re.mutable_field_id() = kFieldTestField;
+  re.mutable_options()->pattern = irs::bstring{B("a.*e")};
+
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter);
+
+  const auto* fused = FusedOf(filter);
+  ASSERT_NE(nullptr, fused);
+  EXPECT_EQ(kFieldTestField, fused->field_id());
+  EXPECT_TRUE(FusedAccepts(*fused, "kiwi"));
+  EXPECT_TRUE(FusedAccepts(*fused, "axle"));
+  EXPECT_TRUE(FusedAccepts(*fused, "banana"));
+  EXPECT_TRUE(FusedAccepts(*fused, "apple"));
+  EXPECT_FALSE(FusedAccepts(*fused, "kiwis"));
+  EXPECT_FALSE(FusedAccepts(*fused, "cherry"));
+}
+
+TEST(OrAcceptorFusion_test, keeps_contiguous_only_by_default) {
+  auto root = std::make_unique<irs::Or>();
+  Append<irs::ByTerm>(*root, kFieldTestField, "kiwi");
+  Append<irs::ByPrefix>(*root, kFieldTestField, "ax");
+
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter);
+
+  EXPECT_EQ(irs::Type<irs::Or>::id(), filter->type());
+}
+
+TEST(OrAcceptorFusion_test, quotes_term_metacharacters) {
+  auto root = std::make_unique<irs::Or>();
+  Append<irs::ByTerm>(*root, kFieldTestField, "a.e");
+  Append<irs::ByPrefix>(*root, kFieldTestField, "b(");
+
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter, {.fuse_seekable_acceptors = true});
+
+  const auto* fused = FusedOf(filter);
+  ASSERT_NE(nullptr, fused);
+  EXPECT_TRUE(FusedAccepts(*fused, "a.e"));
+  EXPECT_FALSE(FusedAccepts(*fused, "axe"));
+  EXPECT_TRUE(FusedAccepts(*fused, "b(x"));
+  EXPECT_FALSE(FusedAccepts(*fused, "bx"));
+}
+
+TEST(OrAcceptorFusion_test, pure_terms_become_by_terms) {
+  auto root = std::make_unique<irs::Or>();
+  Append<irs::ByTerm>(*root, kFieldTestField, "apple");
+  Append<irs::ByTerm>(*root, kFieldTestField, "banana");
+
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter);
+
+  EXPECT_EQ(irs::Type<irs::ByTerms>::id(), filter->type());
+}
+
+TEST(OrAcceptorFusion_test, keeps_min_match_or) {
+  auto root = std::make_unique<irs::Or>();
+  Append<irs::ByTerm>(*root, kFieldTestField, "kiwi");
+  Append<irs::ByPrefix>(*root, kFieldTestField, "ax");
+  Append<irs::ByPrefix>(*root, kFieldTestField, "ban");
+  root->min_match_count(2);
+
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter);
+
+  EXPECT_EQ(irs::Type<irs::Or>::id(), filter->type());
+}
+
+TEST(OrAcceptorFusion_test, keeps_mixed_fields) {
+  auto root = std::make_unique<irs::Or>();
+  Append<irs::ByTerm>(*root, kFieldTestField, "kiwi");
+  Append<irs::ByPrefix>(*root, kFieldName, "ax");
+
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter);
+
+  EXPECT_EQ(irs::Type<irs::Or>::id(), filter->type());
+}
+
+TEST(OrAcceptorFusion_test, keeps_range_children) {
+  auto root = std::make_unique<irs::Or>();
+  Append<irs::ByPrefix>(*root, kFieldTestField, "ax");
+  auto& range = root->add<irs::ByRange>();
+  *range.mutable_field_id() = kFieldTestField;
+  range.mutable_options()->range.min = irs::bstring{B("b")};
+  range.mutable_options()->range.min_type = irs::BoundType::Inclusive;
+  range.mutable_options()->range.max = irs::bstring{B("d")};
+  range.mutable_options()->range.max_type = irs::BoundType::Exclusive;
+
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter);
+
+  EXPECT_EQ(irs::Type<irs::Or>::id(), filter->type());
+}
+
+TEST(OrAcceptorFusion_test, scored_requires_uniform_boosts) {
+  {
+    auto root = std::make_unique<irs::Or>();
+    Append<irs::ByTerm>(*root, kFieldTestField, "kiwi").boost(2.f);
+    Append<irs::ByPrefix>(*root, kFieldTestField, "ax").boost(3.f);
+
+    irs::Filter::ptr filter = std::move(root);
+    irs::Optimize(filter, {.scored = true, .fuse_seekable_acceptors = true});
+
+    EXPECT_EQ(irs::Type<irs::Or>::id(), filter->type());
+  }
+  {
+    auto root = std::make_unique<irs::Or>();
+    Append<irs::ByPrefix>(*root, kFieldTestField, "ax").boost(2.f);
+    Append<irs::ByPrefix>(*root, kFieldTestField, "ban").boost(2.f);
+    root->boost(3.f);
+
+    irs::Filter::ptr filter = std::move(root);
+    irs::Optimize(filter, {.scored = true, .fuse_seekable_acceptors = true});
+
+    const auto* fused = FusedOf(filter);
+    ASSERT_NE(nullptr, fused);
+    EXPECT_EQ(6.f, fused->Boost());
+    EXPECT_EQ(2048, fused->options().scored_terms_limit);
+  }
+}
+
+TEST(OrAcceptorFusion_test, flattens_nested_or_on_search_path) {
+  auto root = std::make_unique<irs::Or>();
+  {
+    auto& inner = root->add<irs::Or>();
+    Append<irs::ByPrefix>(inner, kFieldTestField, "ax");
+    Append<irs::ByPrefix>(inner, kFieldTestField, "ban");
+  }
+  Append<irs::ByWildcard>(*root, kFieldTestField, "%le");
+
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter);
+
+  const auto* fused = FusedOf(filter);
+  ASSERT_NE(nullptr, fused);
+  EXPECT_TRUE(FusedAccepts(*fused, "axle"));
+  EXPECT_TRUE(FusedAccepts(*fused, "banana"));
+  EXPECT_TRUE(FusedAccepts(*fused, "apple"));
+  EXPECT_FALSE(FusedAccepts(*fused, "kiwi"));
+}
+
+TEST(OrAcceptorFusion_test, fuses_nested_fused_or) {
+  auto root = std::make_unique<irs::Or>();
+  {
+    auto& inner = root->add<irs::Or>();
+    Append<irs::ByPrefix>(inner, kFieldTestField, "ax");
+    Append<irs::ByPrefix>(inner, kFieldTestField, "ban");
+  }
+  Append<irs::ByWildcard>(*root, kFieldTestField, "%le");
+
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter, {.fuse_seekable_acceptors = true});
+
+  const auto* fused = FusedOf(filter);
+  ASSERT_NE(nullptr, fused);
+  EXPECT_TRUE(FusedAccepts(*fused, "axle"));
+  EXPECT_TRUE(FusedAccepts(*fused, "banana"));
+  EXPECT_TRUE(FusedAccepts(*fused, "apple"));
+  EXPECT_FALSE(FusedAccepts(*fused, "kiwi"));
+}
+
+TEST(OrAcceptorFusion_test, keeps_unfusable_nested_or) {
+  auto root = std::make_unique<irs::Or>();
+  {
+    auto& inner = root->add<irs::Or>();
+    inner.min_match_count(2);
+    Append<irs::ByPrefix>(inner, kFieldTestField, "ax");
+    Append<irs::ByPrefix>(inner, kFieldTestField, "ban");
+  }
+  Append<irs::ByWildcard>(*root, kFieldTestField, "%le");
+
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter, {.fuse_seekable_acceptors = true});
+
+  EXPECT_EQ(irs::Type<irs::Or>::id(), filter->type());
+}
+
+TEST(OrAcceptorFusion_test, translates_wildcard_escapes) {
+  auto root = std::make_unique<irs::Or>();
+  Append<irs::ByWildcard>(*root, kFieldTestField, "a_c%");
+  Append<irs::ByWildcard>(*root, kFieldTestField, "x\\%y");
+
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter);
+
+  const auto* fused = FusedOf(filter);
+  ASSERT_NE(nullptr, fused);
+  EXPECT_TRUE(FusedAccepts(*fused, "abc"));
+  EXPECT_TRUE(FusedAccepts(*fused, "abcdef"));
+  EXPECT_FALSE(FusedAccepts(*fused, "ac"));
+  EXPECT_TRUE(FusedAccepts(*fused, "x%y"));
+  EXPECT_FALSE(FusedAccepts(*fused, "xzy"));
+}
+
+TEST(OrAcceptorFusion_test, keeps_non_perl_regexp) {
+  auto root = std::make_unique<irs::Or>();
+  Append<irs::ByPrefix>(*root, kFieldTestField, "ax");
+  auto& re = root->add<irs::ByRegexp>();
+  *re.mutable_field_id() = kFieldTestField;
+  re.mutable_options()->pattern = irs::bstring{B("a.*e")};
+  re.mutable_options()->syntax = irs::RegexpSyntax::PosixEre;
+
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter, {.fuse_seekable_acceptors = true});
+
+  EXPECT_EQ(irs::Type<irs::Or>::id(), filter->type());
+}
+
+TEST(AndAcceptorFusion_test, fuses_same_field_acceptors) {
+  auto root = std::make_unique<irs::And>();
+  Append<irs::ByPrefix>(*root, kFieldTestField, "ax");
+  Append<irs::ByWildcard>(*root, kFieldTestField, "%le");
+
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter, {.fuse_acceptor_intersections = true});
+
+  const auto* fused = FusedOf(filter);
+  ASSERT_NE(nullptr, fused);
+  EXPECT_EQ(kFieldTestField, fused->field_id());
+  EXPECT_EQ(irs::bstring{B("ax%&%le")}, fused->options().pattern);
+  EXPECT_TRUE(FusedAccepts(*fused, "axle"));
+  EXPECT_TRUE(FusedAccepts(*fused, "axolotle"));
+  EXPECT_FALSE(FusedAccepts(*fused, "apple"));
+  EXPECT_FALSE(FusedAccepts(*fused, "axis"));
+}
+
+TEST(AndAcceptorFusion_test, noop_without_flag) {
+  auto root = std::make_unique<irs::And>();
+  Append<irs::ByPrefix>(*root, kFieldTestField, "ax");
+  Append<irs::ByWildcard>(*root, kFieldTestField, "%le");
+
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter);
+
+  EXPECT_EQ(irs::Type<irs::And>::id(), filter->type());
+}
+
+TEST(AndAcceptorFusion_test, noop_when_scored) {
+  auto root = std::make_unique<irs::And>();
+  Append<irs::ByPrefix>(*root, kFieldTestField, "ax");
+  Append<irs::ByWildcard>(*root, kFieldTestField, "%le");
+
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter, {.scored = true, .fuse_acceptor_intersections = true});
+
+  EXPECT_EQ(irs::Type<irs::And>::id(), filter->type());
+}
+
+TEST(AndAcceptorFusion_test, renders_range_pattern) {
+  auto root = std::make_unique<irs::And>();
+  Append<irs::ByPrefix>(*root, kFieldTestField, "b");
+  auto& range = root->add<irs::ByRange>();
+  *range.mutable_field_id() = kFieldTestField;
+  range.mutable_options()->range.min = irs::bstring{B("b")};
+  range.mutable_options()->range.min_type = irs::BoundType::Inclusive;
+  range.mutable_options()->range.max = irs::bstring{B("d")};
+  range.mutable_options()->range.max_type = irs::BoundType::Exclusive;
+
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter, {.fuse_acceptor_intersections = true});
+
+  const auto* fused = FusedOf(filter);
+  ASSERT_NE(nullptr, fused);
+  EXPECT_EQ(irs::bstring{B("b%&[b..d)")}, fused->options().pattern);
+  EXPECT_TRUE(FusedAccepts(*fused, "bar"));
+  EXPECT_FALSE(FusedAccepts(*fused, "dog"));
+  EXPECT_FALSE(FusedAccepts(*fused, "ax"));
+}
+
+TEST(AndAcceptorFusion_test, levenshtein_driver_bails) {
+  auto root = std::make_unique<irs::And>();
+  Append<irs::ByEditDistance>(*root, kFieldTestField, "apple")
+    .mutable_options()
+    ->max_distance = 1;
+  Append<irs::ByWildcard>(*root, kFieldTestField, "%le");
+
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter, {.fuse_acceptor_intersections = true});
+
+  EXPECT_EQ(irs::Type<irs::And>::id(), filter->type());
+}
+
+TEST(AndAcceptorFusion_test, levenshtein_predicate_fuses) {
+  auto root = std::make_unique<irs::And>();
+  auto& range = root->add<irs::ByRange>();
+  *range.mutable_field_id() = kFieldTestField;
+  range.mutable_options()->range.min = irs::bstring{B("a")};
+  range.mutable_options()->range.min_type = irs::BoundType::Inclusive;
+  range.mutable_options()->range.max = irs::bstring{B("b")};
+  range.mutable_options()->range.max_type = irs::BoundType::Exclusive;
+  Append<irs::ByEditDistance>(*root, kFieldTestField, "apple")
+    .mutable_options()
+    ->max_distance = 1;
+
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter, {.fuse_acceptor_intersections = true});
+
+  const auto* fused = FusedOf(filter);
+  ASSERT_NE(nullptr, fused);
+  EXPECT_EQ(irs::bstring{B("[a..b)&apple~")}, fused->options().pattern);
+  EXPECT_TRUE(FusedAccepts(*fused, "apple"));
+  EXPECT_TRUE(FusedAccepts(*fused, "aplle"));
+  EXPECT_FALSE(FusedAccepts(*fused, "banana"));
+  EXPECT_FALSE(FusedAccepts(*fused, "axxxx"));
+}
+
+TEST(AndAcceptorFusion_test, by_terms_driver_bails) {
+  auto root = std::make_unique<irs::And>();
+  {
+    auto& inner = root->add<irs::Or>();
+    Append<irs::ByTerm>(inner, kFieldTestField, "apple");
+    Append<irs::ByTerm>(inner, kFieldTestField, "banana");
+  }
+  Append<irs::ByPrefix>(*root, kFieldTestField, "ap");
+
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter, {.fuse_acceptor_intersections = true});
+
+  ASSERT_EQ(irs::Type<irs::And>::id(), filter->type());
+  const auto& node = sdb::basics::downCast<irs::And>(*filter);
+  ASSERT_EQ(2, node.size());
+  EXPECT_EQ(irs::Type<irs::ByTerms>::id(), node[0].type());
+}
+
+TEST(AndAcceptorFusion_test, keeps_other_field_children) {
+  auto root = std::make_unique<irs::And>();
+  Append<irs::ByPrefix>(*root, kFieldTestField, "ax");
+  Append<irs::ByWildcard>(*root, kFieldTestField, "%le");
+  Append<irs::ByPrefix>(*root, kFieldName, "b");
+
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter, {.fuse_acceptor_intersections = true});
+
+  ASSERT_EQ(irs::Type<irs::And>::id(), filter->type());
+  const auto& node = sdb::basics::downCast<irs::And>(*filter);
+  ASSERT_EQ(2, node.size());
+}
+
+TEST(AndAcceptorFusion_test, fuses_or_product) {
+  auto root = std::make_unique<irs::And>();
+  {
+    auto& inner = root->add<irs::Or>();
+    Append<irs::ByPrefix>(inner, kFieldTestField, "ax");
+    Append<irs::ByWildcard>(inner, kFieldTestField, "%le");
+  }
+  auto& range = root->add<irs::ByRange>();
+  *range.mutable_field_id() = kFieldTestField;
+  range.mutable_options()->range.min = irs::bstring{B("a")};
+  range.mutable_options()->range.min_type = irs::BoundType::Inclusive;
+  range.mutable_options()->range.max = irs::bstring{B("b")};
+  range.mutable_options()->range.max_type = irs::BoundType::Exclusive;
+
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter, {.fuse_acceptor_intersections = true});
+
+  const auto* fused = FusedOf(filter);
+  ASSERT_NE(nullptr, fused);
+  EXPECT_TRUE(FusedAccepts(*fused, "axle"));
+  EXPECT_TRUE(FusedAccepts(*fused, "ale"));
+  EXPECT_FALSE(FusedAccepts(*fused, "ble"));
+  EXPECT_FALSE(FusedAccepts(*fused, "amp"));
+}
+
 TEST(Or_test, optimize_all_scored) {
-  irs::Or root;
+  auto root = std::make_unique<irs::Or>();
   detail::Boosted::gExecuteCount = 0;
   {
-    auto& node = root.add<detail::Boosted>();
+    auto& node = root->add<detail::Boosted>();
     node.docs = {1};
   }
   {
-    auto& node = root.add<detail::Boosted>();
+    auto& node = root->add<detail::Boosted>();
     node.docs = {2};
   }
   {
-    auto& node = root.add<detail::Boosted>();
+    auto& node = root->add<detail::Boosted>();
     node.docs = {3};
   }
-  root.add<irs::All>();
-  root.add<irs::Empty>();
-  root.add<irs::All>();
-  root.add<irs::Empty>();
+  root->add<irs::All>();
+  root->add<irs::Empty>();
+  root->add<irs::All>();
+  root->add<irs::Empty>();
   tests::sort::Boost sort{};
-  auto prep = root.prepare({.index = irs::SubReader::empty(), .scorer = &sort});
+  tests::PreparedFilter prep{*root, irs::SubReader::empty(), &sort};
 
-  prep->execute({.segment = irs::SubReader::empty()});
+  prep.Execute(0);
   ASSERT_EQ(3,
             detail::Boosted::gExecuteCount);  // specific filters should
                                               // executed as score needs them
@@ -16504,46 +16985,95 @@ TEST(Or_test, optimize_all_scored) {
 
 TEST(Or_test, optimize_only_all_boosted) {
   tests::sort::Boost sort{};
-  irs::Or root;
-  root.boost(2);
-  root.add<irs::All>().boost(3);
-  root.add<irs::All>().boost(5);
+  auto root = std::make_unique<irs::Or>();
+  root->boost(2);
+  root->add<irs::All>().boost(3);
+  root->add<irs::All>().boost(5);
 
-  auto prep = root.prepare({.index = irs::SubReader::empty(), .scorer = &sort});
+  irs::Filter::ptr f = std::move(root);
+  irs::Optimize(f, {.scored = true});
+  tests::PreparedFilter prep{*f, irs::SubReader::empty(), &sort};
 
-  prep->execute({.segment = irs::SubReader::empty()});
-  ASSERT_EQ(16, prep->Boost());
+  prep.Execute(0);
+  ASSERT_EQ(16, prep.Query(0)->Boost());
 }
 
 TEST(Or_test, boosted_not) {
   tests::sort::Boost sort{};
-  irs::Or root;
+  auto root = std::make_unique<irs::Or>();
   {
-    auto& neg = root.add<irs::Not>();
-    auto& node = neg.filter<detail::Boosted>();
+    auto& neg = root->add<irs::Exclusion>();
+    auto& node = neg.exclude<detail::Boosted>();
     node.docs = {5, 6};
     node.boost(4);
   }
   {
-    auto& node = root.add<detail::Boosted>();
+    auto& node = root->add<detail::Boosted>();
     node.docs = {1};
     node.boost(5);
   }
-  auto prep = root.prepare({.index = irs::SubReader::empty(), .scorer = &sort});
-  auto docs =
-    prep->execute({.segment = irs::SubReader::empty(), .scorer = &sort});
+  irs::Filter::ptr f = std::move(root);
+  irs::Optimize(f, {.scored = true});
+  tests::PreparedFilter prep{*f, irs::SubReader::empty(), &sort};
+  auto docs = prep.Execute(0);
   const auto& scr = docs->PrepareScore({
     .scorer = &sort,
     .segment = &irs::SubReader::empty(),
   });
   ASSERT_FALSE(scr.IsDefault());
 
-  ASSERT_TRUE(docs->next());
+  ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
   docs->FetchScoreArgs(0);
   const auto doc_boost = scr.Score();
   ASSERT_EQ(5., doc_boost);  // FIXME: should be 9 if we will boost negation
   ASSERT_EQ(1, docs->value());
-  ASSERT_FALSE(docs->next());
+  ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
+}
+
+TEST_P(BooleanFilterTestCase, and_or_no_collector) {
+  {
+    tests::JsonDocGenerator gen(resource("simple_sequential.json"),
+                                &tests::GenericJsonFieldFactory);
+    add_segment(gen);
+  }
+  auto rdr = open_reader();
+
+  const auto collect = [&](const irs::Filter& filter,
+                           PreparedFilter::CollectMode mode) {
+    PreparedFilter prepared{filter,  rdr, nullptr, irs::IResourceManager::gNoop,
+                            nullptr, mode};
+    Docs docs;
+    for (size_t i = 0, n = prepared.size(); i < n; ++i) {
+      auto it = prepared.Execute(i);
+      while (!irs::doc_limits::eof(it->advance())) {
+        docs.push_back(it->value());
+      }
+    }
+    return docs;
+  };
+
+  const auto check = [&](const irs::Filter& filter) {
+    const auto with_collector =
+      collect(filter, PreparedFilter::CollectMode::Single);
+    const auto without_collector =
+      collect(filter, PreparedFilter::CollectMode::NoCollector);
+    ASSERT_FALSE(without_collector.empty());
+    ASSERT_EQ(with_collector, without_collector);
+  };
+
+  {
+    irs::And root;
+    Append<irs::ByTerm>(root, kFieldSame, "xyz");
+    Append<irs::ByTerm>(root, kFieldName, "A");
+    check(root);
+  }
+
+  {
+    irs::Or root;
+    Append<irs::ByTerm>(root, kFieldName, "A");
+    Append<irs::ByTerm>(root, kFieldName, "B");
+    check(root);
+  }
 }
 
 static constexpr auto kTestDirs = tests::GetDirectories<tests::kTypesDefault>();

@@ -1,0 +1,62 @@
+control substitution on
+
+# DOCS_TEST: example_001
+
+statement ok
+DETACH IF EXISTS db81;
+
+statement ok
+ATTACH '${__TEST_DIR__}/db81.duckdb' AS db81;
+
+# DOCS_TEST_BODY
+
+statement ok
+SHOW DATABASES;
+
+# DOCS_TEST: example_003
+
+# DOCS_TEST_BODY
+
+statement ok
+SHOW SCHEMAS;
+
+# DOCS_TEST: example_004
+
+statement ok
+USE $__DATABASE__;
+
+statement ok
+CREATE TABLE products (id INTEGER, name VARCHAR);
+
+# DOCS_TEST_BODY
+
+query
+SHOW TABLES;
+----
+name
+products
+
+# DOCS_TEST: example_005
+
+# Earlier examples ran USE, which replaces search_path; reset it so the example
+# shows the default a fresh session sees.
+statement ok
+RESET search_path;
+
+# DOCS_TEST_BODY
+
+query
+SHOW search_path;
+----
+search_path
+"$user", public
+
+# DOCS_TEST: example_006
+
+# DOCS_TEST_BODY
+
+statement ok
+SHOW ALL;
+
+statement ok
+DETACH IF EXISTS db81;

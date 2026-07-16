@@ -32,13 +32,13 @@
 #include "app/app_server.h"
 #include "basics/assert.h"
 #include "basics/containers/flat_hash_map.h"
-#include "basics/containers/trivial_map.h"
+#include "basics/containers/flat_hash_set.h"
 #include "basics/serializer.h"
 #include "basics/static_strings.h"
+#include "basics/system-compiler.h"
 #include "catalog/function.h"
 #include "catalog/identifiers/object_id.h"
 #include "catalog/view.h"
-#include "general_server/state.h"
 #include "pg/information_schema/sql_features.h"
 #include "pg/information_schema/sql_implementation_info.h"
 #include "pg/information_schema/sql_parts.h"
@@ -67,6 +67,7 @@
 #include "pg/pg_catalog/pg_foreign_data_wrapper.h"
 #include "pg/pg_catalog/pg_foreign_server.h"
 #include "pg/pg_catalog/pg_foreign_table.h"
+#include "pg/pg_catalog/pg_hba_file_rules.h"
 #include "pg/pg_catalog/pg_index.h"
 #include "pg/pg_catalog/pg_inherits.h"
 #include "pg/pg_catalog/pg_init_privs.h"
@@ -92,7 +93,6 @@
 #include "pg/pg_catalog/pg_shdepend.h"
 #include "pg/pg_catalog/pg_shdescription.h"
 #include "pg/pg_catalog/pg_shseclabel.h"
-#include "pg/pg_catalog/pg_stat_progress.h"
 #include "pg/pg_catalog/pg_statistic.h"
 #include "pg/pg_catalog/pg_statistic_ext.h"
 #include "pg/pg_catalog/pg_statistic_ext_data.h"
@@ -108,8 +108,9 @@
 #include "pg/pg_catalog/pg_ts_template.h"
 #include "pg/pg_catalog/pg_type.h"
 #include "pg/pg_catalog/pg_user_mapping.h"
-#include "pg/pg_feature.h"
-#include "pg/sdb_catalog/sdb_search_tasks_status.h"
+#include "pg/pg_catalog/sdb_progress.h"
+#include "pg/sdb_catalog/sdb_metrics.h"
+#include "pg/sdb_catalog/sdb_settings.h"
 #include "pg/system_functions.h"
 #include "pg/system_table.h"
 #include "pg/system_views.h"
@@ -172,6 +173,7 @@ const PgSystemSchema kPgCatalog{
   MakeTable<SystemTable<PgForeignDataWrapper>>(),
   MakeTable<SystemTable<PgForeignServer>>(),
   MakeTable<SystemTable<PgForeignTable>>(),
+  MakeTable<SystemTable<PgHbaFileRule>>(),
   MakeTable<SystemTable<PgIndex>>(),
   MakeTable<SystemTable<PgInherits>>(),
   MakeTable<SystemTable<PgInitPrivs>>(),
@@ -199,7 +201,7 @@ const PgSystemSchema kPgCatalog{
   MakeTable<SystemTable<PgShseclabel>>(),
   MakeTable<SystemTable<PgStatistic>>(),
   MakeTable<SystemTable<PgStatisticExt>>(),
-  MakeTable<SystemTable<SdbStatProgress>>(),
+  MakeTable<SystemTable<SdbProgress>>(),
   MakeTable<SystemTable<PgStatisticExtData>>(),
   MakeTable<SystemTable<PgSubscription>>(),
   MakeTable<SystemTable<PgSubscriptionRel>>(),
@@ -213,7 +215,8 @@ const PgSystemSchema kPgCatalog{
   MakeTable<SystemTable<PgTsTemplate>>(),
   MakeTable<SystemTable<PgType>>(),
   MakeTable<SystemTable<PgUserMapping>>(),
-  MakeTable<SystemTable<SdbSearchTasksStatus>>(),
+  MakeTable<SystemTable<SdbMetrics>>(),
+  MakeTable<SystemTable<SdbSettings>>(),
 };
 
 const PgSystemSchema kInformationSchema{
@@ -357,8 +360,8 @@ std::shared_ptr<PgSqlView> GetView(std::string_view name) {
 void InitSystemViews(duckdb::Parser& parser) {
   for (const auto& view : kExternalViews) {
     auto info = duckdb::make_uniq<duckdb::CreateViewInfo>();
-    info->schema = view.schema;
-    info->view_name = view.name;
+    info->SetSchema(duckdb::Identifier{view.schema});
+    info->SetViewName(duckdb::Identifier{view.name});
     info->sql = view.sql;
     info->temporary = true;
     info->internal = true;
@@ -372,8 +375,13 @@ void InitSystemViews(duckdb::Parser& parser) {
       duckdb::unique_ptr_cast<duckdb::SQLStatement, duckdb::SelectStatement>(
         std::move(parser.statements[0]));
 
+    catalog::Acl acl;
+    if (!view.superuser_only) {
+      acl.push_back(catalog::kSystemPublicSelect);
+    }
     auto entry = std::make_shared<catalog::PgSqlView>(
-      ObjectId{}, ObjectId{}, view.name, std::move(info));
+      catalog::Permissions{id::kRootUser, std::move(acl)}, ObjectId{},
+      ObjectId{}, view.name, std::move(info));
 
     auto& map = (view.schema == StaticStrings::kInformationSchema)
                   ? gInfoSchemaViews
@@ -397,7 +405,7 @@ static duckdb::unique_ptr<duckdb::CreateMacroInfo> ParseMacro(
   auto info =
     duckdb::unique_ptr_cast<duckdb::CreateInfo, duckdb::CreateMacroInfo>(
       std::move(create.info));
-  info->schema = macro.schema;
+  info->SetSchema(duckdb::Identifier{macro.schema});
   info->temporary = true;
   info->internal = true;
 
@@ -434,7 +442,8 @@ void InitSystemFunctions(duckdb::Parser& parser) {
       }
     } else {
       map[macro.name] = std::make_shared<catalog::PgSqlFunction>(
-        ObjectId{}, ObjectId{}, macro.name, std::move(info));
+        catalog::Permissions{}, ObjectId{}, ObjectId{}, macro.name,
+        std::move(info));
     }
   }
 }

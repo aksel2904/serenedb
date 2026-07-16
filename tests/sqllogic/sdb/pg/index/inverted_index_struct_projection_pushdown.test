@@ -1,0 +1,122 @@
+# Struct-field projection pushdown: `payload.<field>` over an INCLUDE'd STRUCT
+# is served directly by the IRESEARCH_SCAN -- the extracted field appears in
+# the scan's Projections list, not materialized as the whole struct followed
+# by a residual PROJECTION. Each extracted field is an independent scan
+# projection; only an expression on top of an extract (e.g. arithmetic) stays
+# in a residual PROJECTION above the scan.
+
+statement ok
+CREATE TABLE sp_t (
+  pk INTEGER PRIMARY KEY,
+  t VARCHAR,
+  payload STRUCT(name VARCHAR, score INTEGER)
+)
+
+
+statement ok
+CREATE TEXT SEARCH DICTIONARY sp_en(
+    template = 'text',
+    locale = 'en_US.UTF-8',
+    case = 'none',
+    stemming = false,
+    accent = false,
+    frequency = true,
+    position = true
+)
+
+
+statement ok
+CREATE INDEX sp_t_idx ON sp_t USING inverted(pk, t sp_en) INCLUDE (payload)
+
+
+statement ok
+INSERT INTO sp_t VALUES (1, 'first', ROW('alpha', 10)), (2, 'second', ROW('beta', 20))
+
+
+statement ok
+VACUUM (REFRESH_TABLE) sp_t
+
+
+# Single field: pushed into the scan -- no PROJECTION node above it; the field
+# appears in the scan's Projections as `payload.score (i)`.
+query
+EXPLAIN SELECT pk, payload.score FROM sp_t_idx WHERE t @@ ts_phrase('first');
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ────────────────╮
+│ Index: sp_t_idx                 │
+│ Lookup: table                   │
+│ Filter:                         │
+│ ╭─ Term ───────────╮            │
+│ │ Field: t(string) │            │
+│ │ Value: first     │            │
+│ ╰──────────────────╯            │
+│ Projections: pk (l),            │
+│              payload.score (i)  │
+│ ~1 row                          │
+╰─────────────────────────────────╯
+
+
+# Two fields: each is independently pushed down -- `payload.name (i)` and
+# `payload.score (i)` as separate scan projections, still no residual PROJECTION.
+query
+EXPLAIN SELECT pk, payload.name, payload.score FROM sp_t_idx WHERE t @@ ts_phrase('first');
+----
+QUERY PLAN
+╭─ IRESEARCH_SCAN ────────────────╮
+│ Index: sp_t_idx                 │
+│ Lookup: table                   │
+│ Filter:                         │
+│ ╭─ Term ───────────╮            │
+│ │ Field: t(string) │            │
+│ │ Value: first     │            │
+│ ╰──────────────────╯            │
+│ Projections: pk (l),            │
+│              payload.name (i),  │
+│              payload.score (i)  │
+│ ~1 row                          │
+╰─────────────────────────────────╯
+
+
+# An expression on top of an extract can't be pushed: the field is still served
+# by the scan, but the arithmetic stays in a residual PROJECTION above it.
+query
+EXPLAIN SELECT pk, payload.score + 1 FROM sp_t_idx WHERE t @@ ts_phrase('first');
+----
+QUERY PLAN
+╭─ PROJECTION ────────────────────╮
+│ Projections: pk, payload + 1    │
+│ ~1 row                          │
+╰────────────────┬────────────────╯
+╭─ IRESEARCH_SCAN ────────────────╮
+│ Index: sp_t_idx                 │
+│ Lookup: table                   │
+│ Filter:                         │
+│ ╭─ Term ───────────╮            │
+│ │ Field: t(string) │            │
+│ │ Value: first     │            │
+│ ╰──────────────────╯            │
+│ Projections: pk (l),            │
+│              payload.score (i)  │
+│ ~1 row                          │
+╰─────────────────────────────────╯
+
+
+# Values round-trip through the pushed-down projections.
+query
+SELECT pk, payload.name AS name, payload.score AS score FROM sp_t_idx
+WHERE t @@ ts_phrase('first') OR t @@ ts_phrase('second')
+ORDER BY pk;
+----
+pk	name	score
+1	alpha	10
+2	beta	20
+
+
+query
+SELECT pk, payload.score + 1 AS s1 FROM sp_t_idx
+WHERE t @@ ts_phrase('second')
+ORDER BY pk;
+----
+pk	s1
+2	21

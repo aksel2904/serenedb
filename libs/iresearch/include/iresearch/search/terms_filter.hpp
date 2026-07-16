@@ -23,7 +23,9 @@
 #pragma once
 
 #include <set>
+#include <utility>
 
+#include "iresearch/index/iterators.hpp"
 #include "iresearch/search/all_docs_provider.hpp"
 #include "iresearch/search/filter.hpp"
 #include "iresearch/utils/string.hpp"
@@ -54,10 +56,16 @@ struct ByTermsOptions {
     bool operator<(const SearchTerm& rhs) const noexcept {
       return term < rhs.term;
     }
+
+    bool operator<(bytes_view rhs) const noexcept { return term < rhs; }
+
+    friend bool operator<(bytes_view lhs, const SearchTerm& rhs) noexcept {
+      return lhs < rhs.term;
+    }
   };
 
   using FilterType = ByTerms;
-  using search_terms = std::set<SearchTerm>;
+  using search_terms = std::set<SearchTerm, std::less<>>;
 
   search_terms terms;
   size_t min_match{1};
@@ -69,18 +77,32 @@ struct ByTermsOptions {
   }
 };
 
+struct TermSetAcceptor {
+  const ByTermsOptions::search_terms* terms;
+
+  bool operator()(bytes_view term) const { return terms->contains(term); }
+};
+
 // Filter by a set of terms
 class ByTerms final : public FilterWithField<ByTermsOptions>,
                       public AllDocsProvider {
  public:
   static void visit(const SubReader& segment, const TermReader& field,
-                    const ByTermsOptions::search_terms& terms,
-                    FilterVisitor& visitor);
+                    const ByTermsOptions& options, FilterVisitor& visitor);
 
-  static Query::ptr Prepare(const PrepareContext& ctx, irs::field_id id,
-                            const ByTermsOptions& options);
+  QueryBuilder::ptr PrepareSegment(const SubReader& segment,
+                                   const PrepareContext& ctx) const final;
+  static QueryBuilder::ptr PrepareSegment(const SubReader& segment,
+                                          const PrepareContext& ctx,
+                                          irs::field_id field,
+                                          const ByTermsOptions& options,
+                                          score_t boost);
 
-  Query::ptr prepare(const PrepareContext& ctx) const final;
+  PrepareCollector::ptr MakeCollector(const Scorer* scorer) const final;
+
+  TermPredicate::ptr CompileTermPredicate() const final;
+
+  TermIterator::ptr CompileTermIterator(const TermReader& reader) const final;
 };
 
 }  // namespace irs

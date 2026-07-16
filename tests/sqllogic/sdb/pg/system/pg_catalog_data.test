@@ -327,13 +327,15 @@ query
 SELECT spcname FROM pg_catalog.pg_tablespace ORDER BY spcname
 ----
 spcname
+pg_default
+pg_global
 
 
 query
 SELECT count(*) FROM pg_catalog.pg_tablespace
 ----
 count
-0
+2
 
 
 # pg_proc (functions)
@@ -378,8 +380,8 @@ query
 SELECT conname, contype FROM pg_catalog.pg_constraint WHERE conrelid = (SELECT oid FROM pg_catalog.pg_class WHERE relname = 'pg_cat_t1') ORDER BY conname
 ----
 conname	contype
-pg_cat_t1_id_not_null	c
-pg_cat_t1_name_not_null	c
+pg_cat_t1_id_not_null	n
+pg_cat_t1_name_not_null	n
 pg_cat_t1_pkey	p
 
 
@@ -387,7 +389,7 @@ query
 SELECT conname, contype FROM pg_catalog.pg_constraint WHERE conrelid = (SELECT oid FROM pg_catalog.pg_class WHERE relname = 'pg_cat_t2') ORDER BY conname
 ----
 conname	contype
-pg_cat_t2_a_not_null	c
+pg_cat_t2_a_not_null	n
 pg_cat_t2_pkey	p
 
 
@@ -418,17 +420,21 @@ SELECT count(*) > 0 FROM pg_catalog.pg_authid
 t
 
 
-# Roles should have rolcanlogin set
+# Roles should have rolcanlogin set. Filter to postgres: pg_authid is
+# cluster-global, so roles from other tests running concurrently would
+# otherwise leak into an unfiltered ORDER BY / LIMIT.
 query
-SELECT rolname, rolcanlogin FROM pg_catalog.pg_authid ORDER BY rolname LIMIT 3
+SELECT rolname, rolcanlogin FROM pg_catalog.pg_authid WHERE rolname = 'postgres'
 ----
 rolname	rolcanlogin
 postgres	t
 
 
-# rolsuper should be set for all roles (no RBAC yet)
+# The bootstrap superuser has rolsuper set. Filter to postgres: pg_authid is
+# cluster-global, so an unfiltered LIMIT 1 could return a non-superuser role
+# created by another test running concurrently.
 query
-SELECT rolsuper FROM pg_catalog.pg_authid LIMIT 1
+SELECT rolsuper FROM pg_catalog.pg_authid WHERE rolname = 'postgres'
 ----
 rolsuper
 t
@@ -696,10 +702,10 @@ query
 SELECT con.conname, c.relname, con.contype FROM pg_catalog.pg_constraint con JOIN pg_catalog.pg_class c ON con.conrelid = c.oid WHERE c.relname IN ('pg_cat_t1', 'pg_cat_t2') ORDER BY c.relname, con.conname
 ----
 conname	relname	contype
-pg_cat_t1_id_not_null	pg_cat_t1	c
-pg_cat_t1_name_not_null	pg_cat_t1	c
+pg_cat_t1_id_not_null	pg_cat_t1	n
+pg_cat_t1_name_not_null	pg_cat_t1	n
 pg_cat_t1_pkey	pg_cat_t1	p
-pg_cat_t2_a_not_null	pg_cat_t2	c
+pg_cat_t2_a_not_null	pg_cat_t2	n
 pg_cat_t2_pkey	pg_cat_t2	p
 
 

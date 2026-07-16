@@ -24,7 +24,9 @@
 #pragma once
 
 #include <algorithm>
+#include <optional>
 #include <variant>
+#include <vector>
 
 #include "basics/memory.hpp"
 #include "basics/singleton.hpp"
@@ -34,6 +36,7 @@
 #include "iresearch/search/column_collector.hpp"
 #include "iresearch/search/cost.hpp"
 #include "iresearch/search/filter.hpp"
+#include "iresearch/search/filter_optimizer.hpp"
 #include "iresearch/search/filter_visitor.hpp"
 #include "iresearch/search/score_function.hpp"
 #include "iresearch/search/scorer.hpp"
@@ -43,6 +46,13 @@
 #include "tests_shared.hpp"
 
 namespace tests {
+
+template<typename F>
+irs::Filter::ptr Optimized(F filter, const irs::Scorer* scorer = nullptr) {
+  irs::Filter::ptr root = std::make_unique<F>(std::move(filter));
+  irs::Optimize(root, {.scored = scorer != nullptr});
+  return root;
+}
 
 struct DocBlockAttr : public irs::Attribute {
   const irs::doc_id_t* value = nullptr;
@@ -80,37 +90,53 @@ class DocIteratorWrapper : public irs::DocIterator {
     });
   }
 
+  IRS_DOC_ITERATOR_DEFAULTS
+
  private:
   irs::DocIterator::ptr _it;
   std::vector<irs::doc_id_t> _docs;
   DocBlockAttr _doc_block_attr{.value = _docs.data()};
 };
 
-class QueryWrapper : public irs::Filter::Query {
+class QueryWrapper : public irs::QueryBuilder {
  public:
-  explicit QueryWrapper(Query::ptr query) : _query(std::move(query)) {}
+  QueryWrapper(const irs::SubReader& segment, irs::QueryBuilder::ptr query)
+    : irs::QueryBuilder{segment}, _query(std::move(query)) {}
 
-  irs::DocIterator::ptr execute(const irs::ExecutionContext& ctx) const final {
-    return irs::memory::make_managed<DocIteratorWrapper>(_query->execute(ctx));
+  irs::DocIterator::ptr Execute(const irs::ExecutionContext& ctx,
+                                const irs::StatsBuffer& stats) const final {
+    return irs::memory::make_managed<DocIteratorWrapper>(
+      _query->Execute(ctx, stats));
   }
 
-  void visit(const irs::SubReader& segment, irs::PreparedStateVisitor& visitor,
-             irs::score_t boost) const {
-    _query->visit(segment, visitor, boost);
+  void Visit(irs::PreparedStateVisitor& visitor,
+             irs::score_t boost) const final {
+    _query->Visit(visitor, boost);
   }
 
-  irs::score_t Boost() const noexcept { return _query->Boost(); }
+  irs::score_t Boost() const noexcept final { return _query->Boost(); }
 
  private:
-  Query::ptr _query;
+  irs::QueryBuilder::ptr _query;
 };
 
 class FilterWrapper : public irs::FilterWithBoost {
  public:
   explicit FilterWrapper(const irs::Filter& filter) : _filter(filter) {}
 
-  Query::ptr prepare(const irs::PrepareContext& ctx) const final {
-    return irs::memory::make_managed<QueryWrapper>(_filter.prepare(ctx));
+  irs::QueryBuilder::ptr PrepareSegment(
+    const irs::SubReader& segment, const irs::PrepareContext& ctx) const final {
+    auto query = _filter.PrepareSegment(segment, ctx);
+    if (!query) {
+      return nullptr;
+    }
+    return irs::memory::make_tracked<QueryWrapper>(ctx.memory, segment,
+                                                   std::move(query));
+  }
+
+  irs::PrepareCollector::ptr MakeCollector(
+    const irs::Scorer* scorer) const final {
+    return _filter.MakeCollector(scorer);
   }
 
   irs::TypeInfo::type_id type() const noexcept final { return _filter.type(); }
@@ -316,6 +342,55 @@ struct FrequencyScore : public irs::ScorerBase<FrequencyScore, StatsT> {
 
 }  // namespace sort
 
+class PreparedFilter {
+ public:
+  enum class CollectMode { Single, Merge, MergeAll, NoCollector };
+
+  PreparedFilter(const irs::Filter& filter, const irs::IndexReader& index,
+                 const irs::Scorer* scorer = nullptr,
+                 irs::IResourceManager& memory = irs::IResourceManager::gNoop,
+                 const irs::AttributeProvider* ctx = nullptr,
+                 CollectMode mode = CollectMode::Single,
+                 irs::IResourceManager* exec_memory = nullptr);
+
+  size_t size() const noexcept { return _queries.size(); }
+
+  const irs::QueryBuilder* Query(size_t i) const noexcept {
+    return _queries[i].get();
+  }
+
+  const irs::Scorer* Scorer() const noexcept { return _scorer; }
+
+  const irs::StatsBuffer& Stats() const noexcept { return *_stats; }
+
+  irs::DocIterator::ptr Execute(size_t i) const {
+    const auto& query = _queries[i];
+    return query ? query->Execute(*_exec, *_stats) : irs::DocIterator::empty();
+  }
+
+  irs::DocIterator::ptr Execute(size_t i, irs::WandContext wand) const {
+    const auto& query = _queries[i];
+    if (!query) {
+      return irs::DocIterator::empty();
+    }
+    return query->Execute(
+      {
+        .memory = _exec->memory,
+        .ctx = _exec->ctx,
+        .wand = wand,
+      },
+      *_stats);
+  }
+
+ private:
+  const irs::Scorer* _scorer;
+  irs::PrepareCollector::ptr _collector;
+  std::vector<irs::PrepareCollector::ptr> _perseg;
+  std::vector<irs::QueryBuilder::ptr> _queries;
+  std::optional<irs::StatsBuffer> _stats;
+  std::optional<irs::ExecutionContext> _exec;
+};
+
 class FilterTestCaseBase : public IndexTestBase {
  protected:
   using Docs = std::vector<irs::doc_id_t>;
@@ -384,14 +459,13 @@ class FilterTestCaseBase : public IndexTestBase {
                          bool reverse = false);
 
  private:
-  static void GetQueryResult(const irs::Filter::Query::ptr& q,
+  static void GetQueryResult(const PreparedFilter& prepared,
                              const irs::IndexReader& index, Docs& result,
                              Costs& result_costs,
                              std::string_view source_location);
 
-  static void GetQueryResult(const irs::Filter::Query::ptr& q,
-                             const irs::IndexReader& index,
-                             const irs::Scorer* scorer, ScoredDocs& result,
+  static void GetQueryResult(const PreparedFilter& prepared,
+                             const irs::IndexReader& index, ScoredDocs& result,
                              Costs& result_costs,
                              std::string_view source_location);
 };
@@ -432,15 +506,16 @@ class EmptyFilterVisitor : public irs::FilterVisitor {
  public:
   void Prepare(const irs::SubReader& /*segment*/,
                const irs::TermReader& /*field*/,
-               const irs::SeekTermIterator& terms) noexcept final {
+               irs::SeekTermIterator& terms) noexcept final {
     _it = &terms;
     ++_prepare_calls_counter;
   }
 
-  void Visit(irs::score_t boost) noexcept final {
-    ASSERT_NE(nullptr, _it);
+  bool Visit(irs::score_t boost) noexcept final {
+    EXPECT_NE(nullptr, _it);
     _terms.emplace_back(_it->value(), boost);
     ++_visit_calls_counter;
+    return true;
   }
 
   void reset() noexcept {

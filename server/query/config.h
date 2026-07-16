@@ -28,8 +28,10 @@
 #include <string>
 #include <string_view>
 
+#include "basics/assert.h"
 #include "basics/containers/node_hash_map.h"
 #include "catalog/types.h"
+#include "pg/sql_exception_macro.h"
 
 namespace duckdb {
 
@@ -82,6 +84,8 @@ class Config {
   explicit Config(duckdb::ClientContext& client_ctx)
     : _client_ctx{client_ctx} {}
 
+  virtual ~Config() = default;
+
   duckdb::ClientContext& GetClientContext() const noexcept {
     return _client_ctx;
   }
@@ -92,11 +96,35 @@ class Config {
   IsolationLevel GetIsolationLevel() const;
   bool GetStrictDDL() const;
   bool IsExplicitTransaction() const;
-  bool IsTransactionInvalidated() const;
 
   void DropCatalogSnapshot() { _snapshot.reset(); }
 
-  std::shared_ptr<const catalog::Snapshot> EnsureCatalogSnapshot() const;
+  // Installs the snapshot a prepared statement was bound against, so its plan
+  // executes against the same catalog view that pinned its bound entries.
+  void SetCatalogSnapshot(std::shared_ptr<const catalog::Snapshot> snapshot) {
+    _snapshot = std::move(snapshot);
+  }
+
+  // Acquires the statement's catalog snapshot. Called only at statement
+  // boundaries on the connection thread (OnStatementBegin, the wire message
+  // handlers that bind or serialize before a query lifecycle starts); all
+  // other code reads via CatalogSnapshot().
+  std::shared_ptr<const catalog::Snapshot> AcquireCatalogSnapshot();
+
+  // Read-only access to the snapshot acquired for the current statement.
+  // Never acquires: a lazy first-acquire from an executor worker would race
+  // the connection thread. The check stays in release builds -- a scope hole
+  // must surface as an error, not a null dereference.
+  const std::shared_ptr<const catalog::Snapshot>& CatalogSnapshot() const {
+    SDB_ENSURE(_snapshot,
+               "no catalog snapshot acquired for the current statement");
+    return _snapshot;
+  }
+
+  std::shared_ptr<const catalog::Snapshot> GetCatalogSnapshot() const {
+    SDB_ASSERT(_snapshot);
+    return _snapshot;
+  }
 
   // Returns the current value of a setting, or std::nullopt if not found.
   std::optional<std::string> Get(std::string_view key) const;
@@ -119,6 +147,12 @@ class Config {
   void SetSettingChecked(std::string_view key, std::string value,
                          bool is_local);
 
+  // Monotonic counter bumped whenever a session/local setting changes (via the
+  // setting_change_handler) or is reverted at txn end. Lets the wire layer skip
+  // the per-command ParameterStatus GUC poll unless something actually changed.
+  uint64_t SettingsVersion() const noexcept { return _settings_version; }
+  void MarkSettingsChanged() noexcept { ++_settings_version; }
+
  protected:
   // Pre-rollback hook: restore every tracked variable to its pre-SET value.
   void RollbackVariables() noexcept;
@@ -130,6 +164,9 @@ class Config {
   void SetInternal(std::string_view key, std::string value);
   void RestoreValue(std::string_view key, duckdb::Value value) noexcept;
 
+  // Bumped on every tracked setting change; see SettingsVersion().
+  uint64_t _settings_version = 0;
+
   // Transaction variables (commit-apply / revert semantics).
 
   // Owning-string keys: values may come from caller-provided buffers (e.g.
@@ -137,7 +174,7 @@ class Config {
   // hold string_views that outlive the caller.
   // TODO: use FlatHashMap, there're now problems with ASAN build
   containers::NodeHashMap<std::string, TxnVariable> _transaction;
-  mutable std::shared_ptr<const catalog::Snapshot> _snapshot;
+  std::shared_ptr<const catalog::Snapshot> _snapshot;
   duckdb::ClientContext& _client_ctx;
 };
 

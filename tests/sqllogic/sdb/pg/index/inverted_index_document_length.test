@@ -107,40 +107,23 @@ EXPLAIN SELECT id, raw_dl(docs_idx.tableoid) FROM docs_idx
 WHERE body @@ ts_phrase('fox') ORDER BY id;
 ----
 QUERY PLAN
-┌───────────────────────────┐
-│          ORDER_BY         │
-│    ────────────────────   │
-│      docs_idx.id ASC      │
-│                           │
-│           ~1 row          │
-└─────────────┬─────────────┘
-┌─────────────┴─────────────┐
-│       IRESEARCH_SCAN      │
-│    ────────────────────   │
-│      Index: docs_idx      │
-│       Lookup: table       │
-│                           │
-│          Filter:          │
-│  ┌─────────────────────┐  │
-│  │┌───────────────────┐│  │
-│  ││        AND        ││  │
-│  │└─────────┬─────────┘│  │
-│  │┌─────────┴─────────┐│  │
-│  ││       PHRASE      ││  │
-│  ││    ────────────   ││  │
-│  ││  body(string) =   ││  │
-│  ││ <Term:fox(0, 0); >││  │
-│  │└───────────────────┘│  │
-│  └─────────────────────┘  │
-│                           │
-│      Score: raw_dl()      │
-│                           │
-│        Projections:       │
-│             id            │
-│  sdb_inverted_index_score │
-│                           │
-│           ~1 row          │
-└───────────────────────────┘
+╭─ ORDER_BY ─────────────────────────────╮
+│ Order By: docs_idx.id ASC              │
+│ ~1 row                                 │
+╰────────────────────┬───────────────────╯
+╭─ IRESEARCH_SCAN ───┴───────────────────╮
+│ Index: docs_idx                        │
+│ Lookup: table                          │
+│ Filter:                                │
+│ ╭─ Term ──────────────╮                │
+│ │ Field: body(string) │                │
+│ │ Value: fox          │                │
+│ ╰─────────────────────╯                │
+│ Score: raw_dl()                        │
+│ Projections: id,                       │
+│              sdb_inverted_index_score  │
+│ ~1 row                                 │
+╰────────────────────────────────────────╯
 
 
 

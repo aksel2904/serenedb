@@ -96,6 +96,11 @@ struct TermInterval {
   PosAttr::value_t offs_max{};
   PosAttr::value_t offs_min{};
   PosAttr::value_t lead_offset{};
+  // Per-slot term-group id: equal ids == same connectivity component of
+  // query term sets (fixed: same term; variadic: computed per segment at
+  // prepare-collect). The slop matcher scopes position uniqueness to a
+  // component. 0 for all slots when unused (slop == 0 paths).
+  uint32_t term_group{};
 };
 
 // position attribute + desired offset in the phrase
@@ -1094,20 +1099,6 @@ class PhraseIterator : public DocIterator {
     return doc + 1;
   }
 
-  uint32_t count() final { return CountImpl(*this); }
-
-  void Collect(const ScoreFunction& scorer, ColumnArgsFetcher& fetcher,
-               ScoreCollector& collector) final {
-    CollectImpl(*this, scorer, fetcher, collector);
-  }
-
-  std::pair<doc_id_t, bool> FillBlock(doc_id_t min, doc_id_t max,
-                                      uint64_t* mask,
-                                      FillBlockScoreContext score,
-                                      FillBlockMatchContext match) final {
-    return FillBlockImpl(*this, min, max, mask, score, match);
-  }
-
   void FetchScoreArgs(uint16_t index) final {
     if constexpr (Frequency::kHasBoost) {
       SDB_ASSERT(_collected_boosts.value);
@@ -1118,6 +1109,8 @@ class PhraseIterator : public DocIterator {
       _collected_freqs.value[index] = _freq.GetFreq();
     }
   }
+
+  IRS_DOC_ITERATOR_DEFAULTS
 
  private:
   const byte_type* _stats = nullptr;

@@ -26,15 +26,17 @@
 
 namespace irs {
 
-template<typename IncludeAdapter, typename ExcludeAdapters>
-class Exclusion : public DocIterator {
+template<typename IncludeAdapter, typename ExcludeAdapter>
+class ExclusionIterator : public DocIterator {
  public:
-  Exclusion(IncludeAdapter incl, ExcludeAdapters excl) noexcept
+  ExclusionIterator(IncludeAdapter incl, ExcludeAdapter excl) noexcept
     : _incl{std::move(incl)}, _excl{std::move(excl)} {}
 
   Attribute* GetMutable(TypeInfo::type_id type) noexcept final {
     return _incl.GetMutable(type);
   }
+
+  IRS_DOC_ITERATOR_DEFAULTS
 
   doc_id_t advance() final {
     const auto incl = _incl.advance();
@@ -87,20 +89,6 @@ class Exclusion : public DocIterator {
 
   void FetchScoreArgs(uint16_t index) final { _incl.FetchScoreArgs(index); }
 
-  uint32_t count() final { return CountImpl(*this); }
-
-  void Collect(const ScoreFunction& scorer, ColumnArgsFetcher& fetcher,
-               ScoreCollector& collector) final {
-    CollectImpl(*this, scorer, fetcher, collector);
-  }
-
-  std::pair<doc_id_t, bool> FillBlock(doc_id_t min, doc_id_t max,
-                                      uint64_t* mask,
-                                      FillBlockScoreContext score,
-                                      FillBlockMatchContext match) final {
-    return FillBlockImpl(*this, min, max, mask, score, match);
-  }
-
  private:
   doc_id_t converge(doc_id_t incl) {
     if (doc_limits::eof(incl)) [[unlikely]] {
@@ -133,7 +121,7 @@ class Exclusion : public DocIterator {
   }
 
   IncludeAdapter _incl;
-  ExcludeAdapters _excl;
+  ExcludeAdapter _excl;
 };
 
 }  // namespace irs

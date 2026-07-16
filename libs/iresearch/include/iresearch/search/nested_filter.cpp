@@ -90,6 +90,8 @@ class ChildToParentJoin : public DocIterator, private Matcher {
     return irs::GetMutable(_attrs, id);
   }
 
+  IRS_DOC_ITERATOR_DEFAULTS
+
   doc_id_t advance() final {
     const auto parent = _parent->advance();
     return _doc = SeekInternal(parent);
@@ -115,14 +117,7 @@ class ChildToParentJoin : public DocIterator, private Matcher {
     return _doc = SeekInternal(parent);
   }
 
-  uint32_t count() final { return CountImpl(*this); }
-
   ScoreFunction PrepareScore(const PrepareScoreContext& ctx) final;
-
-  void Collect(const ScoreFunction& scorer, ColumnArgsFetcher& fetcher,
-               ScoreCollector& collector) final {
-    CollectImpl(*this, scorer, fetcher, collector);
-  }
 
   void FetchScoreArgs(uint16_t index) final {
     if constexpr (Matcher::kHasScore) {
@@ -151,7 +146,8 @@ class ChildToParentJoin : public DocIterator, private Matcher {
       parent = _parent->seek(first_child);
 
       if (doc_limits::eof(parent) ||
-          (parent == first_child && !_parent->next())) {  // Skip parent docs
+          (parent == first_child &&
+           doc_limits::eof(_parent->advance()))) {  // Skip parent docs
         return doc_limits::eof();
       }
     }
@@ -551,12 +547,13 @@ auto ResolveMatchType(const SubReader& segment,
 }  // namespace
 namespace irs {
 
-class ByNestedQuery : public Filter::Query {
+class ByNestedQuery : public QueryBuilder {
  public:
-  ByNestedQuery(DocIteratorProvider parent, Query::ptr&& child,
-                ScoreMergeType merge_type, ByNestedOptions::MatchType match,
-                score_t none_boost) noexcept
-    : _parent{std::move(parent)},
+  ByNestedQuery(const SubReader& segment, DocIteratorProvider parent,
+                QueryBuilder::ptr&& child, ScoreMergeType merge_type,
+                ByNestedOptions::MatchType match, score_t none_boost) noexcept
+    : QueryBuilder{segment},
+      _parent{std::move(parent)},
       _child{std::move(child)},
       _match{std::move(match)},
       _merge_type{merge_type},
@@ -566,10 +563,10 @@ class ByNestedQuery : public Filter::Query {
     SDB_ASSERT(IsValid(_match));
   }
 
-  DocIterator::ptr execute(const ExecutionContext& ctx) const final;
+  DocIterator::ptr Execute(const ExecutionContext& ctx,
+                           const StatsBuffer& stats) const final;
 
-  void visit(const SubReader& segment, PreparedStateVisitor& visitor,
-             score_t boost) const final {
+  void Visit(PreparedStateVisitor& visitor, score_t boost) const final {
     // TODO(mbkkt) maybe use none_boost for NoneMatcher?
     // boost *= this->Boost();
 
@@ -578,21 +575,22 @@ class ByNestedQuery : public Filter::Query {
     }
 
     SDB_ASSERT(_child);
-    _child->visit(segment, visitor, boost);
+    _child->Visit(visitor, boost);
   }
 
   score_t Boost() const noexcept final { return kNoBoost; }
 
  private:
   DocIteratorProvider _parent;
-  Query::ptr _child;
+  QueryBuilder::ptr _child;
   ByNestedOptions::MatchType _match;
   ScoreMergeType _merge_type;
   score_t _none_boost;
 };
 
-DocIterator::ptr ByNestedQuery::execute(const ExecutionContext& ctx) const {
-  auto& rdr = ctx.segment;
+DocIterator::ptr ByNestedQuery::Execute(const ExecutionContext& ctx,
+                                        const StatsBuffer& stats) const {
+  auto& rdr = _segment;
 
   auto parent = _parent(rdr);
 
@@ -606,24 +604,27 @@ DocIterator::ptr ByNestedQuery::execute(const ExecutionContext& ctx) const {
     return DocIterator::empty();
   }
 
-  auto child = _child->execute({.segment = rdr,
-                                .scorer = GetOrder(_match, ctx.scorer),
-                                .ctx = ctx.ctx,
-                                // TODO(mbkkt) wand for nested?
-                                .wand = {}});
+  const auto* scorer = stats.GetScorer();
+
+  ExecutionContext child_ctx{ctx};
+  // TODO(mbkkt) wand for nested?
+  child_ctx.wand = {};
+
+  auto child = _child->Execute(
+    child_ctx, stats.ChildCount() != 0 ? stats.Child(0) : StatsBuffer::Empty());
 
   if (!child) [[unlikely]] {
     return DocIterator::empty();
   }
 
   return ResolveMergeType(
-    ctx.scorer ? _merge_type : ScoreMergeType::Noop,
+    scorer ? _merge_type : ScoreMergeType::Noop,
     [&]<ScoreMergeType MergeType>() -> DocIterator::ptr {
       return ResolveMatchType<MergeType>(
         rdr, _match, _none_boost,
         [&]<typename M>(M&& matcher) -> DocIterator::ptr {
           if constexpr (std::is_same_v<NoneMatcher, M>) {
-            if (doc_limits::eof(child->value()) && !ctx.scorer) {
+            if (doc_limits::eof(child->value()) && !scorer) {
               return std::move(parent);
             }
           } else if constexpr (std::is_same_v<MinMatcher<MergeType>, M> ||
@@ -646,29 +647,44 @@ DocIterator::ptr ByNestedQuery::execute(const ExecutionContext& ctx) const {
     });
 }
 
-Filter::Query::ptr ByNestedFilter::prepare(const PrepareContext& ctx) const {
+PrepareCollector::ptr ByNestedFilter::MakeCollector(
+  const Scorer* scorer) const {
   auto& [parent, child, match, merge_type] = options();
 
   if (!parent || !child || !IsValid(match)) {
-    return Query::empty();
+    return std::make_unique<NoopCollector>();
   }
+
+  auto compound = std::make_unique<CompoundCollector>(scorer);
+  compound->Add(child->MakeCollector(GetOrder(match, scorer)));
+  return compound;
+}
+
+QueryBuilder::ptr ByNestedFilter::PrepareSegment(
+  const SubReader& segment, const PrepareContext& ctx) const {
+  auto& [parent, child, match, merge_type] = options();
+
+  if (!parent || !child || !IsValid(match)) {
+    return QueryBuilder::Empty();
+  }
+
+  auto* compound = dynamic_cast<CompoundCollector*>(ctx.collector);
+  SDB_ASSERT(ctx.collector == nullptr || compound != nullptr);
 
   const auto sub_boost = ctx.boost * Boost();
 
-  auto prepared_child = child->prepare({
-    .index = ctx.index,
-    .memory = ctx.memory,
-    .scorer = GetOrder(match, ctx.scorer),
-    .ctx = ctx.ctx,
-    .boost = sub_boost,
-  });
+  PrepareContext child_ctx = ctx;
+  child_ctx.boost = sub_boost;
+  child_ctx.collector = compound ? &compound->Child(0) : nullptr;
+
+  auto prepared_child = child->PrepareSegment(segment, child_ctx);
 
   if (!prepared_child) {
-    return Query::empty();
+    return QueryBuilder::Empty();
   }
 
   return memory::make_tracked<ByNestedQuery>(
-    ctx.memory, parent, std::move(prepared_child), merge_type, match,
+    ctx.memory, segment, parent, std::move(prepared_child), merge_type, match,
     /*none_boost*/ sub_boost);
 }
 

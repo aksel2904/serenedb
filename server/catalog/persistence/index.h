@@ -31,15 +31,26 @@
 
 namespace sdb::catalog::persistence {
 
+enum class PkColumnKind : uint8_t {
+  None,
+  I64,
+  I64I64,
+  Unable,
+};
+
 struct InvertedIndexOptions {
   uint32_t row_group_size = 0;
   uint32_t norm_row_group_size = 0;
   uint32_t refresh_interval_ms = 0;
   uint32_t compaction_interval_ms = 0;
   uint32_t cleanup_interval_step = 0;
+  bool pk_term = true;
+  PkColumnKind pk_column = PkColumnKind::I64;
   std::optional<ScorerOptions> topk_scorer;
 };
 
+// Shared expression payload for a computed index key. Each index kind persists
+// its own key layout; only this leaf is common.
 struct ExpressionData {
   std::string serialized_expr;
   std::vector<Column::Id> dependent_columns;

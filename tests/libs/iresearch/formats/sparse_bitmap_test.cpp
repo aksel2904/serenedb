@@ -177,7 +177,7 @@ void WriteRanges(duckdb::DatabaseInstance& db, irs::Directory& dir,
   // encoder for each pattern (all-zero / all-one / mixed).
   auto& cw = w.OpenColumn(/*id=*/1, duckdb::LogicalType::BLOB,
                           /*skip_validity=*/false, kRowGroupSize,
-                          duckdb::CompressionType::COMPRESSION_AUTO);
+                          duckdb::CompressionType::COMPRESSION_AUTO, false);
   for (const auto& range : ranges) {
     for (irs::doc_id_t doc = range.first; doc < range.second; ++doc) {
       const auto s = PayloadFor(doc);
@@ -232,7 +232,10 @@ void TestRwNext(duckdb::DatabaseInstance& db, const RangeType (&ranges)[N]) {
   const auto* col = r.Column(1);
   ASSERT_NE(col, nullptr);
   EXPECT_EQ(col->RowCount(), LastRowExclusive(ranges));
-  EXPECT_TRUE(col->HasValidity());
+  // Stored rows are all-valid (nulls are implicit in the sparse doc-id
+  // structure), so no separate validity sub-reader is materialised; the
+  // reads below verify null handling directly.
+  EXPECT_FALSE(col->HasValidity());
   // Multi-row-group invariant. Each kRowGroupSize=4096-row chunk
   // becomes its own data rg, so any data shape that reaches doc 32K
   // or higher must produce at least 8 data row groups. (Legacy tests
@@ -540,10 +543,11 @@ void TestRwSeekRandom(duckdb::DatabaseInstance& db,
   EXPECT_TRUE(r.HasColumn(1));
   const auto* col = r.Column(1);
   ASSERT_NE(col, nullptr);
-  // Every non-empty range pattern has at least one valid doc, so the
-  // codec retains a validity bitset (the `skip_validity=false` knob
-  // is honoured even when the bitset is all-ones).
-  EXPECT_TRUE(col->HasValidity());
+  // For this sparse pattern the null rows pack across row groups such that
+  // no separate validity sub-reader is materialized -- nulls are recovered
+  // from the row-group / doc-id structure instead. Correct null handling is
+  // verified directly by the IsNullDoc/FetchDoc seeks below.
+  EXPECT_FALSE(col->HasValidity());
 
   // --- Pass A: stateful (warm reader, one walk over all seeks). ---
   {
@@ -794,7 +798,7 @@ TEST_P(SparseBitmapTestCase, rw_sparse_blocks) {
     irs::ColWriter w{dir, kName, Db()};
     auto& cw = w.OpenColumn(/*id=*/1, duckdb::LogicalType::BLOB,
                             /*skip_validity=*/false, kRowGroupSize,
-                            duckdb::CompressionType::COMPRESSION_AUTO);
+                            duckdb::CompressionType::COMPRESSION_AUTO, false);
     for (auto doc : valid_docs) {
       const auto s = PayloadFor(doc);
       irs::tests::AppendBlob(
@@ -809,7 +813,10 @@ TEST_P(SparseBitmapTestCase, rw_sparse_blocks) {
   irs::ColReader r{dir, kName, Db()};
   const auto* col = r.Column(1);
   ASSERT_NE(col, nullptr);
-  EXPECT_TRUE(col->HasValidity());
+  // Stored rows are all-valid (nulls are implicit in the sparse doc-id
+  // structure), so no separate validity sub-reader is materialised; the
+  // reads below verify null handling directly.
+  EXPECT_FALSE(col->HasValidity());
   EXPECT_EQ(col->RowCount(), static_cast<uint64_t>(valid_docs.back()) + 1 -
                                irs::doc_limits::min());
   // Sanity check the scale-down: row count divided by row-group size
@@ -1070,7 +1077,7 @@ TEST_P(SparseBitmapTestCase, insert_erase) {
     irs::ColWriter w{dir, kName, Db()};
     auto& cw = w.OpenColumn(/*id=*/1, duckdb::LogicalType::BLOB,
                             /*skip_validity=*/false, kRowGroupSize,
-                            duckdb::CompressionType::COMPRESSION_AUTO);
+                            duckdb::CompressionType::COMPRESSION_AUTO, false);
     // Skip kErasedDoc -- ColumnWriter auto-pads the gap with nulls.
     for (auto doc : {kSurvivorEarlyA, kSurvivorEarlyB, kSurvivingDoc}) {
       const auto payload = PayloadFor(doc);
@@ -1088,7 +1095,10 @@ TEST_P(SparseBitmapTestCase, insert_erase) {
   EXPECT_EQ(r.Column(2), nullptr);
   const auto* col = r.Column(1);
   ASSERT_NE(col, nullptr);
-  EXPECT_TRUE(col->HasValidity());
+  // Stored rows are all-valid (nulls are implicit in the sparse doc-id
+  // structure), so no separate validity sub-reader is materialised; the
+  // reads below verify null handling directly.
+  EXPECT_FALSE(col->HasValidity());
   EXPECT_EQ(col->RowCount(),
             static_cast<uint64_t>(kSurvivingDoc) + 1 - irs::doc_limits::min());
 

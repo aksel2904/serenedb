@@ -75,32 +75,17 @@ query
 EXPLAIN SELECT pk, v, dual FROM wal_inc_idx WHERE txt @@ ts_phrase('alpha');
 ----
 QUERY PLAN
-┌───────────────────────────┐
-│       IRESEARCH_SCAN      │
-│    ────────────────────   │
-│     Index: wal_inc_idx    │
-│                           │
-│          Filter:          │
-│  ┌─────────────────────┐  │
-│  │┌───────────────────┐│  │
-│  ││        AND        ││  │
-│  │└─────────┬─────────┘│  │
-│  │┌─────────┴─────────┐│  │
-│  ││       PHRASE      ││  │
-│  ││    ────────────   ││  │
-│  ││   txt(string) =   ││  │
-│  ││ <Term:alpha(0, 0);││  │
-│  ││          >        ││  │
-│  │└───────────────────┘│  │
-│  └─────────────────────┘  │
-│                           │
-│        Projections:       │
-│             pk            │
-│             v             │
-│            dual           │
-│                           │
-│           ~1 row          │
-└───────────────────────────┘
+╭─ IRESEARCH_SCAN ───────╮
+│ Index: wal_inc_idx     │
+│ Filter:                │
+│ ╭─ Term ─────────────╮ │
+│ │ Field: txt(string) │ │
+│ │ Value: alpha       │ │
+│ ╰────────────────────╯ │
+│ Projections: pk, v,    │
+│              dual      │
+│ ~1 row                 │
+╰────────────────────────╯
 
 # Pre-crash row served from the .cs file.
 query
@@ -136,7 +121,7 @@ pk	tags
 
 # Freeze iresearch commits: subsequent INSERTs land in RocksDB WAL only.
 statement ok
-SET sdb_faults = 'SearchCommitTask::commitUnsafe';
+SET sdb_faults = 'SearchRefreshTask::commitUnsafe';
 
 statement ok
 INSERT INTO wal_inc_t VALUES

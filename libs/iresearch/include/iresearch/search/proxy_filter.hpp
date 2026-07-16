@@ -42,7 +42,10 @@ class ProxyFilter final : public Filter {
  public:
   using cache_ptr = std::shared_ptr<ProxyQueryCache>;
 
-  Query::ptr prepare(const PrepareContext& ctx) const final;
+  QueryBuilder::ptr PrepareSegment(const SubReader& segment,
+                                   const PrepareContext& ctx) const final;
+
+  PrepareCollector::ptr MakeCollector(const Scorer* scorer) const final;
 
   template<typename Impl, typename Base = Impl, typename... Args>
   std::pair<Base&, cache_ptr> set_filter(IResourceManager& memory,
@@ -52,6 +55,12 @@ class ProxyFilter final : public Filter {
     auto& real =
       cache_filter(memory, std::make_unique<Impl>(std::forward<Args>(args)...));
     return {sdb::basics::downCast<Base>(real), _cache};
+  }
+
+  std::pair<Filter&, cache_ptr> set_filter(IResourceManager& memory,
+                                           Filter::ptr&& filter) {
+    auto& real = cache_filter(memory, std::move(filter));
+    return {real, _cache};
   }
 
   void set_cache(cache_ptr cache) noexcept { _cache = std::move(cache); }

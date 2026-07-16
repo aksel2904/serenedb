@@ -36,12 +36,11 @@
 #include "catalog/catalog.h"
 #include "catalog/store/store.h"
 #include "duckdb_shell.hpp"
-#include "general_server/general_server_feature.h"
-#include "general_server/scheduler_feature.h"
-#include "general_server/ssl_server_feature.h"
-#include "pg/pg_feature.h"
+#include "network/pg/hba.h"
+#include "network/server.h"
 #include "query/server_engine.h"
 #include "rest_server/database_path_feature.h"
+#include "scheduler/background_scheduler.h"
 #include "storage_engine/search_engine.h"
 
 namespace {
@@ -57,30 +56,32 @@ int RunServer(int argc, char** argv) {
 
     AppServer server;
 
-    // 1. Parse CLI before constructing any feature (ctors read flags).
-    //    parseOptions can SDB_FATAL on bad CLI -- DuckDB is already up
-    //    by the time we get here (Initialize ran in main(), see below).
-    server.parseOptions(argc, argv);
+    // 1. CLI is already parsed (in main(), before engine.Initialize, so the
+    //    pool-sizing flags like --cpu_threads are visible while DuckDB is
+    //    built). Feature ctors below read their flags from the parsed state.
 
     // 2. Construct features in dependency order. Each ctor reads its
     //    own flags, runs validation, and sets its static gInstance
     //    pointer; Feature::instance() works from here on.
-    SslServerFeature ssl;
     DatabasePathFeature db_path;
     catalog::CatalogStore store;
-    SchedulerFeature scheduler;
+    BackgroundScheduler background;
     search::SearchEngine search;
-    GeneralServerFeature general;
-    pg::PostgresFeature pg;
+    Server network;
 
     // Lifecycle is two explicit, flat lists: bring features UP in dependency
     // order, then take them DOWN in a dependency order that is deliberately
-    // NOT the reverse of startup. The non-obvious edge: the scheduler must
-    // drain (it runs drop tasks that touch search) before search goes down.
-    // DuckDBEngine brackets all of this from main(). The up_* flags let DOWN
-    // skip whatever never came UP (start() threw).
-    bool up_ssl = false, up_store = false, up_scheduler = false,
-         up_catalog = false, up_search = false, up_general = false;
+    // NOT the reverse of startup. The non-obvious edge: the search loops run ON
+    // the background pool, so SearchEngine::stop() must join them (it sets
+    // _stopping and Waits the loop Futures, which resume on the still-live
+    // pool) BEFORE BackgroundScheduler::stop() tears that pool down -- else a
+    // loop is stranded mid-resume. search.stop() does not destroy the engine
+    // (its dtor runs at end of scope), so drop tasks draining on the pool
+    // afterwards still see a live SearchEngine. DuckDBEngine brackets all of
+    // this from main(). The up_* flags let DOWN skip whatever never came UP
+    // (start() threw).
+    bool up_store = false, up_background = false, up_catalog = false,
+         up_search = false, up_network = false;
 
     absl::Cleanup down = [&]() noexcept {
       CrashHandler::SetState("stopping");
@@ -93,40 +94,57 @@ int RunServer(int argc, char** argv) {
           SDB_ERROR(GENERAL, "unknown exception stopping ", what);
         }
       };
-      if (up_general) {
-        stop("general", [&] { general.stop(); });
+      if (up_search) {
+        // Signal the search loops to stop BEFORE the IoPool is torn down, so
+        // their Delay()s (which complete instantly once the pool is gone) break
+        // immediately instead of spinning until search.stop() below.
+        search.RequestStop();
       }
-      if (up_scheduler) {
-        stop("scheduler", [&] { scheduler.stop(); });
+      if (up_network) {
+        // Stop taking new connections early, but keep the io pool alive: the
+        // search/background loops below still drain their timers on it.
+        stop("accept", [&] { network.StopAccepting(); });
       }
       if (up_search) {
         stop("search", [&] { search.stop(); });
       }
+      if (up_background) {
+        stop("background", [&] { background.stop(); });
+      }
+      if (up_store) {
+        stop("store", [&] { store.Shutdown(); });
+      }
       if (up_catalog) {
         stop("catalog", [&] { catalog::ShutdownCatalog(); });
       }
-      if (up_store) {
-        stop("store", [&] { store.Shutdown(); });  // detach + checkpoint
-      }
-      if (up_ssl) {
-        stop("ssl", [&] { ssl.stop(); });
+      if (up_network) {
+        // Last: every DuckDB-work submitter above is now down, so join the
+        // DuckDB workers and tear the io pool down. A session query pipeline
+        // runs on a DuckDB worker and pushes results up into the io pool, so
+        // the pool can only be freed once no worker is left to touch it.
+        stop("network", [&] { network.stop(); });
       }
     };
 
     CrashHandler::SetState("starting");
-    ssl.start();
-    up_ssl = true;
     store.Initialize(db_path.directory());
+    network::pg::hba::SetHbaConfig(db_path.hbaConfigFile());
     up_store = true;
-    scheduler.start();
-    up_scheduler = true;
+    background.start();
+    up_background = true;
     catalog::InitCatalog();
     up_catalog = true;
+    // The io pool must be up before search.start(): the per-index refresh /
+    // compaction loops co_await BackgroundScheduler::Delay(), which hosts its
+    // timers on the io pool. Without it Delay() returns instantly and the loops
+    // busy-spin every core, starving startup so no listener ever binds.
+    network.StartIoPool();
+    up_network = true;
     search.start();
     up_search = true;
-    general.start();
-    up_general = true;
-    pg.start();
+    // Accept connections only once the indexes are loaded and loops are
+    // running.
+    network.StartListeners();
 
     SDB_INFO(GENERAL, "SereneDB is ready for business. Have fun!");
 
@@ -157,7 +175,10 @@ int RunSubcommand(int argc, char* argv[],
 
 }  // namespace
 
+extern "C" void json_object_seed(size_t seed);
+
 int main(int argc, char* argv[]) {
+  json_object_seed(0);
   if (argc >= 2 && std::strcmp(argv[1], "shell") == 0) {
     // Pure duckdb shell -- manages its own DuckDB instance, no SDB_*.
     return RunSubcommand(argc, argv, duckdb_shell::ShellSubcommand::SHELL);
@@ -176,6 +197,11 @@ int main(int argc, char* argv[]) {
   // ctor runs (storage extensions must be registered pre-construct), then
   // RegisterServerExtensions fills connector/pg/index types on the live
   // DatabaseInstance.
+  //
+  // CLI flags are parsed FIRST: ConfigureServerDBConfig reads --cpu_threads to
+  // size the DuckDB pool at construction, so the flags must be live before
+  // Initialize (parseOptions is SDB_*-free precisely so it can run this early).
+  sdb::app::AppServer::parseOptions(argc, argv);
   auto& engine = sdb::DuckDBEngine::Instance();
   engine.Initialize(&server::query::ConfigureServerDBConfig);
   server::query::RegisterServerExtensions(engine.instance());

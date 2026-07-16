@@ -105,22 +105,36 @@ def test_psql_env_vars() -> None:
 def test_psql_user_default_falls_back_to_os_user() -> None:
     # psql defaults USERNAME to the OS user (via getpwuid / $USER); mirror
     # that. duckdb_databases().path exposes the libpq DSN we synthesised
-    # so we can read the user value back directly.
+    # so we can read the user value back directly. Login as an unknown role
+    # is rejected, so the sentinel role must exist for the connection to
+    # come up.
+    import psycopg
+
     k = _kw()
-    env = {**os.environ, "NO_COLOR": "1", "TERM": "dumb"}
-    env.pop("PGUSER", None)  # so the $USER fallback actually runs
-    env.update({
-        "PGHOST": k["host"], "PGPORT": k["port"], "PGDATABASE": k["dbname"],
-        "USER": "zzz_sentinel_user",
-    })
-    r = subprocess.run(
-        [SERENED_BIN, "psql", "-c",
-         "SELECT path FROM duckdb_databases() WHERE database_name='postgres';"],
-        capture_output=True, text=True, timeout=20, env=env,
-    )
-    assert r.returncode == 0, r.stderr
-    assert "user=zzz_sentinel_user" in r.stdout, \
-        f"OS-user fallback didn't reach the DSN:\nstdout={r.stdout!r}"
+
+    def _admin(sql: str) -> None:
+        with psycopg.connect(**conn_kwargs(), autocommit=True) as c:
+            c.execute(sql)
+
+    _admin("DROP ROLE IF EXISTS zzz_sentinel_user;")
+    _admin("CREATE ROLE zzz_sentinel_user LOGIN;")
+    try:
+        env = {**os.environ, "NO_COLOR": "1", "TERM": "dumb"}
+        env.pop("PGUSER", None)  # so the $USER fallback actually runs
+        env.update({
+            "PGHOST": k["host"], "PGPORT": k["port"], "PGDATABASE": k["dbname"],
+            "USER": "zzz_sentinel_user",
+        })
+        r = subprocess.run(
+            [SERENED_BIN, "psql", "-c",
+             "SELECT path FROM duckdb_databases() WHERE database_name='postgres';"],
+            capture_output=True, text=True, timeout=20, env=env,
+        )
+        assert r.returncode == 0, r.stderr
+        assert "user=zzz_sentinel_user" in r.stdout, \
+            f"OS-user fallback didn't reach the DSN:\nstdout={r.stdout!r}"
+    finally:
+        _admin("DROP ROLE zzz_sentinel_user;")
 
 
 def test_psql_list_databases() -> None:
@@ -161,6 +175,47 @@ def test_psql_round_trip() -> None:
         f"row count/sum missing: {r.stdout!r}"
     assert "one,two,three" in r.stdout, \
         f"string_agg missing: {r.stdout!r}"
+
+
+def test_psql_create_drop_database() -> None:
+    # CREATE DATABASE / DROP DATABASE are rewritten by the parser to
+    # ATTACH (TYPE serenedb) / DETACH -- local catalog ops the client shell
+    # cannot run (it has no serenedb storage extension). serened psql must
+    # forward them to the attached server instead of failing locally with
+    # `Extension "serenedb.duckdb_extension" not found`.
+    k = _kw()
+    db = f"psql_cdb_{uuid.uuid4().hex[:10]}"
+
+    def psql(sql: str, dbname: str | None = None):
+        return _run(["-h", k["host"], "-p", k["port"], "-U", k["user"],
+                     "-d", dbname or k["dbname"], "-c", sql])
+
+    # CREATE forwards to the server -- no local serenedb.duckdb_extension error.
+    r = psql(f'CREATE DATABASE "{db}";')
+    assert r.returncode == 0, f"stderr={r.stderr!r}"
+    assert "serenedb.duckdb_extension" not in r.stderr, \
+        f"statement ran locally instead of being forwarded: {r.stderr!r}"
+
+    # IF NOT EXISTS is idempotent.
+    r = psql(f'CREATE DATABASE IF NOT EXISTS "{db}";')
+    assert r.returncode == 0, f"stderr={r.stderr!r}"
+
+    # A plain re-create surfaces the server's duplicate error.
+    r = psql(f'CREATE DATABASE "{db}";')
+    assert r.returncode != 0, f"expected duplicate error, stdout={r.stdout!r}"
+    assert "already exists" in r.stderr, \
+        f"missing duplicate-database error: {r.stderr!r}"
+
+    # The database really exists on the server: connect straight to it.
+    r = psql("SELECT 1 AS ok;", dbname=db)
+    assert r.returncode == 0, f"could not connect to created db: {r.stderr!r}"
+
+    # DROP forwards too; afterwards the database is gone (connect fails).
+    r = psql(f'DROP DATABASE "{db}";')
+    assert r.returncode == 0, f"stderr={r.stderr!r}"
+    r = psql("SELECT 1;", dbname=db)
+    assert r.returncode != 0, \
+        f"database still connectable after DROP: {r.stdout!r}"
 
 
 def test_psql_unknown_flag_passes_through() -> None:

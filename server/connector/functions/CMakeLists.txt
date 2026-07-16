@@ -2,8 +2,8 @@ target_sources(
     serene_connector
     PRIVATE
         array.cpp
-        cast.cpp
         encode_key.cpp
+        es.cpp
         inout.cpp
         json.cpp
         math.cpp
@@ -11,6 +11,7 @@ target_sources(
         system.cpp
         search.cpp
         sequence.cpp
+        split_by_non_alpha.cpp
         ts_anyall.cpp
         ts_between.cpp
         ts_compound.cpp

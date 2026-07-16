@@ -26,13 +26,17 @@
 #include <absl/functional/any_invocable.h>
 
 #include <functional>
+#include <span>
 
 #include "basics/down_cast.h"
 #include "iresearch/index/index_meta.hpp"
 #include "iresearch/index/index_reader.hpp"
 #include "iresearch/index/index_reader_options.hpp"
 #include "iresearch/index/iterators.hpp"
+#include "iresearch/search/collectors.hpp"
 #include "iresearch/search/column_collector.hpp"
+#include "iresearch/search/term_iterator.hpp"
+#include "iresearch/search/term_predicate.hpp"
 #include "iresearch/utils/hash_utils.hpp"
 
 namespace irs {
@@ -41,23 +45,16 @@ struct IndexReader;
 struct PreparedStateVisitor;
 
 struct PrepareContext {
-  const IndexReader& index;
+  PrepareCollector* collector = nullptr;
   IResourceManager& memory = IResourceManager::gNoop;
-  const Scorer* scorer = nullptr;
   const AttributeProvider* ctx = nullptr;
   score_t boost = kNoBoost;
 
-  PrepareContext Boost(score_t boost) const noexcept {
-    auto ctx = *this;
-    ctx.boost *= boost;
-    return ctx;
-  }
+  void Boost(score_t b) noexcept { boost *= b; }
 };
 
 struct ExecutionContext {
-  const SubReader& segment;
   IResourceManager& memory = IResourceManager::gNoop;
-  const Scorer* scorer = nullptr;
   const AttributeProvider* ctx = nullptr;
   const DocumentMask* pending_docs_mask = nullptr;
   // If enabled, wand would use first scorer from scorers
@@ -68,29 +65,36 @@ inline IndexFeatures GetFeatures(const Scorer* scorer) noexcept {
   return scorer ? scorer->GetIndexFeatures() : IndexFeatures::None;
 }
 
-inline size_t GetStatsSize(const Scorer* scorer) noexcept {
-  return scorer ? scorer->stats_size() : 0;
-}
+// Per-segment query builder
+class QueryBuilder : public memory::Managed {
+ public:
+  using ptr = memory::managed_ptr<const QueryBuilder>;
+
+  QueryBuilder(const SubReader& segment) noexcept : _segment{segment} {}
+
+  virtual ~QueryBuilder() = default;
+
+  static QueryBuilder::ptr Empty();
+  virtual DocIterator::ptr Execute(const ExecutionContext& ctx,
+                                   const StatsBuffer& stats) const = 0;
+
+  virtual bool CollectTopK(ScoreCollector& /*collector*/,
+                           const ExecutionContext& /*ctx*/,
+                           const StatsBuffer& /*stats*/) const {
+    return false;
+  }
+
+  virtual void Visit(PreparedStateVisitor&, score_t boost) const = 0;
+
+  virtual score_t Boost() const noexcept = 0;
+
+ protected:
+  const SubReader& _segment;
+};
 
 // Base class for all user-side filters
 class Filter {
  public:
-  // Base class for all prepared(compiled) queries
-  class Query : public memory::Managed {
-   public:
-    using ptr = memory::managed_ptr<const Query>;
-
-    static Query::ptr empty();
-
-    virtual DocIterator::ptr execute(const ExecutionContext& ctx) const = 0;
-
-    virtual void visit(const SubReader& segment, PreparedStateVisitor& visitor,
-                       score_t boost) const = 0;
-
-    // test only member
-    virtual score_t Boost() const noexcept = 0;
-  };
-
   using ptr = std::unique_ptr<Filter>;
 
   virtual ~Filter() = default;
@@ -99,9 +103,20 @@ class Filter {
     return equals(rhs);
   }
 
-  virtual Query::ptr prepare(const PrepareContext& ctx) const = 0;
+  virtual QueryBuilder::ptr PrepareSegment(const SubReader& segment,
+                                           const PrepareContext& ctx) const = 0;
+
+  // Allocate the statistics collector this filter expects in PrepareSegment.
+  // The default collects nothing.
+  virtual PrepareCollector::ptr MakeCollector(const Scorer* scorer) const;
 
   virtual TypeInfo::type_id type() const noexcept = 0;
+
+  virtual std::span<Filter::ptr> GetChildren() { return {}; }
+
+  virtual TermPredicate::ptr CompileTermPredicate() const { return nullptr; }
+
+  virtual TermIterator::ptr CompileTermIterator(const TermReader& reader) const;
 
   // kludge for optimization in And::prepare
   virtual score_t BoostImpl() const noexcept { return kNoBoost; }
@@ -181,7 +196,13 @@ class FilterWithField : public FilterWithOptions<Options> {
 // Filter which returns no documents
 class Empty final : public FilterWithType<Empty> {
  public:
-  Query::ptr prepare(const PrepareContext& ctx) const final;
+  TermPredicate::ptr CompileTermPredicate() const final {
+    return MakeTermPredicate(AcceptNoTerms{});
+  }
+
+ public:
+  QueryBuilder::ptr PrepareSegment(const SubReader& segment,
+                                   const PrepareContext& ctx) const final;
 };
 
 struct FilterVisitor;

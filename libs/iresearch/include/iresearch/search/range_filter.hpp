@@ -22,6 +22,7 @@
 
 #pragma once
 
+#include "iresearch/index/iterators.hpp"
 #include "iresearch/search/filter.hpp"
 #include "iresearch/search/search_range.hpp"
 #include "iresearch/utils/string.hpp"
@@ -34,9 +35,6 @@ struct FilterVisitor;
 struct ByRangeFilterOptions {
   using range_type = SearchRange<bstring>;
 
-  //////////////////////////////////////////////////////////////////////////////
-  /// @brief search range
-  //////////////////////////////////////////////////////////////////////////////
   range_type range;
 
   bool operator==(const ByRangeFilterOptions& rhs) const noexcept {
@@ -44,17 +42,10 @@ struct ByRangeFilterOptions {
   }
 };
 
-////////////////////////////////////////////////////////////////////////////////
-/// @struct ByPrefixOptions
-/// @brief options for prefix filter
-////////////////////////////////////////////////////////////////////////////////
 struct ByRangeOptions : ByRangeFilterOptions {
   using FilterType = ByRange;
   using filter_options = ByRangeFilterOptions;
 
-  //////////////////////////////////////////////////////////////////////////////
-  /// @brief the maximum number of most frequent terms to consider for scoring
-  //////////////////////////////////////////////////////////////////////////////
   size_t scored_terms_limit{1024};
 
   bool operator==(const ByRangeOptions& rhs) const noexcept {
@@ -63,24 +54,65 @@ struct ByRangeOptions : ByRangeFilterOptions {
   }
 };
 
-//////////////////////////////////////////////////////////////////////////////
-/// @class by_range
-/// @brief user-side term range filter
-//////////////////////////////////////////////////////////////////////////////
+struct RangeMinAcceptor {
+  const ByRangeFilterOptions::range_type* range;
+
+  bool operator()(bytes_view term) const noexcept {
+    switch (range->min_type) {
+      case BoundType::Unbounded:
+        return true;
+      case BoundType::Inclusive:
+        return term >= range->min;
+      case BoundType::Exclusive:
+        return term > range->min;
+    }
+    return false;
+  }
+};
+
+struct RangeMaxAcceptor {
+  const ByRangeFilterOptions::range_type* range;
+
+  bool operator()(bytes_view term) const noexcept {
+    switch (range->max_type) {
+      case BoundType::Unbounded:
+        return true;
+      case BoundType::Inclusive:
+        return term <= range->max;
+      case BoundType::Exclusive:
+        return term < range->max;
+    }
+    return false;
+  }
+};
+
+struct RangeAcceptor {
+  RangeMinAcceptor min;
+  RangeMaxAcceptor max;
+
+  bool operator()(bytes_view term) const noexcept {
+    return min(term) && max(term);
+  }
+};
+
 class ByRange : public FilterWithField<ByRangeOptions> {
  public:
-  static Query::ptr prepare(const PrepareContext& ctx, irs::field_id id,
-                            const options_type::range_type& rng,
-                            size_t scored_terms_limit);
-
   static void visit(const SubReader& segment, const TermReader& reader,
-                    const options_type::range_type& rng,
-                    FilterVisitor& visitor);
+                    const ByRangeOptions& options, FilterVisitor& visitor);
 
-  Query::ptr prepare(const PrepareContext& ctx) const final {
-    return prepare(ctx.Boost(Boost()), field_id(), options().range,
-                   options().scored_terms_limit);
-  }
+  QueryBuilder::ptr PrepareSegment(const SubReader& segment,
+                                   const PrepareContext& ctx) const final;
+  static QueryBuilder::ptr PrepareSegment(const SubReader& segment,
+                                          const PrepareContext& ctx,
+                                          const irs::field_id field,
+                                          const options_type::range_type& rng,
+                                          score_t boost);
+
+  PrepareCollector::ptr MakeCollector(const Scorer* scorer) const final;
+
+  TermPredicate::ptr CompileTermPredicate() const final;
+
+  TermIterator::ptr CompileTermIterator(const TermReader& reader) const final;
 };
 
 }  // namespace irs

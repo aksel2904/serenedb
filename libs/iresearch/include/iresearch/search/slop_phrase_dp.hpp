@@ -21,8 +21,10 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
+#include <tuple>
 #include <vector>
 
 #include "basics/empty.hpp"
@@ -34,31 +36,38 @@
 
 // Sloppy phrase frequency over per-slot position lists.
 //
-// Matching: a bitmask DP (Run/RunForLead) walks a window around each
-// candidate lead position and yields freq + best_distance; a separate
-// DFS (EnumerateAll) lists every valid tuple for highlighting. The DP
-// chain always runs in phrase order (slots 0..n-1); StepCost is
-// directional, so the order is fixed.
+// Matching: Run anchors at the rarest slot and, for each of its positions,
+// runs a pruned DFS (CountFromAnchor) over the remaining slots, rightward
+// then leftward, accumulating freq + best_distance. StepCost is directional,
+// so every transition is scored in phrase order against the slot's adjacent
+// partner. The DFS walks only the slop-reachable [lo, hi] slice of each slot
+// and prunes on running cost, so its work tracks the valid (and near-valid)
+// tuples; it never materializes a per-anchor window. Given a collector, the
+// same pass emits one EnumeratedMatch per valid tuple, so freq and the
+// enumerated count come from one walk and agree by construction.
 //
-// Gather: positions can be collected two ways. read-all reads every
-// slot fully. seek-gather reads only the rarest slot fully, then seeks
-// the other slots into the slop-reachable windows around it
-// (BuildWindows); by the coverage lemma |p_a - p_b| <= slop +
-// sum_expected this drops no match, so the DP is identical either way -
-// only fewer positions reach it. ResolveSeekGather picks the path
-// (kSeekGatherSkew heuristic, overridable by the gGatherOverride test
-// seam). Note the window is anchored on the rarest slot, not slot 0.
+// Gather: read-all reads every slot fully; seek-gather reads only the rarest
+// slot and seeks the others into the windows around it (BuildWindows). By the
+// coverage lemma |p_a - p_b| <= slop + sum_expected this drops no match, so
+// the two paths match identically - seek-gather just feeds in fewer
+// positions. ResolveSeekGather picks between them (kSeekGatherSkew,
+// overridable by the gGatherOverride test seam).
 //
-// expected_step == 1 keeps the original SlopPhraseFrequency formula
-// bit-for-bit; expected_step > 1 supports per-slot positional gaps
-// requested via push_back(term, offs). Interval gaps (offs_min !=
-// offs_max) combined with slop are rejected upstream by SDB_ENSURE.
-//
-// When the window exceeds kMaxWindowPositions the bitmask DP cannot
-// run for that lead. Run then falls back to CountFromLead, a DFS that
-// enumerates the lead's valid tuples directly: slower, but correct. It
-// mirrors EnumerateAll's pruning so freq/best_distance stay exact
-// instead of dropping the lead.
+// expected_step == 1 reproduces the original SlopPhraseFrequency formula
+// bit-for-bit; expected_step > 1 adds per-slot positional gaps from
+// push_back(term, offs). Interval gaps (offs_min != offs_max) with slop are
+// rejected upstream by SDB_ENSURE.
+
+// Profiling aid: with -DSLOP_PROFILE, force the matcher (Run), the window
+// builder (BuildWindows) and the pair join (JoinPair) out of line so a
+// profiler can split "build windows" vs "match" vs position decode (iterator
+// next/seek, already out of line). Each runs once per candidate doc, so the
+// perturbation is negligible. Never defined in production.
+#ifdef SLOP_PROFILE
+#define SLOP_PROF_NOINLINE [[gnu::noinline]]
+#else
+#define SLOP_PROF_NOINLINE
+#endif
 
 namespace irs {
 
@@ -69,18 +78,12 @@ struct HasPosition;
 
 namespace detail::slop_dp {
 
-// Step cost for one slot transition.
-//
-// expected == 1 (regular phrase term, adjacent to previous):
-//   delta >= 2  -> delta - 1   (forward gap)
-//   delta <= -1 -> -delta + 1  (reversal)
-//   delta in {0, 1} -> 0       (delta == 0 dropped by uniqueness)
-//
-// expected > 1 (push_back(term, offs) requested a gap):
-//   delta == expected           -> 0
-//   delta > expected            -> delta - expected      (too far)
-//   0 <= delta < expected       -> expected - delta      (too close)
-//   delta < 0                   -> expected - delta + 1  (reversal)
+// Step cost for one slot transition, over delta = pos[slot] - pos[partner]
+// in phrase order. For a regular adjacent term (expected == 1): adjacency
+// (delta == 1) is free, a forward gap costs delta - 1, same position costs
+// 1, and a reversal (delta <= -1) costs -delta + 1. For a requested gap
+// (expected > 1): hitting it costs 0, too far costs delta - expected, too
+// close costs expected - delta, and a reversal costs expected - delta + 1.
 constexpr PosAttr::value_t StepCost(int64_t delta,
                                     PosAttr::value_t expected) noexcept {
   if (expected == 1) {
@@ -90,7 +93,10 @@ constexpr PosAttr::value_t StepCost(int64_t delta,
     if (delta <= -1) {
       return static_cast<PosAttr::value_t>(-delta + 1);
     }
-    return 0;
+    if (delta == 0) {
+      return 1;  // same position: one move to separate the two slots
+    }
+    return 0;  // delta == 1: already adjacent
   }
   const int64_t exp = static_cast<int64_t>(expected);
   if (delta == exp) {
@@ -105,87 +111,36 @@ constexpr PosAttr::value_t StepCost(int64_t delta,
   return static_cast<PosAttr::value_t>(exp - delta + 1);
 }
 
-inline constexpr size_t kMaxWindowPositions = 128;
-
-struct Mask64 {
-  uint64_t v = 0;
-  bool Test(unsigned bit) const noexcept { return (v >> bit) & 1ULL; }
-  void Set(unsigned bit) noexcept { v |= (1ULL << bit); }
-  bool operator==(const Mask64&) const = default;
-};
-
-struct Mask128 {
-  uint64_t lo = 0;
-  uint64_t hi = 0;
-  bool Test(unsigned bit) const noexcept {
-    return bit < 64 ? ((lo >> bit) & 1ULL) : ((hi >> (bit - 64)) & 1ULL);
-  }
-  void Set(unsigned bit) noexcept {
-    if (bit < 64) {
-      lo |= (1ULL << bit);
-    } else {
-      hi |= (1ULL << (bit - 64));
-    }
-  }
-  bool operator==(const Mask128&) const = default;
-};
-
-template<typename Mask>
-struct DpEntry {
-  PosAttr::value_t cost;
-  Mask mask;
-  uint64_t count;
-};
-
 struct DpResult {
   uint64_t freq = 0;
   PosAttr::value_t best_distance = 0;
   bool any = false;
 };
 
-// Per-mask scratch buffers for a single RunForLead invocation. Kept
-// alive in DpScratch so the inner vectors' capacity is reused across
-// leads and across documents instead of being reallocated on each
-// call (Match runs once per candidate doc, RunForLead once per lead).
-// Only buckets in [0, Wsize) are ever read or written; capacity left
-// over from a wider window is harmless and never touched.
-template<typename Mask>
-struct LeadScratch {
-  std::vector<std::vector<unsigned>> slot_bits;
-  std::vector<std::vector<PosAttr::value_t>> slot_pos_in_win;
-  std::vector<std::vector<DpEntry<Mask>>> prev_layer;
-  std::vector<std::vector<DpEntry<Mask>>> cur_layer;
-};
-
-// Reusable scratch passed from the Frequency object into Run. Holds
-// both mask variants because Run dispatches Mask64/Mask128 per lead
-// within a single document depending on window size.
+// Scratch passed from the Frequency object into Run: the DFS chain and slot
+// visitation order, whose capacity is reused across anchor positions and
+// documents instead of reallocated per call.
 struct DpScratch {
-  std::vector<PosAttr::value_t> window_positions;
-  std::vector<PosAttr::value_t> chain;  // overflow fallback chain
-  LeadScratch<Mask64> lead64;
-  LeadScratch<Mask128> lead128;
+  std::vector<PosAttr::value_t> chain;
+  std::vector<uint32_t> order;
 };
 
 // Disjoint, ascending [lo, hi] gather interval (inclusive).
 using Window = std::pair<PosAttr::value_t, PosAttr::value_t>;
 
 // Engage seek-based gather (read the rarest slot, seek the rest into
-// slop-reachable windows) only when the rarest slot is at least this
-// many times rarer than the densest. Conservative on purpose: when
-// term frequencies are balanced the plain read-all path is the safe
-// choice. TODO(perf): this crossover and its interaction with large
-// slop, where windows widen toward full coverage and erode the win
-// measured: 8 is conservative, leaves win on the table on
-// moderately-skewed real data; calibration pending
-inline constexpr uint64_t kSeekGatherSkew = 8;
+// slop-reachable windows) only when the rarest slot is at least this many
+// times rarer than the densest. Conservative: on balanced frequencies plain
+// read-all is the safe choice. TODO(perf): 3 leaves some win on the table on
+// moderately-skewed data, and the crossover shifts with large slop (windows
+// widen toward full coverage and erode the seek win); recalibrate under
+// measurement.
+inline constexpr uint64_t kSeekGatherSkew = 3;
 
-// Test seam for the gather strategy. Production always leaves this at
-// kAuto; gGatherOverride is never written outside tests. Tests flip it
-// to kForceSeek / kForceReadAll so the seek-gather and read-all paths
-// can be driven over identical data and asserted to match - the only
-// way to cover the seek-gather branch, since on balanced data the
-// heuristic never selects it and read-all would mask any divergence.
+// Test seam for the gather strategy. Production leaves this at kAuto; tests
+// flip it to kForceSeek / kForceReadAll to drive both paths over identical
+// data and assert they match. Without it the seek-gather branch is
+// unreachable on balanced data, where the heuristic never selects it.
 enum class GatherOverride : uint8_t {
   kAuto,
   kForceSeek,
@@ -194,9 +149,9 @@ enum class GatherOverride : uint8_t {
 
 inline GatherOverride gGatherOverride = GatherOverride::kAuto;
 
-// Applies the test seam on top of the heuristic decision. Seek-gather
-// is correct for any input (it only changes which positions are read,
-// never the match set), so forcing it on balanced data is safe.
+// Applies the test seam on top of the heuristic. Seek-gather is correct for
+// any input (it changes which positions are read, not the match set), so
+// forcing it on balanced data is safe.
 inline bool ResolveSeekGather(bool heuristic) noexcept {
   switch (gGatherOverride) {
     case GatherOverride::kForceSeek:
@@ -209,6 +164,379 @@ inline bool ResolveSeekGather(bool heuristic) noexcept {
   return heuristic;
 }
 
+// Test seam for the n == 2 fused merge-join (JoinPair), fixed and variadic.
+// Production leaves this false; tests set it to route n == 2 through the
+// generic gather + Run path and assert join-vs-generic equivalence over
+// identical data (the join bypasses gather, so this is the only way to run
+// both).
+inline bool gPairJoinDisabled = false;
+
+// Bench seam for the offset-enabled read-all gather. Production leaves this
+// false; the micro benchmark sets it (via a command-line flag) to route the
+// Offs gather through the scalar per-position loop instead of the bulk
+// ReadAll overload, giving an in-binary A/B of the two decode paths.
+inline bool gOffsBulkGatherDisabled = false;
+
+// (start, end) offsets of one token occurrence.
+struct PosOffset {
+  uint32_t start;
+  uint32_t end;
+};
+
+// A single valid pair emitted by JoinPair: positions with slot ids
+// (mirrors EnumeratedMatch) plus the already-resolved match offsets
+// (leftmost token's start, rightmost token's end).
+struct PairMatch {
+  PosAttr::value_t leftmost;
+  PosAttr::value_t rightmost;
+  uint32_t leftmost_slot;
+  uint32_t rightmost_slot;
+  uint32_t start_offset;
+  uint32_t end_offset;
+};
+
+// Sliding partner-position buffer for JoinPair, reused across Match()
+// calls. buf_offs is parallel to buf_pos and filled only when the join
+// is instantiated with Offs.
+struct PairScratch {
+  std::vector<PosAttr::value_t> buf_pos;
+  std::vector<PosOffset> buf_offs;
+};
+
+// n == 2 fused merge-join over two forward-only position iterators, replacing
+// gather + BuildWindows + Run for two-slot phrases. Anchor positions are read
+// straight off their iterator; partner positions are decoded exactly once
+// into a sliding buffer bounded by the anchor window [pa - w, pa + w],
+// w = slop + expected (the BuildWindows coverage window). Candidates are then
+// exact-checked with StepCost, so the accept set equals Run's. Both bounds
+// are nondecreasing in pa, which is what makes the single forward pass and
+// the front-trimmed buffer sound.
+//
+// anchor_is_slot0 picks the phrase-order delta sign; anchor should be the
+// rarer slot but either is correct. enforce_uniqueness mirrors Run: a pair
+// may not share one index position. With 'out' non-null (Offs && HasFreq) one
+// PairMatch per valid pair is appended, sorted by (leftmost, rightmost,
+// leftmost_slot, rightmost_slot) as Run's collector does. When !HasFreq the
+// join returns at the first valid pair.
+template<bool Offs, bool HasFreq, typename AnchorIt, typename PartnerIt>
+SLOP_PROF_NOINLINE DpResult JoinPair(
+  AnchorIt& anchor, PartnerIt& partner, const OffsAttr* anchor_offs,
+  const OffsAttr* partner_offs, bool anchor_is_slot0, PosAttr::value_t slop,
+  PosAttr::value_t expected, bool enforce_uniqueness, PairScratch& scratch,
+  std::vector<PairMatch>* out) {
+  if constexpr (!HasFreq) {
+    // A collector implies a full count; early exit would truncate it.
+    SDB_ASSERT(out == nullptr);
+  }
+  DpResult res{};
+  if (out) {
+    out->clear();
+  }
+
+  constexpr PosAttr::value_t kMax =
+    std::numeric_limits<PosAttr::value_t>::max();
+  const PosAttr::value_t w = (expected > kMax - slop)
+                               ? kMax
+                               : static_cast<PosAttr::value_t>(slop + expected);
+
+  auto& buf = scratch.buf_pos;
+  buf.clear();
+  if constexpr (Offs) {
+    scratch.buf_offs.clear();
+  }
+  size_t head = 0;
+
+  bool partner_eof = false;
+  bool partner_primed = false;
+  PosAttr::value_t pv = 0;
+
+  bool anchor_live = anchor.next();
+  while (anchor_live) {
+    const PosAttr::value_t pa = anchor.value();
+    if (pos_limits::eof(pa)) {
+      break;
+    }
+    const PosAttr::value_t lo = (pa > w) ? (pa - w) : pos_limits::min();
+    const PosAttr::value_t hi = (pa > kMax - w) ? kMax : (pa + w);
+
+    // Drop buffered partner positions below lo; lo is nondecreasing, so
+    // they can never re-enter a later window.
+    while (head < buf.size() && buf[head] < lo) {
+      ++head;
+    }
+    if (head == buf.size()) {
+      if (head != 0) {
+        buf.clear();
+        if constexpr (Offs) {
+          scratch.buf_offs.clear();
+        }
+        head = 0;
+      }
+    } else if (head > 32 && head * 2 >= buf.size()) {
+      buf.erase(buf.begin(), buf.begin() + static_cast<ptrdiff_t>(head));
+      if constexpr (Offs) {
+        scratch.buf_offs.erase(
+          scratch.buf_offs.begin(),
+          scratch.buf_offs.begin() + static_cast<ptrdiff_t>(head));
+      }
+      head = 0;
+    }
+
+    // Extend decode up to hi; hi is nondecreasing, so every partner
+    // position is decoded exactly once. Offsets must be captured while
+    // the iterator still sits on the position.
+    if (!partner_eof) {
+      if (!partner_primed || pv < lo) {
+        pv = partner.seek(lo);
+        partner_primed = true;
+        if (!pos_limits::valid(pv) || pos_limits::eof(pv)) {
+          partner_eof = true;
+        }
+      }
+      while (!partner_eof && pv <= hi) {
+        buf.push_back(pv);
+        if constexpr (Offs) {
+          if (partner_offs) {
+            scratch.buf_offs.push_back(
+              {partner_offs->start, partner_offs->end});
+          } else {
+            scratch.buf_offs.push_back({0, 0});
+          }
+        }
+        if (!partner.next()) {
+          partner_eof = true;
+          break;
+        }
+        pv = partner.value();
+        if (pos_limits::eof(pv)) {
+          partner_eof = true;
+        }
+      }
+    }
+
+    if (head == buf.size()) {
+      if (partner_eof) {
+        // Nothing buffered and no partner positions left: no anchor
+        // position can match anymore.
+        break;
+      }
+      // Nothing buffered and the next partner position sits beyond this
+      // window (pv > hi). No anchor below pv - w can reach it, so gallop
+      // the anchor forward instead of stepping; the seeked position is
+      // reprocessed by the loop. lo and hi stay nondecreasing.
+      const PosAttr::value_t target = (pv > w) ? (pv - w) : pos_limits::min();
+      if (target > pa) {
+        const PosAttr::value_t av = anchor.seek(target);
+        anchor_live = pos_limits::valid(av) && !pos_limits::eof(av);
+      } else {
+        anchor_live = anchor.next();
+      }
+      continue;
+    }
+
+    PosOffset aoffs{0, 0};
+    if constexpr (Offs) {
+      if (anchor_offs) {
+        aoffs = {anchor_offs->start, anchor_offs->end};
+      }
+    }
+
+    // All buffered positions are in [lo, hi] here (pushed under a hi
+    // that has only grown, trimmed by the current lo); the exact
+    // StepCost check below is the real filter.
+    for (size_t i = head; i < buf.size(); ++i) {
+      const PosAttr::value_t v = buf[i];
+      if (enforce_uniqueness && v == pa) {
+        continue;
+      }
+      const int64_t delta =
+        anchor_is_slot0 ? static_cast<int64_t>(v) - static_cast<int64_t>(pa)
+                        : static_cast<int64_t>(pa) - static_cast<int64_t>(v);
+      const PosAttr::value_t step = StepCost(delta, expected);
+      if (step > slop) {
+        continue;
+      }
+      ++res.freq;
+      if (!res.any || step < res.best_distance) {
+        res.best_distance = step;
+      }
+      res.any = true;
+      if constexpr (!HasFreq) {
+        return res;
+      }
+      if (out) {
+        const PosAttr::value_t p0 = anchor_is_slot0 ? pa : v;
+        const PosAttr::value_t p1 = anchor_is_slot0 ? v : pa;
+        // Tie-breaking mirrors Run's collector: slot 0 wins both ends
+        // when positions coincide.
+        const uint32_t ls = (p1 < p0) ? 1u : 0u;
+        const uint32_t rs = (p1 > p0) ? 1u : 0u;
+        PosOffset o0;
+        PosOffset o1;
+        if constexpr (Offs) {
+          o0 = anchor_is_slot0 ? aoffs : scratch.buf_offs[i];
+          o1 = anchor_is_slot0 ? scratch.buf_offs[i] : aoffs;
+        } else {
+          o0 = {0, 0};
+          o1 = {0, 0};
+        }
+        out->push_back({p0 < p1 ? p0 : p1, p0 < p1 ? p1 : p0, ls, rs,
+                        (ls == 0 ? o0 : o1).start, (rs == 0 ? o0 : o1).end});
+      }
+    }
+    anchor_live = anchor.next();
+  }
+
+  if (out) {
+    std::sort(out->begin(), out->end(),
+              [](const PairMatch& a, const PairMatch& b) noexcept {
+                return std::tie(a.leftmost, a.rightmost, a.leftmost_slot,
+                                a.rightmost_slot) <
+                       std::tie(b.leftmost, b.rightmost, b.leftmost_slot,
+                                b.rightmost_slot);
+              });
+  }
+  return res;
+}
+
+// Merged position stream over one variadic slot's sub-iterators: a k-way
+// merge of the per-term position lists with duplicate positions collapsed,
+// exposing the next()/value()/seek() contract JoinPair expects from a single
+// slot. Duplicates must collapse because the gather path does the same
+// (finalize_slot's sort + unique keys on position alone): two terms of the
+// set at one position yield one slot position, hence one counted pair. Which
+// duplicate's offsets survive is unspecified in the gather path (unstable
+// sort); the stream deterministically keeps the first sub-iterator in visit
+// order.
+//
+// Offsets are copied into stream-owned storage on every reposition: the
+// active sub-iterator changes as the merge advances, so no single sub's
+// OffsAttr pointer stays correct. JoinPair reads offsets immediately after
+// positioning, which the refresh-on-move exactly covers.
+//
+// Linear scans over the subs: a slot's term set is a handful of synonyms,
+// where a heap costs more than it saves.
+//
+// Templated on the sub-iterator type so the fuzz oracle can drive it over
+// mocks; production always uses the PosAttr default.
+template<bool Offs, typename SubPos = PosAttr>
+class MergedPosStream {
+ public:
+  void Clear() {
+    _subs.clear();
+    _cur = pos_limits::invalid();
+  }
+
+  // Registers one sub-iterator of the current document, rewound and primed
+  // at its first position. Exhausted (empty) subs are dropped up front.
+  void Add(SubPos* pos, const OffsAttr* offs) {
+    SDB_ASSERT(pos);
+    pos->reset();
+    Sub s{.pos = pos, .offs = offs, .val = pos_limits::eof()};
+    if (pos->next()) {
+      const auto v = pos->value();
+      if (!pos_limits::eof(v)) {
+        s.val = v;
+      }
+    }
+    if (!pos_limits::eof(s.val)) {
+      _subs.push_back(s);
+    }
+  }
+
+  bool Empty() const noexcept { return _subs.empty(); }
+
+  PosAttr::value_t value() const noexcept { return _cur; }
+
+  bool next() {
+    if (pos_limits::valid(_cur)) {
+      if (pos_limits::eof(_cur)) {
+        return false;
+      }
+      // Consume every sub entry sitting on the current position; this is
+      // where duplicates collapse into the one merged position already
+      // emitted. The inner loop also skips repeats within one sub - real
+      // postings are strictly increasing, but one compare buys not having
+      // to assume it.
+      for (auto& s : _subs) {
+        while (s.val == _cur) {
+          AdvanceSub(s);
+        }
+      }
+    }
+    return Reposition();
+  }
+
+  PosAttr::value_t seek(PosAttr::value_t target) {
+    if (pos_limits::valid(_cur) && _cur >= target) {
+      return _cur;  // forward-only, like the underlying iterators
+    }
+    for (auto& s : _subs) {
+      if (s.val < target) {
+        const auto v = s.pos->seek(target);
+        s.val =
+          (!pos_limits::valid(v) || pos_limits::eof(v)) ? pos_limits::eof() : v;
+      }
+    }
+    Reposition();
+    return _cur;
+  }
+
+  // Stable pointer to the current position's offsets, refreshed on every
+  // reposition; {0, 0} when the winning sub carries no offsets.
+  const OffsAttr* GetOffs() const noexcept { return &_offs; }
+
+ private:
+  struct Sub {
+    SubPos* pos;
+    // Null when the sub-iterator carries no offsets.
+    const OffsAttr* offs;
+    // Cached pos->value(); pos_limits::eof() once exhausted.
+    PosAttr::value_t val;
+  };
+
+  static void AdvanceSub(Sub& s) {
+    if (!s.pos->next()) {
+      s.val = pos_limits::eof();
+      return;
+    }
+    const auto v = s.pos->value();
+    s.val = pos_limits::eof(v) ? pos_limits::eof() : v;
+  }
+
+  // Emits the minimum over the subs' cached positions (exhausted subs sit
+  // at eof and never win) and captures the winner's offsets.
+  bool Reposition() {
+    auto min = pos_limits::eof();
+    for (const auto& s : _subs) {
+      min = std::min(min, s.val);
+    }
+    _cur = min;
+    if (pos_limits::eof(_cur)) {
+      return false;
+    }
+    if constexpr (Offs) {
+      for (const auto& s : _subs) {
+        if (s.val == _cur) {
+          if (s.offs) {
+            _offs.start = s.offs->start;
+            _offs.end = s.offs->end;
+          } else {
+            _offs.start = 0;
+            _offs.end = 0;
+          }
+          break;
+        }
+      }
+    }
+    return true;
+  }
+
+  std::vector<Sub> _subs;
+  PosAttr::value_t _cur = pos_limits::invalid();
+  OffsAttr _offs;
+};
+
 // Merge [pos - W, pos + W] over the lead slot's already-sorted
 // positions into disjoint ascending windows. lo is clamped to
 // pos_limits::min() because positions are 1-based and seek(0) is a
@@ -216,15 +544,17 @@ inline bool ResolveSeekGather(bool heuristic) noexcept {
 // (|p_a - p_b| <= slop + sum_expected for any two slots of a valid
 // tuple) every position of every valid match lies in one of these
 // windows, so gathering other slots within them drops no match.
-inline void BuildWindows(const std::vector<PosAttr::value_t>& lead_pos,
-                         PosAttr::value_t w, std::vector<Window>& out) {
+SLOP_PROF_NOINLINE inline void BuildWindows(
+  const std::vector<PosAttr::value_t>& lead_pos, PosAttr::value_t w,
+  std::vector<Window>& out) {
   out.clear();
+  // Cap hi below eof: no real position is ever eof, so nothing is lost,
+  // and the gather loops can bound-check with a bare v <= hi - an
+  // exhausted iterator (v == eof) can never pass it.
+  constexpr PosAttr::value_t kMaxPos = pos_limits::eof() - 1;
   for (const PosAttr::value_t p : lead_pos) {
     const PosAttr::value_t lo = (p > w) ? (p - w) : pos_limits::min();
-    const PosAttr::value_t hi =
-      (p > std::numeric_limits<PosAttr::value_t>::max() - w)
-        ? std::numeric_limits<PosAttr::value_t>::max()
-        : (p + w);
+    const PosAttr::value_t hi = (p > kMaxPos - w) ? kMaxPos : (p + w);
     if (!out.empty() && lo <= out.back().second) {
       // Overlaps the previous window: extend it. Forward-only seek
       // cannot re-read, so the gather windows must stay disjoint.
@@ -237,188 +567,159 @@ inline void BuildWindows(const std::vector<PosAttr::value_t>& lead_pos,
   }
 }
 
-template<typename Mask>
-inline void RunForLead(
-  const std::vector<std::vector<PosAttr::value_t>>& slot_pos,
-  PosAttr::value_t slop, const std::vector<PosAttr::value_t>& expected_steps,
-  const std::vector<PosAttr::value_t>& window_positions, unsigned p0_bit,
-  LeadScratch<Mask>& scratch, DpResult& res, bool early_exit) {
-  const size_t n = slot_pos.size();
-  const size_t Wsize = window_positions.size();
+// A single enumerated valid tuple, recording leftmost and rightmost
+// position with their originating slot indices (used to look up
+// OffsAttr from per-slot materialized offset arrays).
+struct EnumeratedMatch {
+  PosAttr::value_t leftmost;
+  PosAttr::value_t rightmost;
+  uint32_t leftmost_slot;
+  uint32_t rightmost_slot;
+};
 
-  auto& slot_bits = scratch.slot_bits;
-  auto& slot_pos_in_win = scratch.slot_pos_in_win;
-  slot_bits.resize(n);
-  slot_pos_in_win.resize(n);
-  const PosAttr::value_t win_lo = window_positions.front();
-  const PosAttr::value_t win_hi = window_positions.back();
-  for (size_t i = 0; i < n; ++i) {
-    const auto& sp = slot_pos[i];
-    auto begin = std::lower_bound(sp.begin(), sp.end(), win_lo);
-    auto end = std::upper_bound(sp.begin(), sp.end(), win_hi);
-    slot_bits[i].clear();
-    slot_pos_in_win[i].clear();
-    slot_bits[i].reserve(static_cast<size_t>(end - begin));
-    slot_pos_in_win[i].reserve(static_cast<size_t>(end - begin));
-    for (auto it = begin; it != end; ++it) {
-      auto wit =
-        std::lower_bound(window_positions.begin(), window_positions.end(), *it);
-      slot_bits[i].push_back(
-        static_cast<unsigned>(wit - window_positions.begin()));
-      slot_pos_in_win[i].push_back(*it);
-    }
+// Gate for the duplicate-position check: true when groups are absent
+// (variadic / opt-out; the check is then global) or when some group
+// holds two or more slots (the check is then scoped per group, see
+// CountFromAnchor). ES-verified rule: uniqueness applies only between
+// slots of one group (a connectivity component of query term sets);
+// slots of different groups may share a position, the delta-0 step
+// costing 1 via StepCost, so excluded at slop 0.
+inline bool EnforceUniqueness(const std::vector<uint32_t>& groups) noexcept {
+  if (groups.empty()) {
+    return true;
   }
-
-  auto& prev_layer = scratch.prev_layer;
-  auto& cur_layer = scratch.cur_layer;
-  if (prev_layer.size() < Wsize) {
-    prev_layer.resize(Wsize);
-  }
-  if (cur_layer.size() < Wsize) {
-    cur_layer.resize(Wsize);
-  }
-  for (size_t b = 0; b < Wsize; ++b) {
-    prev_layer[b].clear();
-  }
-
-  Mask init_mask;
-  init_mask.Set(p0_bit);
-  prev_layer[p0_bit].push_back({0, init_mask, 1});
-
-  auto add_or_insert = [](std::vector<DpEntry<Mask>>& bucket,
-                          PosAttr::value_t cost, const Mask& mask,
-                          uint64_t count) {
-    for (auto& e : bucket) {
-      if (e.cost == cost && e.mask == mask) {
-        e.count += count;
-        return;
-      }
-    }
-    bucket.push_back({cost, mask, count});
-  };
-
-  for (size_t i = 1; i < n; ++i) {
-    const PosAttr::value_t expected = expected_steps[i - 1];
-    for (size_t b = 0; b < Wsize; ++b) {
-      cur_layer[b].clear();
-    }
-    for (unsigned p_prev_bit = 0; p_prev_bit < Wsize; ++p_prev_bit) {
-      const auto& prev_bucket = prev_layer[p_prev_bit];
-      if (prev_bucket.empty()) {
-        continue;
-      }
-      const PosAttr::value_t p_prev = window_positions[p_prev_bit];
-      const auto& bits_i = slot_bits[i];
-      const auto& pos_i = slot_pos_in_win[i];
-      for (size_t k = 0; k < bits_i.size(); ++k) {
-        const unsigned p_bit = bits_i[k];
-        const PosAttr::value_t p = pos_i[k];
-        const int64_t delta =
-          static_cast<int64_t>(p) - static_cast<int64_t>(p_prev);
-        const PosAttr::value_t step = StepCost(delta, expected);
-        for (const auto& e : prev_bucket) {
-          const PosAttr::value_t new_cost = e.cost + step;
-          if (new_cost > slop) {
-            continue;
-          }
-          if (e.mask.Test(p_bit)) {
-            continue;
-          }
-          Mask new_mask = e.mask;
-          new_mask.Set(p_bit);
-          add_or_insert(cur_layer[p_bit], new_cost, new_mask, e.count);
-        }
-      }
-    }
-    std::swap(prev_layer, cur_layer);
-    if (early_exit && i == n - 1) {
-      for (size_t b = 0; b < Wsize; ++b) {
-        if (!prev_layer[b].empty()) {
-          res.any = true;
-          return;
-        }
+  for (size_t a = 0; a < groups.size(); ++a) {
+    for (size_t b = a + 1; b < groups.size(); ++b) {
+      if (groups[a] == groups[b]) {
+        return true;
       }
     }
   }
-
-  for (size_t b = 0; b < Wsize; ++b) {
-    for (const auto& e : prev_layer[b]) {
-      res.freq += e.count;
-      if (!res.any || e.cost < res.best_distance) {
-        res.best_distance = e.cost;
-      }
-      res.any = true;
-    }
-  }
+  return false;
 }
 
-// Counts a single lead's valid tuples and accumulates freq +
-// best_distance into 'res'. Used when the window exceeds
-// kMaxWindowPositions and the bitmask DP cannot run. Mirrors
-// DfsEnumerate's pruning so the reported frequency matches
-// EnumerateAll's tuple count. Stops at the first tuple under
-// early_exit.
-inline void CountFromLead(
+// Counts one anchor position's valid tuples into 'res' (freq +
+// best_distance); Run calls it per anchor position. With 'out' non-null the
+// completed chain is also emitted as one EnumeratedMatch per tuple, so
+// res.freq == out->size() by construction. early_exit stops at the first
+// tuple (never combined with 'out').
+// With enforce_uniqueness a candidate position is rejected when an
+// already-placed slot of the SAME group sits on it; empty groups widen
+// the check to all placed slots (strict global).
+inline void CountFromAnchor(
   const std::vector<std::vector<PosAttr::value_t>>& slots,
   PosAttr::value_t slop, const std::vector<PosAttr::value_t>& expected_steps,
-  std::vector<PosAttr::value_t>& chain, size_t i, PosAttr::value_t cost_so_far,
-  DpResult& res, bool early_exit) {
+  std::vector<PosAttr::value_t>& chain, const std::vector<uint32_t>& order,
+  uint32_t anchor, size_t d, PosAttr::value_t cost_so_far, DpResult& res,
+  bool early_exit, const std::vector<uint32_t>& groups, bool enforce_uniqueness,
+  std::vector<EnumeratedMatch>* out) {
   const size_t n = slots.size();
-  if (i == n) {
+  if (d == n) {
     ++res.freq;
     if (!res.any || cost_so_far < res.best_distance) {
       res.best_distance = cost_so_far;
     }
     res.any = true;
+    if (out) {
+      PosAttr::value_t lp = chain[0];
+      PosAttr::value_t rp = chain[0];
+      uint32_t ls = 0;
+      uint32_t rs = 0;
+      for (size_t k = 1; k < n; ++k) {
+        if (chain[k] < lp) {
+          lp = chain[k];
+          ls = static_cast<uint32_t>(k);
+        }
+        if (chain[k] > rp) {
+          rp = chain[k];
+          rs = static_cast<uint32_t>(k);
+        }
+      }
+      out->push_back({lp, rp, ls, rs});
+    }
     return;
   }
-  const PosAttr::value_t prev = chain[i - 1];
+
+  constexpr PosAttr::value_t kMax =
+    std::numeric_limits<PosAttr::value_t>::max();
+
+  const uint32_t slot = order[d];
+  // Phrase-adjacent partner and the pair's expected step. Rightward slots
+  // pair with slot-1, leftward with slot+1; `forward` picks the sign so the
+  // delta is always in phrase order.
+  const bool forward = slot > anchor;
+  const uint32_t partner = forward ? slot - 1 : slot + 1;
+  const PosAttr::value_t expected =
+    forward ? expected_steps[slot - 1] : expected_steps[slot];
+  const PosAttr::value_t pv = chain[partner];
+
   const PosAttr::value_t budget = slop - cost_so_far;
-  const PosAttr::value_t expected = expected_steps[i - 1];
   const PosAttr::value_t span = budget + 1;
-  const PosAttr::value_t exp_plus = expected + span;
-  const PosAttr::value_t exp_target =
-    (prev > std::numeric_limits<PosAttr::value_t>::max() - expected)
-      ? std::numeric_limits<PosAttr::value_t>::max()
-      : prev + expected;
-  const PosAttr::value_t lo = (exp_target > span) ? exp_target - span : 0;
-  const PosAttr::value_t hi =
-    (prev > std::numeric_limits<PosAttr::value_t>::max() - exp_plus)
-      ? std::numeric_limits<PosAttr::value_t>::max()
-      : prev + exp_plus;
-  const auto& sp = slots[i];
+
+  // Loose [lo, hi] superset of positions whose StepCost can still fit the
+  // remaining budget; centred on pv + expected (forward) or pv - expected
+  // (backward). The exact StepCost check below does the real pruning.
+  PosAttr::value_t lo;
+  PosAttr::value_t hi;
+  if (forward) {
+    const PosAttr::value_t center =
+      (pv > kMax - expected) ? kMax : pv + expected;
+    lo = (center > span) ? static_cast<PosAttr::value_t>(center - span) : 0;
+    hi = (center > kMax - span) ? kMax
+                                : static_cast<PosAttr::value_t>(center + span);
+  } else {
+    const PosAttr::value_t center =
+      (pv > expected) ? static_cast<PosAttr::value_t>(pv - expected) : 0;
+    lo = (center > span) ? static_cast<PosAttr::value_t>(center - span) : 0;
+    hi = (center > kMax - span) ? kMax
+                                : static_cast<PosAttr::value_t>(center + span);
+  }
+
+  const auto& sp = slots[slot];
   auto begin = std::lower_bound(sp.begin(), sp.end(), lo);
   auto end = std::upper_bound(sp.begin(), sp.end(), hi);
   for (auto it = begin; it != end; ++it) {
     const PosAttr::value_t p = *it;
-    bool dup = false;
-    for (size_t k = 0; k < i; ++k) {
-      if (chain[k] == p) {
-        dup = true;
-        break;
+    if (enforce_uniqueness) {
+      bool dup = false;
+      for (size_t k = 0; k < d; ++k) {
+        if (chain[order[k]] == p &&
+            (groups.empty() || groups[order[k]] == groups[slot])) {
+          dup = true;
+          break;
+        }
+      }
+      if (dup) {
+        continue;
       }
     }
-    if (dup) {
-      continue;
-    }
-    const int64_t delta = static_cast<int64_t>(p) - static_cast<int64_t>(prev);
+    const int64_t delta =
+      forward ? static_cast<int64_t>(p) - static_cast<int64_t>(pv)
+              : static_cast<int64_t>(pv) - static_cast<int64_t>(p);
     const PosAttr::value_t step = StepCost(delta, expected);
     if (cost_so_far + step > slop) {
       continue;
     }
-    chain[i] = p;
-    CountFromLead(slots, slop, expected_steps, chain, i + 1, cost_so_far + step,
-                  res, early_exit);
+    chain[slot] = p;
+    CountFromAnchor(slots, slop, expected_steps, chain, order, anchor, d + 1,
+                    static_cast<PosAttr::value_t>(cost_so_far + step), res,
+                    early_exit, groups, enforce_uniqueness, out);
     if (early_exit && res.any) {
       return;
     }
   }
 }
 
-inline DpResult Run(const std::vector<std::vector<PosAttr::value_t>>& slot_pos,
-                    PosAttr::value_t slop,
-                    const std::vector<PosAttr::value_t>& expected_steps,
-                    DpScratch& scratch, bool early_exit) {
+SLOP_PROF_NOINLINE inline DpResult Run(
+  const std::vector<std::vector<PosAttr::value_t>>& slot_pos,
+  PosAttr::value_t slop, const std::vector<PosAttr::value_t>& expected_steps,
+  DpScratch& scratch, bool early_exit, const std::vector<uint32_t>& groups = {},
+  std::vector<EnumeratedMatch>* out = nullptr) {
+  // A collector implies a full count; early exit would truncate it.
+  SDB_ASSERT(!(early_exit && out));
+  if (out) {
+    out->clear();
+  }
   DpResult res{};
   const size_t n = slot_pos.size();
   if (n < 2) {
@@ -430,176 +731,67 @@ inline DpResult Run(const std::vector<std::vector<PosAttr::value_t>>& slot_pos,
     }
   }
   SDB_ASSERT(expected_steps.size() == n - 1);
+  SDB_ASSERT(groups.empty() || groups.size() == n);
 
-  // Window half-width: bounded by slop + sum_expected
-  // (StepCost invariant |delta_i| <= cost_i + expected_i).
-  PosAttr::value_t sum_expected = 0;
-  for (auto e : expected_steps) {
-    sum_expected += e;
+  const bool enforce_uniqueness = EnforceUniqueness(groups);
+
+  // Anchor at the rarest slot: iterating the fewest anchor positions
+  // minimizes window searches, and lets n >= 3 phrases lead from the rarest
+  // slot rather than slot 0 (a win on dense-slot0 phrases like "the european
+  // union"). Step cost sums over phrase-adjacent pairs regardless of which
+  // slot leads, so freq and best_distance are unchanged.
+  uint32_t anchor = 0;
+  for (uint32_t i = 1; i < n; ++i) {
+    if (slot_pos[i].size() < slot_pos[anchor].size()) {
+      anchor = i;
+    }
   }
-  const PosAttr::value_t W = slop + sum_expected;
-  auto& window_positions = scratch.window_positions;
 
-  for (PosAttr::value_t p0 : slot_pos[0]) {
-    const PosAttr::value_t win_lo = (p0 > W) ? (p0 - W) : 0;
-    const PosAttr::value_t win_hi =
-      (p0 > std::numeric_limits<PosAttr::value_t>::max() - W)
-        ? std::numeric_limits<PosAttr::value_t>::max()
-        : (p0 + W);
-    window_positions.clear();
-    for (const auto& sp : slot_pos) {
-      auto begin = std::lower_bound(sp.begin(), sp.end(), win_lo);
-      auto end = std::upper_bound(sp.begin(), sp.end(), win_hi);
-      window_positions.insert(window_positions.end(), begin, end);
-    }
-    std::sort(window_positions.begin(), window_positions.end());
-    window_positions.erase(
-      std::unique(window_positions.begin(), window_positions.end()),
-      window_positions.end());
+  // Visitation order: anchor, then rightward r+1..n-1, then leftward r-1..0.
+  auto& order = scratch.order;
+  order.resize(n);
+  size_t idx = 0;
+  order[idx++] = anchor;
+  for (uint32_t s = anchor + 1; s < n; ++s) {
+    order[idx++] = s;
+  }
+  for (uint32_t s = anchor; s-- > 0;) {
+    order[idx++] = s;
+  }
+  SDB_ASSERT(idx == n);
 
-    auto p0_it =
-      std::lower_bound(window_positions.begin(), window_positions.end(), p0);
-    const unsigned p0_bit =
-      static_cast<unsigned>(p0_it - window_positions.begin());
-
-    if (window_positions.size() <= 64) {
-      RunForLead<Mask64>(slot_pos, slop, expected_steps, window_positions,
-                         p0_bit, scratch.lead64, res, early_exit);
-    } else if (window_positions.size() <= kMaxWindowPositions) {
-      RunForLead<Mask128>(slot_pos, slop, expected_steps, window_positions,
-                          p0_bit, scratch.lead128, res, early_exit);
-    } else {
-      // Window too wide for the bitmask DP: enumerate this lead's valid
-      // tuples directly so freq/best_distance stay correct instead of
-      // dropping the lead.
-      auto& chain = scratch.chain;
-      chain.resize(n);
-      chain[0] = p0;
-      CountFromLead(slot_pos, slop, expected_steps, chain, 1, 0, res,
-                    early_exit);
-    }
-
+  auto& chain = scratch.chain;
+  chain.resize(n);
+  for (PosAttr::value_t pa : slot_pos[anchor]) {
+    chain[anchor] = pa;
+    CountFromAnchor(slot_pos, slop, expected_steps, chain, order, anchor, 1, 0,
+                    res, early_exit, groups, enforce_uniqueness, out);
     if (early_exit && res.any) {
       return res;
     }
   }
 
+  if (out) {
+    // Anchor order is not document order; emit matches sorted by
+    // leftmost position (full tuple compare keeps ties deterministic).
+    std::sort(out->begin(), out->end(),
+              [](const EnumeratedMatch& a, const EnumeratedMatch& b) noexcept {
+                return std::tie(a.leftmost, a.rightmost, a.leftmost_slot,
+                                a.rightmost_slot) <
+                       std::tie(b.leftmost, b.rightmost, b.leftmost_slot,
+                                b.rightmost_slot);
+              });
+  }
   return res;
-}
-
-// A single enumerated valid tuple, recording leftmost and rightmost
-// position with their originating slot indices (used to look up
-// OffsAttr from per-slot materialized offset arrays).
-struct EnumeratedMatch {
-  PosAttr::value_t leftmost;
-  PosAttr::value_t rightmost;
-  uint32_t leftmost_slot;
-  uint32_t rightmost_slot;
-};
-
-// DFS over all valid n-tuples, one EnumeratedMatch per tuple, sorted
-// by leftmost position ascending. Pruned by the same budget and
-// uniqueness checks as the DP pass.
-inline void DfsEnumerate(
-  const std::vector<std::vector<PosAttr::value_t>>& slots,
-  PosAttr::value_t slop, const std::vector<PosAttr::value_t>& expected_steps,
-  std::vector<PosAttr::value_t>& chain, size_t i, PosAttr::value_t cost_so_far,
-  std::vector<EnumeratedMatch>& out) {
-  const size_t n = slots.size();
-  if (i == n) {
-    PosAttr::value_t lp = chain[0], rp = chain[0];
-    uint32_t ls = 0, rs = 0;
-    for (size_t k = 1; k < n; ++k) {
-      if (chain[k] < lp) {
-        lp = chain[k];
-        ls = static_cast<uint32_t>(k);
-      }
-      if (chain[k] > rp) {
-        rp = chain[k];
-        rs = static_cast<uint32_t>(k);
-      }
-    }
-    out.push_back({lp, rp, ls, rs});
-    return;
-  }
-  const PosAttr::value_t prev = chain[i - 1];
-  const PosAttr::value_t budget = slop - cost_so_far;
-  const PosAttr::value_t expected = expected_steps[i - 1];
-  // Candidate window for p with +1 slack each side; out-of-range
-  // drops via the StepCost check below.
-  const PosAttr::value_t span = budget + 1;
-  const PosAttr::value_t exp_plus = expected + span;
-  const PosAttr::value_t exp_target =
-    (prev > std::numeric_limits<PosAttr::value_t>::max() - expected)
-      ? std::numeric_limits<PosAttr::value_t>::max()
-      : prev + expected;
-  const PosAttr::value_t lo = (exp_target > span) ? exp_target - span : 0;
-  const PosAttr::value_t hi =
-    (prev > std::numeric_limits<PosAttr::value_t>::max() - exp_plus)
-      ? std::numeric_limits<PosAttr::value_t>::max()
-      : prev + exp_plus;
-  const auto& sp = slots[i];
-  auto begin = std::lower_bound(sp.begin(), sp.end(), lo);
-  auto end = std::upper_bound(sp.begin(), sp.end(), hi);
-  for (auto it = begin; it != end; ++it) {
-    const PosAttr::value_t p = *it;
-    bool dup = false;
-    for (size_t k = 0; k < i; ++k) {
-      if (chain[k] == p) {
-        dup = true;
-        break;
-      }
-    }
-    if (dup) {
-      continue;
-    }
-    const int64_t delta = static_cast<int64_t>(p) - static_cast<int64_t>(prev);
-    const PosAttr::value_t step = StepCost(delta, expected);
-    if (cost_so_far + step > slop) {
-      continue;
-    }
-    chain[i] = p;
-    DfsEnumerate(slots, slop, expected_steps, chain, i + 1, cost_so_far + step,
-                 out);
-  }
-}
-
-inline std::vector<EnumeratedMatch> EnumerateAll(
-  const std::vector<std::vector<PosAttr::value_t>>& slots,
-  PosAttr::value_t slop, const std::vector<PosAttr::value_t>& expected_steps) {
-  std::vector<EnumeratedMatch> out;
-  const size_t n = slots.size();
-  if (n < 2) {
-    return out;
-  }
-  for (const auto& sp : slots) {
-    if (sp.empty()) {
-      return out;
-    }
-  }
-  SDB_ASSERT(expected_steps.size() == n - 1);
-  std::vector<PosAttr::value_t> chain(n);
-  for (PosAttr::value_t p0 : slots[0]) {
-    chain[0] = p0;
-    DfsEnumerate(slots, slop, expected_steps, chain, 1, 0, out);
-  }
-  std::sort(out.begin(), out.end(),
-            [](const EnumeratedMatch& a, const EnumeratedMatch& b) {
-              return a.leftmost < b.leftmost;
-            });
-  return out;
 }
 
 }  // namespace detail::slop_dp
 
-// Replaces SlopPhraseFrequency. Template parameters:
-//   Offs    - collect OffsAttr and emit per-match offsets through
-//             PhrasePosition iteration.
-//   HasFreq - compute exact freq + best_distance. When false, the DP
-//             early-exits on the first valid tuple and freq is set
-//             to 1 to signal a match.
-// kHasBoost = HasFreq follows the original convention.
-// document.
+// Replaces SlopPhraseFrequency. Offs collects OffsAttr and emits per-match
+// offsets through PhrasePosition iteration. HasFreq computes exact freq +
+// best_distance; when false the DP early-exits on the first valid tuple and
+// sets freq to 1 to signal a match. kHasBoost = HasFreq, per the original
+// convention.
 template<bool Offs, bool HasFreq>
 class SlopPhraseFrequencyDP {
  public:
@@ -637,33 +829,63 @@ class SlopPhraseFrequencyDP {
     const size_t n = _pos.size();
     // Reuse inner vector capacity across calls; n is fixed for the iterator.
     _slot_pos.resize(n);
-    for (auto& s : _slot_pos) {
-      s.clear();
-    }
-    if constexpr (Offs) {
-      _slot_offs.resize(n);
-      for (auto& s : _slot_offs) {
-        s.clear();
+
+    if (_term_groups.size() != n) {
+      _term_groups.clear();
+      _term_groups.reserve(n);
+      for (const auto& p : _pos) {
+        _term_groups.push_back(p.second.term_group);
       }
     }
+
+    // Two-slot phrases bypass gather + Run entirely: the fused
+    // merge-join consumes the position iterators directly.
+    if (n == 2 && !detail::slop_dp::gPairJoinDisabled) {
+      return MatchPair();
+    }
+
+    if constexpr (Offs) {
+      _slot_offs_start.resize(n);
+      _slot_offs_end.resize(n);
+    }
+
     // Per-slot gather. gather_all reads the whole posting; gather_windows
     // reads only positions inside the precomputed slop-reachable windows
-    // via forward seek. Both fill _slot_pos[i] (+ _slot_offs[i] when Offs).
+    // via forward seek. Both fill _slot_pos[i] (+ _slot_offs_start[i] /
+    // _slot_offs_end[i] when Offs); each path resets its own slot before
+    // filling it.
     const auto gather_all = [&](size_t i) {
       auto& it = *_pos[i].first;
       auto& positions = _slot_pos[i];
-      while (it.next()) {
-        const auto v = it.value();
-        if (pos_limits::eof(v)) {
-          break;
-        }
-        positions.push_back(v);
-        if constexpr (Offs) {
-          if (auto* o = irs::get<OffsAttr>(it); o) {
-            _slot_offs[i].push_back({o->start, o->end});
-          } else {
-            _slot_offs[i].push_back({0, 0});
+      // Gather is the first consumer of positions for this doc, so the
+      // whole per-doc posting is still pending and DocFreq is exact.
+      // No clear() first: resize from the previous size skips the
+      // value-initialization that a resize from zero would do, and
+      // ReadAll overwrites the slot in full anyway.
+      if constexpr (!Offs) {
+        positions.resize(it.DocFreq());
+        const auto count = it.ReadAll(positions.data());
+        SDB_ASSERT(count == positions.size());
+      } else {
+        auto& starts = _slot_offs_start[i];
+        auto& ends = _slot_offs_end[i];
+        if (detail::slop_dp::gOffsBulkGatherDisabled) [[unlikely]] {
+          positions.clear();
+          starts.clear();
+          ends.clear();
+          const OffsAttr* offs = irs::get<OffsAttr>(it);
+          while (it.next()) {
+            positions.push_back(it.value());
+            starts.push_back(offs ? offs->start : 0);
+            ends.push_back(offs ? offs->end : 0);
           }
+        } else {
+          positions.resize(it.DocFreq());
+          starts.resize(positions.size());
+          ends.resize(positions.size());
+          const auto count =
+            it.ReadAll(positions.data(), starts.data(), ends.data());
+          SDB_ASSERT(count == positions.size());
         }
       }
     };
@@ -671,16 +893,23 @@ class SlopPhraseFrequencyDP {
     const auto gather_windows = [&](size_t i) {
       auto& it = *_pos[i].first;
       auto& positions = _slot_pos[i];
+
+      positions.clear();
+      [[maybe_unused]] const OffsAttr* offs = nullptr;
+      if constexpr (Offs) {
+        _slot_offs_start[i].clear();
+        _slot_offs_end[i].clear();
+        offs = irs::get<OffsAttr>(it);
+      }
       for (const auto& [lo, hi] : _windows) {
+        // seek(lo >= min) returns a real position or eof, and hi < eof
+        // (BuildWindows caps it), so the bound check alone suffices.
         auto v = it.seek(lo);
-        while (pos_limits::valid(v) && !pos_limits::eof(v) && v <= hi) {
+        while (v <= hi) {
           positions.push_back(v);
           if constexpr (Offs) {
-            if (auto* o = irs::get<OffsAttr>(it); o) {
-              _slot_offs[i].push_back({o->start, o->end});
-            } else {
-              _slot_offs[i].push_back({0, 0});
-            }
+            _slot_offs_start[i].push_back(offs ? offs->start : 0);
+            _slot_offs_end[i].push_back(offs ? offs->end : 0);
           }
           if (!it.next()) {
             break;
@@ -737,8 +966,13 @@ class SlopPhraseFrequencyDP {
       }
     }
 
-    auto res = detail::slop_dp::Run(_slot_pos, _max_slop, _expected_steps,
-                                    _dp_scratch, /*early_exit=*/!HasFreq);
+    std::vector<detail::slop_dp::EnumeratedMatch>* collect = nullptr;
+    if constexpr (Offs && HasFreq) {
+      collect = &_enumerated;
+    }
+    auto res =
+      detail::slop_dp::Run(_slot_pos, _max_slop, _expected_steps, _dp_scratch,
+                           /*early_exit=*/!HasFreq, _term_groups, collect);
     if (!res.any) {
       return false;
     }
@@ -783,7 +1017,7 @@ class SlopPhraseFrequencyDP {
   // false on the following call).
   uint32_t NextPosition() {
     if constexpr (!Offs || !HasFreq) {
-      // Filter-only or no-offsets path: single emission, prior behavior.
+      // filter-only or no-offsets path: single emission
       return 0;
     } else {
       if (_match_idx >= _matches.size()) {
@@ -796,29 +1030,79 @@ class SlopPhraseFrequencyDP {
     }
   }
 
-  // Enumerate all valid tuples, resolve their leftmost/rightmost
-  // OffsAttr, and pre-load match #0 into _start_offset/_end_offset.
+  // n == 2 path: runs JoinPair over the two position iterators and maps its
+  // result onto the generic outputs (_phrase_freq, _best_distance, _matches).
+  // Anchor = rarer slot by per-doc DocFreq; ties keep slot 0, as Run does.
+  bool MatchPair() {
+    const bool anchor_is_slot0 =
+      _pos[0].first->DocFreq() <= _pos[1].first->DocFreq();
+    auto& anchor = *_pos[anchor_is_slot0 ? 0 : 1].first;
+    auto& partner = *_pos[anchor_is_slot0 ? 1 : 0].first;
+
+    const OffsAttr* anchor_offs = nullptr;
+    const OffsAttr* partner_offs = nullptr;
+    if constexpr (Offs) {
+      anchor_offs = irs::get<OffsAttr>(anchor);
+      partner_offs = irs::get<OffsAttr>(partner);
+    }
+
+    std::vector<detail::slop_dp::PairMatch>* collect = nullptr;
+    if constexpr (Offs && HasFreq) {
+      collect = &_pair_matches;
+    }
+
+    const auto res = detail::slop_dp::JoinPair<Offs, HasFreq>(
+      anchor, partner, anchor_offs, partner_offs, anchor_is_slot0, _max_slop,
+      _expected_steps[0], detail::slop_dp::EnforceUniqueness(_term_groups),
+      _pair_scratch, collect);
+    if (!res.any) {
+      return false;
+    }
+
+    if constexpr (HasFreq) {
+      _phrase_freq = static_cast<uint32_t>(res.freq);
+      _best_distance = res.best_distance;
+      if constexpr (Offs) {
+        // Same single-pass invariant as the generic path: the join
+        // emits exactly one PairMatch per counted pair.
+        SDB_ASSERT(static_cast<uint32_t>(_pair_matches.size()) == _phrase_freq);
+        _matches.reserve(_pair_matches.size());
+        for (const auto& m : _pair_matches) {
+          _matches.push_back({m.start_offset, m.end_offset});
+        }
+        if (!_matches.empty()) {
+          _start_offset = _matches[0].start;
+          _end_offset = _matches[0].end;
+          _match_idx = 1;
+        }
+      }
+    } else {
+      _phrase_freq = 1;
+    }
+    return true;
+  }
+
+  // Resolve leftmost/rightmost OffsAttr for the matcher-collected tuples and
+  // pre-load match #0. The collector ran inside the same DFS that produced
+  // _phrase_freq, so the assert is a cheap check of that invariant.
   void BuildMatches() {
     if constexpr (!Offs || !HasFreq) {
       return;
     }
-    auto enumerated =
-      detail::slop_dp::EnumerateAll(_slot_pos, _max_slop, _expected_steps);
-    // DP-reported freq must match enumeration count exactly.
-    SDB_ASSERT(static_cast<uint32_t>(enumerated.size()) == _phrase_freq);
+    SDB_ASSERT(static_cast<uint32_t>(_enumerated.size()) == _phrase_freq);
     _matches.clear();
-    _matches.reserve(enumerated.size());
+    _matches.reserve(_enumerated.size());
     auto find_index = [&](size_t slot, PosAttr::value_t p) -> size_t {
       const auto& sp = _slot_pos[slot];
       auto it = std::lower_bound(sp.begin(), sp.end(), p);
       SDB_ASSERT(it != sp.end() && *it == p);
       return static_cast<size_t>(it - sp.begin());
     };
-    for (const auto& m : enumerated) {
+    for (const auto& m : _enumerated) {
       const size_t li = find_index(m.leftmost_slot, m.leftmost);
       const size_t ri = find_index(m.rightmost_slot, m.rightmost);
-      _matches.push_back({_slot_offs[m.leftmost_slot][li].start,
-                          _slot_offs[m.rightmost_slot][ri].end});
+      _matches.push_back({_slot_offs_start[m.leftmost_slot][li],
+                          _slot_offs_end[m.rightmost_slot][ri]});
     }
     if (!_matches.empty()) {
       _start_offset = _matches[0].start;
@@ -833,23 +1117,31 @@ class SlopPhraseFrequencyDP {
   // Window half-width slop + sum(expected_steps); cached for gather.
   PosAttr::value_t _window_half = 0;
   std::vector<std::vector<PosAttr::value_t>> _slot_pos;
-  std::vector<std::vector<OffsetPair>> _slot_offs;
+  // Per-slot offsets, parallel to _slot_pos, stored as separate start/end
+  // arrays so the bulk ReadAll overload can fill them directly.
+  std::vector<std::vector<uint32_t>> _slot_offs_start;
+  std::vector<std::vector<uint32_t>> _slot_offs_end;
   // Merged slop-reachable windows around the rarest slot's positions
-  // (filled only on the seek-gather path). Reused across Match() calls.
+  // (seek-gather path only). These scratch members are reused across Match().
   std::vector<detail::slop_dp::Window> _windows;
-  // Reused across Match() calls to keep the DP off the allocator on
-  // the hot path.
+  // DP scratch, kept off the allocator on the hot path.
   detail::slop_dp::DpScratch _dp_scratch;
-  // All emitted matches (filled only when Offs && HasFreq). Sorted
-  // by leftmost position. Each entry holds the start offset of the
-  // leftmost token and the end offset of the rightmost token of the
-  // corresponding valid tuple.
+  // Valid tuples from the matcher pass, sorted by leftmost (Offs && HasFreq
+  // only); source for BuildMatches.
+  std::vector<detail::slop_dp::EnumeratedMatch> _enumerated;
+  // n == 2 fused merge-join state.
+  detail::slop_dp::PairScratch _pair_scratch;
+  std::vector<detail::slop_dp::PairMatch> _pair_matches;
+  // All emitted matches (Offs && HasFreq only), sorted by leftmost; each holds
+  // the leftmost token's start and the rightmost token's end offset.
   std::vector<OffsetPair> _matches;
   size_t _match_idx = 0;
   uint32_t _phrase_freq = 0;
   PosAttr::value_t _best_distance = 0;
   uint32_t _start_offset{0};
   uint32_t _end_offset{0};
+
+  std::vector<uint32_t> _term_groups;
 };
 
 // Variadic sloppy phrase frequency. Replaces SlopVariadicPhraseFrequency.
@@ -888,6 +1180,21 @@ class SlopVariadicPhraseFrequencyDP {
     }
 
     const size_t n = _pos.size();
+
+    if (_term_groups.size() != n) {
+      _term_groups.clear();
+      _term_groups.reserve(n);
+      for (const auto& p : _pos) {
+        _term_groups.push_back(p.second.term_group);
+      }
+    }
+
+    // Two-slot phrases bypass gather + Run entirely: the fused merge-join
+    // consumes the merged per-slot position streams directly.
+    if (n == 2 && !detail::slop_dp::gPairJoinDisabled) {
+      return MatchPair();
+    }
+
     // Reuse inner vectors' capacity (see SlopPhraseFrequencyDP::Match)
     _slot_pos.resize(n);
     for (auto& s : _slot_pos) {
@@ -936,12 +1243,10 @@ class SlopVariadicPhraseFrequencyDP {
       return finalize_slot(i);
     };
 
-    // Variadic has no exact per-doc position count on the compound
-    // iterator, so the rarest slot is picked by the disjunction's
-    // doc-level cost estimate. This only steers which slot leads the
-    // gather (perf), never correctness. TODO(perf): a per-doc count via
-    // a DocFreq-summing visit pass would gate more precisely; deferred
-    // to the measurement phase.
+    // No exact per-doc position count on the compound iterator, so the rarest
+    // slot is picked by the disjunction's doc-level cost estimate. Steers
+    // which slot leads the gather (perf), never correctness. TODO(perf): a
+    // per-doc DocFreq-summing pass would gate more precisely; deferred.
     size_t rare = 0;
     uint64_t min_cost = std::numeric_limits<uint64_t>::max();
     uint64_t max_cost = 0;
@@ -979,8 +1284,16 @@ class SlopVariadicPhraseFrequencyDP {
       }
     }
 
-    auto res = detail::slop_dp::Run(_slot_pos, _max_slop, _expected_steps,
-                                    _dp_scratch, /*early_exit=*/!HasFreq);
+    // Uniqueness is scoped to slot groups: connectivity components of the
+    // per-segment query term sets, computed at prepare-collect and carried
+    // in TermInterval::term_group (ES-verified rule).
+    std::vector<detail::slop_dp::EnumeratedMatch>* collect = nullptr;
+    if constexpr (kHasOffsets && HasFreq) {
+      collect = &_enumerated;
+    }
+    auto res =
+      detail::slop_dp::Run(_slot_pos, _max_slop, _expected_steps, _dp_scratch,
+                           /*early_exit=*/!HasFreq, _term_groups, collect);
     if (!res.any) {
       return false;
     }
@@ -1060,6 +1373,50 @@ class SlopVariadicPhraseFrequencyDP {
     return true;
   }
 
+  struct BindCtx {
+    detail::slop_dp::MergedPosStream<kHasOffsets>* stream;
+  };
+
+  // Registers one sub-iterator of the current document into the slot's
+  // merged stream (n == 2 join path).
+  static bool BindOneSubIter(void* ctx, Adapter& adapter) {
+    SDB_ASSERT(ctx);
+    auto& c = *reinterpret_cast<BindCtx*>(ctx);
+    auto* p = adapter.position;
+    if (!p) {
+      return true;
+    }
+    const OffsAttr* offs = nullptr;
+    if constexpr (kHasOffsets) {
+      offs = adapter.offset;
+    }
+    c.stream->Add(p, offs);
+    return true;
+  }
+
+  struct SoloCtx {
+    PosAttr* pos{nullptr};
+    const OffsAttr* offs{nullptr};
+    uint32_t count{0};
+  };
+
+  // Counts the current document's sub-iterators and captures the last one.
+  // A slot with exactly one sub feeds JoinPair its raw position iterator;
+  // the merged-stream layer only pays off when there is something to merge.
+  static bool CaptureSoloSubIter(void* ctx, Adapter& adapter) {
+    SDB_ASSERT(ctx);
+    auto& c = *reinterpret_cast<SoloCtx*>(ctx);
+    if (!adapter.position) {
+      return true;
+    }
+    ++c.count;
+    c.pos = adapter.position;
+    if constexpr (kHasOffsets) {
+      c.offs = adapter.offset;
+    }
+    return true;
+  }
+
   struct WindowCtx {
     std::vector<PosEntry>* out;
     const std::vector<detail::slop_dp::Window>* windows;
@@ -1083,8 +1440,9 @@ class SlopVariadicPhraseFrequencyDP {
     }
     p->reset();
     for (const auto& [lo, hi] : *c.windows) {
+      // Same bound-only check as the fixed gather_windows: hi < eof.
       auto v = p->seek(lo);
-      while (pos_limits::valid(v) && !pos_limits::eof(v) && v <= hi) {
+      while (v <= hi) {
         PosEntry e{.pos = v};
         if constexpr (kHasOffsets) {
           if (offs) {
@@ -1094,7 +1452,6 @@ class SlopVariadicPhraseFrequencyDP {
         }
         c.out->push_back(e);
         if (!p->next()) {
-          v = pos_limits::eof();
           break;
         }
         v = p->value();
@@ -1122,23 +1479,127 @@ class SlopVariadicPhraseFrequencyDP {
     }
   }
 
+  // n == 2 path: feeds JoinPair with the two slots' positions and maps its
+  // result onto the generic outputs (_phrase_freq, _best_distance,
+  // _matches). When both slots hold a single sub-iterator in the current
+  // document (the common real-text case), the raw position iterators go
+  // straight into the join; otherwise each slot is merged first. Anchor =
+  // rarer slot by the disjunction's doc-level cost estimate (a compound
+  // iterator has no exact per-doc count); ties keep slot 0, as Run does.
+  bool MatchPair() {
+    std::array<SoloCtx, 2> solo;
+    for (size_t i = 0; i < 2; ++i) {
+      _pos[i].first->visit(&solo[i], CaptureSoloSubIter);
+      if (solo[i].count == 0) {
+        return false;
+      }
+    }
+
+    const bool anchor_is_slot0 =
+      CostAttr::extract(*_pos[0].first) <= CostAttr::extract(*_pos[1].first);
+
+    const size_t a = anchor_is_slot0 ? 0 : 1;
+    const size_t p = a ^ 1;
+
+    // Solo slots go into the join raw; only multi-sub slots pay for the
+    // merged stream. A stream bound from count > 0 subs cannot be empty.
+    for (size_t i = 0; i < 2; ++i) {
+      if (solo[i].count == 1) {
+        solo[i].pos->reset();
+        continue;
+      }
+      auto& stream = _merged[i];
+      stream.Clear();
+      BindCtx ctx{&stream};
+      _pos[i].first->visit(&ctx, BindOneSubIter);
+      SDB_ASSERT(!stream.Empty());
+    }
+
+    const auto offs_of = [&](size_t i) -> const OffsAttr* {
+      if constexpr (kHasOffsets) {
+        return solo[i].count == 1 ? solo[i].offs : _merged[i].GetOffs();
+      } else {
+        return nullptr;
+      }
+    };
+    const OffsAttr* a_offs = offs_of(a);
+    const OffsAttr* p_offs = offs_of(p);
+
+    if (solo[a].count == 1 && solo[p].count == 1) {
+      return RunPair(*solo[a].pos, a_offs, *solo[p].pos, p_offs,
+                     anchor_is_slot0);
+    }
+    if (solo[a].count == 1) {
+      return RunPair(*solo[a].pos, a_offs, _merged[p], p_offs, anchor_is_slot0);
+    }
+    if (solo[p].count == 1) {
+      return RunPair(_merged[a], a_offs, *solo[p].pos, p_offs, anchor_is_slot0);
+    }
+    return RunPair(_merged[a], a_offs, _merged[p], p_offs, anchor_is_slot0);
+  }
+
+  std::vector<detail::slop_dp::PairMatch>* PairCollect() {
+    if constexpr (kHasOffsets && HasFreq) {
+      return &_pair_matches;
+    } else {
+      return nullptr;
+    }
+  }
+
+  // Maps a JoinPair result onto the generic outputs; shared by the raw and
+  // merged branches of MatchPair.
+  bool FinishPair(const detail::slop_dp::DpResult& res) {
+    if (!res.any) {
+      return false;
+    }
+    if constexpr (HasFreq) {
+      _phrase_freq = static_cast<uint32_t>(res.freq);
+      _best_distance = res.best_distance;
+      if constexpr (kHasOffsets) {
+        // Same single-pass invariant as the generic path: the join emits
+        // exactly one PairMatch per counted pair.
+        SDB_ASSERT(static_cast<uint32_t>(_pair_matches.size()) == _phrase_freq);
+        _matches.reserve(_pair_matches.size());
+        for (const auto& m : _pair_matches) {
+          _matches.push_back({m.start_offset, m.end_offset});
+        }
+        if (!_matches.empty()) {
+          _start_offset = _matches[0].start;
+          _end_offset = _matches[0].end;
+          _match_idx = 1;
+        }
+      }
+    } else {
+      _phrase_freq = 1;
+    }
+    return true;
+  }
+
+  template<typename AnchorIt, typename PartnerIt>
+  bool RunPair(AnchorIt& anchor, const OffsAttr* anchor_offs,
+               PartnerIt& partner, const OffsAttr* partner_offs,
+               bool anchor_is_slot0) {
+    return FinishPair(detail::slop_dp::JoinPair<kHasOffsets, HasFreq>(
+      anchor, partner, anchor_offs, partner_offs, anchor_is_slot0, _max_slop,
+      _expected_steps[0], detail::slop_dp::EnforceUniqueness(_term_groups),
+      _pair_scratch, PairCollect()));
+  }
+
   // See SlopPhraseFrequencyDP::BuildMatches
   void BuildMatches() {
     if constexpr (!kHasOffsets || !HasFreq) {
       return;
     }
-    auto enumerated =
-      detail::slop_dp::EnumerateAll(_slot_pos, _max_slop, _expected_steps);
-    SDB_ASSERT(static_cast<uint32_t>(enumerated.size()) == _phrase_freq);
+    SDB_ASSERT(static_cast<uint32_t>(_enumerated.size()) == _phrase_freq);
     _matches.clear();
-    _matches.reserve(enumerated.size());
+    _matches.reserve(_enumerated.size());
     auto find_index = [&](size_t slot, PosAttr::value_t p) -> size_t {
       const auto& sp = _slot_pos[slot];
       auto it = std::lower_bound(sp.begin(), sp.end(), p);
       SDB_ASSERT(it != sp.end() && *it == p);
       return static_cast<size_t>(it - sp.begin());
     };
-    for (const auto& m : enumerated) {
+    for (const auto& m : _enumerated) {
       const size_t li = find_index(m.leftmost_slot, m.leftmost);
       const size_t ri = find_index(m.rightmost_slot, m.rightmost);
       _matches.push_back({_slot_offs[m.leftmost_slot][li].start,
@@ -1160,17 +1621,24 @@ class SlopVariadicPhraseFrequencyDP {
   std::vector<std::vector<OffsetPair>> _slot_offs;
   std::vector<PosEntry> _scratch_entries;
   // Merged slop-reachable windows around the rarest slot's positions
-  // (filled only on the seek-gather path). Reused across Match() calls.
+  // (seek-gather path only). These scratch members are reused across Match().
   std::vector<detail::slop_dp::Window> _windows;
-  // Reused across Match() calls to keep the DP off the allocator on
-  // the hot path.
+  // DP scratch, kept off the allocator on the hot path.
   detail::slop_dp::DpScratch _dp_scratch;
+  // Valid tuples from the matcher pass, sorted by leftmost (kHasOffsets &&
+  // HasFreq only).
+  std::vector<detail::slop_dp::EnumeratedMatch> _enumerated;
+  // n == 2 fused merge-join state.
+  std::array<detail::slop_dp::MergedPosStream<kHasOffsets>, 2> _merged;
+  detail::slop_dp::PairScratch _pair_scratch;
+  std::vector<detail::slop_dp::PairMatch> _pair_matches;
   std::vector<OffsetPair> _matches;
   size_t _match_idx = 0;
   uint32_t _phrase_freq = 0;
   PosAttr::value_t _best_distance = 0;
   uint32_t _start_offset{0};
   uint32_t _end_offset{0};
+  std::vector<uint32_t> _term_groups;
 };
 
 }  // namespace irs

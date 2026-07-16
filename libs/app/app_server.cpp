@@ -24,10 +24,13 @@
 #include <absl/flags/usage.h>
 #include <absl/flags/usage_config.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 
 #include "basics/lifecycle.h"
 #include "basics/log.h"
+#include "basics/signals.h"
 
 namespace sdb::app {
 
@@ -45,11 +48,10 @@ void AppServer::parseOptions(int argc, char* argv[]) {
     };
     static constexpr CategoryRule kRules[] = {
       {"server/rest_server/database_path_feature.cpp", "server"},
-      {"server/rest_server/endpoint_feature.cpp", "server"},
-      {"server/general_server/scheduler_feature.cpp", "server"},
       {"server/storage_engine/search_engine.cpp", "server"},
-      {"server/general_server/general_server_feature.cpp", "http"},
-      {"server/general_server/ssl_server_feature.cpp", "ssl"},
+      {"server/network/server.cpp", "server"},
+      {"server/query/server_engine.cpp", "server"},
+      {"server/scheduler/background_scheduler.cpp", "server"},
       {"libs/basics/log_flags.cpp", "log"},
     };
     for (const auto& [suffix, category] : kRules) {
@@ -92,11 +94,16 @@ void AppServer::parseOptions(int argc, char* argv[]) {
   if (positionals.size() == 2) {
     lifecycle::SetDataDirArg(positionals[1]);
   } else if (positionals.size() > 2) {
-    SDB_FATAL(GENERAL, "expected at most one positional data-dir arg");
+    // Runs before the DuckDB-backed log is up (SDB_* would crash), so report
+    // this CLI usage error straight to stderr, like absl's own flag errors.
+    std::fputs("serened: expected at most one positional data-dir arg\n",
+               stderr);
+    FatalErrorExit();
   }
 }
 
 void AppServer::wait() {
+  signals::InstallShutdownHandlers();
   lifecycle::WaitForShutdown();
   SDB_INFO(GENERAL, "received shutdown signal, beginning shut down sequence");
 }

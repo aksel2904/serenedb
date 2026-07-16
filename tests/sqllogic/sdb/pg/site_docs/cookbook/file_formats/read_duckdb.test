@@ -1,0 +1,204 @@
+control substitution on
+
+# DOCS_TEST: example_001
+
+statement ok
+DETACH IF EXISTS db1;
+
+statement ok
+ATTACH '${__TEST_DIR__}/db1.duckdb' AS db1;
+
+statement ok
+DROP TABLE IF EXISTS db1.region;
+
+statement ok
+CREATE TABLE db1.region AS SELECT * FROM (VALUES
+    (0, 'AFRICA'),
+    (1, 'AMERICA'),
+    (2, 'ASIA'),
+    (3, 'EUROPE'),
+    (4, 'MIDDLE EAST')
+) AS t(r_regionkey, r_name);
+
+statement ok
+DETACH db1;
+
+# DOCS_TEST_RAW
+#| FROM read_duckdb('path_to_database', table_name = 'table_to_read');
+
+# DOCS_TEST_BODY
+
+query
+FROM read_duckdb('${__TEST_DIR__}/db1.duckdb', table_name = 'region');
+----
+r_regionkey	r_name
+0	AFRICA
+1	AMERICA
+2	ASIA
+3	EUROPE
+4	MIDDLE EAST
+
+
+# DOCS_TEST: example_002
+
+# DOCS_TEST_RAW
+#| SELECT r_regionkey, r_name
+#| FROM read_duckdb('https://blobs.duckdb.org/data/tpch-sf10.db', table_name = 'region');
+
+# DOCS_TEST_BODY
+
+statement ok
+DETACH IF EXISTS db2;
+
+statement ok
+ATTACH '${__TEST_DIR__}/db2.duckdb' AS db2;
+
+statement ok
+DROP TABLE IF EXISTS db2.region;
+
+statement ok
+CREATE TABLE db2.region AS SELECT * FROM (VALUES
+    (0, 'AFRICA'),
+    (1, 'AMERICA'),
+    (2, 'ASIA'),
+    (3, 'EUROPE'),
+    (4, 'MIDDLE EAST')
+) AS t(r_regionkey, r_name);
+
+statement ok
+DETACH db2;
+
+query
+SELECT r_regionkey, r_name
+FROM read_duckdb('${__TEST_DIR__}/db2.duckdb', table_name = 'region');
+----
+r_regionkey	r_name
+0	AFRICA
+1	AMERICA
+2	ASIA
+3	EUROPE
+4	MIDDLE EAST
+
+# DOCS_TEST: example_003
+
+statement ok
+DETACH IF EXISTS db3_1;
+
+statement ok
+DETACH IF EXISTS db3_2;
+
+statement ok
+ATTACH '${__TEST_DIR__}/db3_1.duckdb' AS db3_1;
+
+statement ok
+DROP TABLE IF EXISTS db3_1.numbers;
+
+statement ok
+CREATE TABLE db3_1.numbers AS SELECT 42 AS x;
+
+statement ok
+DROP TABLE IF EXISTS db3_1.letters;
+
+statement ok
+CREATE TABLE db3_1.letters AS SELECT 'm' AS a;
+
+statement ok
+DETACH db3_1;
+
+statement ok
+ATTACH '${__TEST_DIR__}/db3_2.duckdb' AS db3_2;
+
+statement ok
+DROP TABLE IF EXISTS db3_2.numbers;
+
+statement ok
+CREATE TABLE db3_2.numbers AS SELECT 43 AS x;
+
+statement ok
+DETACH db3_2;
+
+# DOCS_TEST_RAW
+#| SELECT x FROM read_duckdb('my-*.duckdb', table_name = 'numbers');
+
+# DOCS_TEST_BODY
+
+query ? rowsort
+SELECT x FROM read_duckdb('${__TEST_DIR__}/db3_*.duckdb', table_name = 'numbers');
+----
+x
+42
+43
+
+# DOCS_TEST: example_004
+
+statement ok
+DETACH IF EXISTS db4;
+
+statement ok
+ATTACH '${__TEST_DIR__}/db4.duckdb' AS db4;
+
+statement ok
+DROP TABLE IF EXISTS db4.numbers;
+
+statement ok
+CREATE TABLE db4.numbers AS SELECT 43 AS x;
+
+statement ok
+DETACH db4;
+
+# DOCS_TEST_RAW
+#| FROM read_duckdb('my-2.duckdb');
+
+# DOCS_TEST_BODY
+
+query
+FROM read_duckdb('${__TEST_DIR__}/db4.duckdb');
+----
+x
+43
+
+# DOCS_TEST: example_005
+
+statement ok
+DETACH IF EXISTS db5;
+
+statement ok
+ATTACH '${__TEST_DIR__}/db5.duckdb' AS db5;
+
+statement ok
+DROP TABLE IF EXISTS db5.numbers;
+
+statement ok
+CREATE TABLE db5.numbers AS SELECT 43 AS x;
+
+statement ok
+DETACH db5;
+
+# DOCS_TEST_RAW
+#| FROM 'my-2.duckdb';
+
+# DOCS_TEST_BODY
+
+query
+SELECT #1 AS "my-2" FROM '${__TEST_DIR__}/db5.duckdb';
+----
+my-2
+43
+
+statement ok
+DETACH IF EXISTS db1;
+
+statement ok
+DETACH IF EXISTS db2;
+
+statement ok
+DETACH IF EXISTS db3_1;
+
+statement ok
+DETACH IF EXISTS db3_2;
+
+statement ok
+DETACH IF EXISTS db4;
+
+statement ok
+DETACH IF EXISTS db5;
