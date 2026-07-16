@@ -1,0 +1,77 @@
+hash-threshold 100
+
+control substitution on
+
+# Regression: geometry "shredding" decomposes a GEOMETRY column into primitive
+# DOUBLE storage segments at CHECKPOINT time. With geometry_minimum_shredding_size
+# = -1 shredding is disabled (segments stay GEOMETRY); with 0 it always shreds
+# (segments become DOUBLE). A NAMED checkpoint flushes only the attached per-test
+# database, so it never touches the shared engine.
+
+statement ok
+DETACH IF EXISTS db141;
+
+statement ok
+DETACH IF EXISTS db142;
+
+statement ok
+ATTACH '${__TEST_DIR__}/db141.db' AS db141 (STORAGE_VERSION 'v1.5.0');
+
+statement ok
+ATTACH '${__TEST_DIR__}/db142.db' AS db142 (STORAGE_VERSION 'v1.5.0');
+
+
+# --- shredding disabled: storage segments stay GEOMETRY ---
+statement ok
+SET geometry_minimum_shredding_size = -1;
+
+statement ok
+CREATE OR REPLACE TABLE db141.points AS
+SELECT printf('POINT (%d %d)', x, y)::GEOMETRY AS geom
+FROM range(0, 8) AS rx(x), range(0, 8) AS ry(y);
+
+statement ok
+CHECKPOINT db141;
+
+query
+SELECT string_agg(DISTINCT segment_type, ',' ORDER BY segment_type) AS types
+FROM pragma_storage_info('db141.points');
+----
+types
+GEOMETRY,VALIDITY
+
+
+# --- shredding always on: the GEOMETRY column decomposes into DOUBLE segments ---
+statement ok
+SET geometry_minimum_shredding_size = 0;
+
+statement ok
+CREATE OR REPLACE TABLE db142.points AS
+SELECT printf('POINT (%d %d)', x, y)::GEOMETRY AS geom
+FROM range(0, 8) AS rx(x), range(0, 8) AS ry(y);
+
+statement ok
+CHECKPOINT db142;
+
+query
+SELECT string_agg(DISTINCT segment_type, ',' ORDER BY segment_type) AS types
+FROM pragma_storage_info('db142.points');
+----
+types
+DOUBLE,VALIDITY
+
+
+statement ok
+RESET geometry_minimum_shredding_size;
+
+statement ok
+DETACH db141;
+
+statement ok
+DETACH db142;
+
+statement ok
+DETACH IF EXISTS db141;
+
+statement ok
+DETACH IF EXISTS db142;

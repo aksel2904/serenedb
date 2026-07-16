@@ -60,26 +60,25 @@ using VariadicPhraseIterator = PhraseIterator<
 
 }  // namespace
 
-DocIterator::ptr FixedPhraseQuery::execute(const ExecutionContext& ctx) const {
-  auto& rdr = ctx.segment;
-  // get phrase state for the specified reader
-  auto phrase_state = states.find(rdr);
-
-  if (!phrase_state) {
-    // invalid state
-    return DocIterator::empty();
-  }
+DocIterator::ptr FixedPhraseQuery::Execute(const ExecutionContext& ctx,
+                                           const StatsBuffer& stats) const {
+  auto& rdr = _segment;
+  const auto* phrase_state = &state;
 
   auto* reader = phrase_state->reader;
-  SDB_ASSERT(reader);
+  if (!reader) {
+    return DocIterator::empty();
+  }
 
   if (kRequiredFeatures !=
       (reader->meta().index_features & kRequiredFeatures)) {
     return DocIterator::empty();
   }
 
+  const auto* scorer = stats.GetScorer();
+
   // get index features required for query & order
-  const IndexFeatures features = GetFeatures(ctx.scorer) | kRequiredFeatures;
+  const IndexFeatures features = GetFeatures(scorer) | kRequiredFeatures;
 
   using Adapter = PostingAdapter<PostingIteratorBase<FixedTermTraits<false>>>;
 
@@ -107,33 +106,29 @@ DocIterator::ptr FixedPhraseQuery::execute(const ExecutionContext& ctx) const {
       sdb::basics::downCast<FixedTermPositionImpl<false>>(pos), *position++);
   }
 
-  SDB_ENSURE(
-    this->slop == 0 || !absl::c_any_of(this->positions,
-                                       [](const auto& pos) {
-                                         return pos.offs_max != pos.offs_min;
-                                       }),
-    sdb::ERROR_BAD_PARAMETER, "slop and intervals are mutually exclusive");
+  SDB_ENSURE(this->slop == 0 || !has_intervals,
+             "slop and intervals are mutually exclusive");
 
   if (this->slop > 0) {
     auto expected_steps = BuildExpectedSteps(this->positions);
-    if (!ctx.scorer) {
+    if (!scorer) {
       using SlopIterator = PhraseIterator<Conjunction<Adapter>,
                                           SlopPhraseFrequencyDP<false, false>>;
       return memory::make_managed<SlopIterator>(
         static_cast<doc_id_t>(rdr.docs_count()), std::move(itrs),
         std::move(positions), this->slop, std::move(expected_steps));
     }
+    const auto& all_stats = stats.GetAllStats();
+    const auto* stats_data =
+      all_stats.empty() ? nullptr : all_stats.back().c_str();
     using SlopIterator =
       PhraseIterator<Conjunction<Adapter>, SlopPhraseFrequencyDP<false, true>>;
     return memory::make_managed<SlopIterator>(
       static_cast<doc_id_t>(rdr.docs_count()), std::move(itrs),
       std::move(positions), this->slop, std::move(expected_steps),
-      phrase_state->reader->meta(), stats.c_str(), boost);
+      phrase_state->reader->meta(), stats_data, boost);
   }
-  const bool has_intervals = absl::c_any_of(
-    this->positions,
-    [](const auto& pos) { return pos.offs_max != pos.offs_min; });
-  if (!ctx.scorer) {
+  if (!scorer) {
     return ResolveBool(
       has_intervals, [&]<bool HasIntervals> -> DocIterator::ptr {
         using FixedPhraseIterator =
@@ -144,32 +139,29 @@ DocIterator::ptr FixedPhraseQuery::execute(const ExecutionContext& ctx) const {
           std::move(positions));
       });
   }
+  const auto& all_stats = stats.GetAllStats();
+  const auto* stats_data =
+    all_stats.empty() ? nullptr : all_stats.back().c_str();
   return ResolveBool(has_intervals, [&]<bool HasIntervals> -> DocIterator::ptr {
     using FixedPhraseIterator =
       PhraseIterator<Conjunction<Adapter>,
                      FixedPhraseFrequency<false, true, HasIntervals>>;
     return memory::make_managed<FixedPhraseIterator>(
       static_cast<doc_id_t>(rdr.docs_count()), std::move(itrs),
-      std::move(positions), phrase_state->reader->meta(), stats.c_str(), boost);
+      std::move(positions), phrase_state->reader->meta(), stats_data, boost);
   });
 }
 
 DocIterator::ptr FixedPhraseQuery::ExecuteWithOffsets(
   const SubReader& segment) const {
-  // get phrase state for the specified reader
-  auto phrase_state = states.find(segment);
+  const auto* phrase_state = &state;
 
-  if (!phrase_state) {
-    // invalid state
+  if (!phrase_state->reader) {
     return DocIterator::empty();
   }
 
-  SDB_ENSURE(
-    this->slop == 0 || !absl::c_any_of(this->positions,
-                                       [](const auto& pos) {
-                                         return pos.offs_max != pos.offs_min;
-                                       }),
-    sdb::ERROR_BAD_PARAMETER, "slop and intervals are mutually exclusive");
+  SDB_ENSURE(this->slop == 0 || !has_intervals,
+             "slop and intervals are mutually exclusive");
 
   if (this->slop > 0) {
     auto* reader = phrase_state->reader;
@@ -219,10 +211,6 @@ DocIterator::ptr FixedPhraseQuery::ExecuteWithOffsets(
       static_cast<doc_id_t>(segment.docs_count()), std::move(itrs),
       std::move(positions), this->slop, std::move(expected_steps));
   }
-
-  const bool has_intervals = absl::c_any_of(
-    this->positions,
-    [](const auto& pos) { return pos.offs_max != pos.offs_min; });
 
   return ResolveBool(has_intervals, [&]<bool HasIntervals> -> DocIterator::ptr {
     using Adapter = PostingAdapter<PostingIteratorBase<FixedTermTraits<true>>>;
@@ -298,32 +286,30 @@ DocIterator::ptr FixedPhraseQuery::ExecuteWithOffsets(
   });
 }
 
-DocIterator::ptr VariadicPhraseQuery::execute(
-  const ExecutionContext& ctx) const {
+DocIterator::ptr VariadicPhraseQuery::Execute(const ExecutionContext& ctx,
+                                              const StatsBuffer& stats) const {
   using Adapter = VariadicPhraseAdapter;
   using CompoundDocIterator = CompoundDocIterator<Adapter>;
   using Disjunction = Disjunction<VariadicPhraseAdapter>;
-  auto& rdr = ctx.segment;
+  auto& rdr = _segment;
 
-  // get phrase state for the specified reader
-  auto phrase_state = states.find(rdr);
-
-  if (!phrase_state) {
-    // invalid state
-    return DocIterator::empty();
-  }
+  const auto* phrase_state = &state;
 
   // find term using cached state
   auto* reader = phrase_state->reader;
-  SDB_ASSERT(reader);
+  if (!reader) {
+    return DocIterator::empty();
+  }
 
   if (kRequiredFeatures !=
       (reader->meta().index_features & kRequiredFeatures)) {
     return DocIterator::empty();
   }
 
+  const auto* scorer = stats.GetScorer();
+
   // get features required for query & order
-  const IndexFeatures features = GetFeatures(ctx.scorer) | kRequiredFeatures;
+  const IndexFeatures features = GetFeatures(scorer) | kRequiredFeatures;
 
   ScoreAdapters conj_itrs;
   conj_itrs.reserve(phrase_state->terms.size());
@@ -378,16 +364,12 @@ DocIterator::ptr VariadicPhraseQuery::execute(
   }
   SDB_ASSERT(term_state == std::end(phrase_state->terms));
 
-  SDB_ENSURE(
-    this->slop == 0 || !absl::c_any_of(this->positions,
-                                       [](const auto& pos) {
-                                         return pos.offs_max != pos.offs_min;
-                                       }),
-    sdb::ERROR_BAD_PARAMETER, "slop and intervals are mutually exclusive");
+  SDB_ENSURE(this->slop == 0 || !has_intervals,
+             "slop and intervals are mutually exclusive");
 
   if (this->slop > 0) {
     auto expected_steps = BuildExpectedSteps(this->positions);
-    if (!ctx.scorer) {
+    if (!scorer) {
       using SlopIterator = PhraseIterator<
         Conjunction<ScoreAdapter>,
         SlopVariadicPhraseFrequencyDP<VariadicPhraseAdapter, false>>;
@@ -395,20 +377,19 @@ DocIterator::ptr VariadicPhraseQuery::execute(
         static_cast<doc_id_t>(rdr.docs_count()), std::move(conj_itrs),
         std::move(positions), this->slop, std::move(expected_steps));
     }
+    const auto& all_stats = stats.GetAllStats();
+    const auto* stats_data =
+      all_stats.empty() ? nullptr : all_stats.back().c_str();
     using SlopIterator = PhraseIterator<
       Conjunction<ScoreAdapter>,
       SlopVariadicPhraseFrequencyDP<VariadicPhraseAdapter, true>>;
     return memory::make_managed<SlopIterator>(
       static_cast<doc_id_t>(rdr.docs_count()), std::move(conj_itrs),
       std::move(positions), this->slop, std::move(expected_steps),
-      phrase_state->reader->meta(), stats.c_str(), boost);
+      phrase_state->reader->meta(), stats_data, boost);
   }
 
-  const bool has_intervals = absl::c_any_of(
-    this->positions,
-    [](const auto& pos) { return pos.offs_max != pos.offs_min; });
-
-  if (!ctx.scorer) {
+  if (!scorer) {
     return ResolveBool(
       has_intervals, [&]<bool HasIntervals> -> DocIterator::ptr {
         return memory::make_managed<
@@ -418,13 +399,17 @@ DocIterator::ptr VariadicPhraseQuery::execute(
       });
   }
 
+  const auto& all_stats = stats.GetAllStats();
+  const auto* stats_data =
+    all_stats.empty() ? nullptr : all_stats.back().c_str();
+
   if (phrase_state->volatile_boost) {
     return ResolveBool(
       has_intervals, [&]<bool HasIntervals> -> DocIterator::ptr {
         return memory::make_managed<
           VariadicPhraseIterator<Adapter, true, true, HasIntervals>>(
           static_cast<doc_id_t>(rdr.docs_count()), std::move(conj_itrs),
-          std::move(positions), phrase_state->reader->meta(), stats.c_str(),
+          std::move(positions), phrase_state->reader->meta(), stats_data,
           boost);
       });
   }
@@ -432,7 +417,7 @@ DocIterator::ptr VariadicPhraseQuery::execute(
     return memory::make_managed<
       VariadicPhraseIterator<Adapter, false, true, HasIntervals>>(
       static_cast<doc_id_t>(rdr.docs_count()), std::move(conj_itrs),
-      std::move(positions), phrase_state->reader->meta(), stats.c_str(), boost);
+      std::move(positions), phrase_state->reader->meta(), stats_data, boost);
   });
 }
 
@@ -442,13 +427,7 @@ DocIterator::ptr VariadicPhraseQuery::ExecuteWithOffsets(
   using CompundDocIterator = CompoundDocIterator<Adapter>;
   using Disjunction = Disjunction<Adapter>;
 
-  // get phrase state for the specified reader
-  auto phrase_state = states.find(segment);
-
-  if (!phrase_state) {
-    // invalid state
-    return DocIterator::empty();
-  }
+  const auto* phrase_state = &state;
 
   ScoreAdapters conj_itrs;
   conj_itrs.reserve(phrase_state->terms.size());
@@ -463,12 +442,8 @@ DocIterator::ptr VariadicPhraseQuery::ExecuteWithOffsets(
     return DocIterator::empty();
   }
 
-  SDB_ENSURE(
-    this->slop == 0 || !absl::c_any_of(this->positions,
-                                       [](const auto& pos) {
-                                         return pos.offs_max != pos.offs_min;
-                                       }),
-    sdb::ERROR_BAD_PARAMETER, "slop and intervals are mutually exclusive");
+  SDB_ENSURE(this->slop == 0 || !has_intervals,
+             "slop and intervals are mutually exclusive");
 
   if (this->slop > 0) {
     using SlopIterator = PhraseIterator<
@@ -529,10 +504,6 @@ DocIterator::ptr VariadicPhraseQuery::ExecuteWithOffsets(
       static_cast<doc_id_t>(segment.docs_count()), std::move(conj_itrs),
       std::move(positions), this->slop, std::move(expected_steps));
   }
-
-  const bool has_intervals = absl::c_any_of(
-    this->positions,
-    [](const auto& pos) { return pos.offs_max != pos.offs_min; });
 
   return ResolveBool(has_intervals, [&]<bool HasIntervals> -> DocIterator::ptr {
     std::vector<VariadicTermPosition<Adapter>> positions;

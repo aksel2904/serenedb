@@ -15,12 +15,13 @@ fi
 
 echo "=== Tarball RTA: $(basename "$TARBALL") ==="
 mkdir -p "${WORKSPACE}/out/logs"
-mkdir -p "${WORKSPACE}/out/test-tmp"
 
 export TARBALL_NAME="$(basename "$TARBALL")"
 export DOCKER_UID="$(id -u)"
 export DOCKER_GID="$(id -g)"
 export CARGO_TARGET_CACHE="${CARGO_TARGET_CACHE:-${HOME}/.cache/serenedb-cargo-target}"
+export CARGO_HOME_CACHE="${CARGO_HOME_CACHE:-${HOME}/.cache/serenedb-cargo-home}"
+mkdir -p "$CARGO_TARGET_CACHE" "$CARGO_HOME_CACHE"
 
 PREFIX="tarball-rta-$$"
 COMPOSE_FILE="${CI_DIR}/docker-compose.tarball-rta.yml"
@@ -42,6 +43,14 @@ log_lines=$(docker compose -p "$PREFIX" -f "$COMPOSE_FILE" logs serenedb 2>&1 | 
 if [[ "$log_lines" -eq 0 ]]; then
 	echo "ERROR: No serened log output found - service likely failed to start"
 	test_rc=1
+fi
+
+# HBA network tests: standalone service (launches its own serened from the
+# extracted tarball, in-container), so it goes through `run`, not `up`.
+if [[ $test_rc -eq 0 ]]; then
+	echo "=== HBA network tests ==="
+	docker compose -p "$PREFIX" -f "$COMPOSE_FILE" run --rm network-tests \
+		2>&1 | tee "${WORKSPACE}/out/logs/tarball-rta-network.log" || test_rc=$?
 fi
 
 # Optional drivers RTA. Gated on RTA_DRIVERS for the same reason as the

@@ -22,6 +22,7 @@
 #include <limits>
 #include <map>
 
+#include "filter_test_case_base.hpp"
 #include "index/index_tests.hpp"
 #include "iresearch/index/index_features.hpp"
 #include "iresearch/index/norm.hpp"
@@ -132,17 +133,10 @@ TEST_P(IndriDirichletIndexTest, scores_are_finite) {
     irs::ViewCast<irs::byte_type>(std::string_view("fox"));
 
   MaxMemoryCounter counter;
-  auto prepared = filter.prepare({
-    .index = *index,
-    .memory = counter,
-    .scorer = impl.get(),
-  });
+  tests::PreparedFilter prepared{filter, *index, impl.get(), counter};
 
   irs::ColumnArgsFetcher fetcher;
-  auto docs = prepared->execute({
-    .segment = segment,
-    .scorer = impl.get(),
-  });
+  auto docs = prepared.Execute(0);
   auto score = docs->PrepareScore({
     .scorer = impl.get(),
     .segment = &segment,
@@ -150,7 +144,7 @@ TEST_P(IndriDirichletIndexTest, scores_are_finite) {
   });
 
   std::map<irs::doc_id_t, irs::score_t> seen;
-  while (docs->next()) {
+  while (!irs::doc_limits::eof(docs->advance())) {
     fetcher.Fetch(docs->value());
     docs->FetchScoreArgs(0);
     irs::score_t s{};

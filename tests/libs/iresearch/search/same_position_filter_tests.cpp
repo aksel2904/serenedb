@@ -103,7 +103,7 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
         [&finish_count](irs::byte_type*, const irs::FieldCollector*,
                         const irs::TermCollector*) -> void { ++finish_count; };
 
-      auto prepared = filter.prepare({.index = index, .scorer = &scorer});
+      tests::PreparedFilter prepared{filter, index, &scorer};
       ASSERT_EQ(0, finish_count);
     }
 
@@ -128,11 +128,7 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
         finish_docs_with_term += term->docs_with_term;
       };
 
-      auto prepared = filter.prepare({
-        .index = index,
-        .memory = counter,
-        .scorer = &scorer,
-      });
+      tests::PreparedFilter prepared{filter, index, &scorer, counter};
       ASSERT_EQ(1, finish_count);
       ASSERT_GT(finish_docs_with_field, 0u);  // scorer collected field stats
       ASSERT_GT(finish_docs_with_term, 0u);   // scorer collected term stats
@@ -164,7 +160,7 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
         finish_docs_with_term += term->docs_with_term;
       };
 
-      auto prepared = filter.prepare({.index = index, .scorer = &scorer});
+      tests::PreparedFilter prepared{filter, index, &scorer};
       ASSERT_EQ(2, finish_count);
       ASSERT_GT(finish_docs_with_field, 0u);  // scorer collected field stats
       ASSERT_GT(finish_docs_with_term, 0u);   // scorer collected term stats
@@ -210,9 +206,9 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
     // empty query
     {
       irs::BySamePosition q;
-      auto prepared = q.prepare({.index = index});
-      auto docs = prepared->execute({.segment = segment});
-      ASSERT_FALSE(docs->next());
+      tests::PreparedFilter prepared{q, index};
+      auto docs = prepared.Execute(0);
+      ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     }
 
     // { a: 100 } - equal to 'by_term'
@@ -226,18 +222,18 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
       expected_query.mutable_options()->term =
         irs::ViewCast<irs::byte_type>(std::string_view("100"));
 
-      auto prepared = query.prepare({.index = index});
-      auto expected_prepared = expected_query.prepare({.index = index});
+      tests::PreparedFilter prepared{query, index};
+      tests::PreparedFilter expected_prepared{expected_query, index};
 
-      auto docs = prepared->execute({.segment = segment});
-      auto expected_docs = prepared->execute({.segment = segment});
+      auto docs = prepared.Execute(0);
+      auto expected_docs = prepared.Execute(0);
 
       ASSERT_EQ(irs::doc_limits::invalid(), docs->value());
-      while (expected_docs->next()) {
-        ASSERT_TRUE(docs->next());
+      while (!irs::doc_limits::eof(expected_docs->advance())) {
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         ASSERT_EQ(expected_docs->value(), docs->value());
       }
-      ASSERT_FALSE(docs->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
       ASSERT_EQ(irs::doc_limits::eof(), docs->value());
     }
 
@@ -251,10 +247,10 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
         kBId, irs::ViewCast<irs::byte_type>(std::string_view("90")));
       q.mutable_options()->terms.emplace_back(
         kCId, irs::ViewCast<irs::byte_type>(std::string_view("9")));
-      auto prepared = q.prepare({.index = index});
-      auto docs = prepared->execute({.segment = segment});
+      tests::PreparedFilter prepared{q, index};
+      auto docs = prepared.Execute(0);
       ASSERT_EQ(irs::doc_limits::invalid(), docs->value());
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       ASSERT_EQ(1, docs->value());
     }
 
@@ -268,21 +264,21 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
       q.mutable_options()->terms.emplace_back(
         kCId, irs::ViewCast<irs::byte_type>(std::string_view("6")));
 
-      auto prepared = q.prepare({.index = index});
+      tests::PreparedFilter prepared{q, index};
 
       // next
       {
         irs::tests::BlobPointReader values{segment, *column};
 
-        auto docs = prepared->execute({.segment = segment});
+        auto docs = prepared.Execute(0);
         ASSERT_EQ(irs::doc_limits::invalid(), docs->value());
-        ASSERT_TRUE(docs->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(6, irs::ReadZV64(in));
-        ASSERT_TRUE(docs->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(27, irs::ReadZV64(in));
-        ASSERT_FALSE(docs->next());
+        ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
         ASSERT_EQ(irs::doc_limits::eof(), docs->value());
       }
 
@@ -290,7 +286,7 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
       {
         irs::tests::BlobPointReader values{segment, *column};
 
-        auto docs = prepared->execute({.segment = segment});
+        auto docs = prepared.Execute(0);
         ASSERT_EQ(irs::doc_limits::invalid(), docs->value());
         ASSERT_EQ((irs::doc_limits::min)() + 6,
                   docs->seek((irs::doc_limits::min)()));
@@ -303,7 +299,7 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
                   docs->seek(8));  // seek backwards
         ASSERT_EQ((irs::doc_limits::min)() + 27,
                   docs->seek(27));  // seek to same position
-        ASSERT_FALSE(docs->next());
+        ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
         ASSERT_EQ(irs::doc_limits::eof(), docs->value());
       }
     }
@@ -318,21 +314,21 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
       q.mutable_options()->terms.emplace_back(
         kAId, irs::ViewCast<irs::byte_type>(std::string_view("700")));
 
-      auto prepared = q.prepare({.index = index});
+      tests::PreparedFilter prepared{q, index};
 
       // next
       {
         irs::tests::BlobPointReader values{segment, *column};
 
-        auto docs = prepared->execute({.segment = segment});
+        auto docs = prepared.Execute(0);
         ASSERT_EQ(irs::doc_limits::invalid(), docs->value());
-        ASSERT_TRUE(docs->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(14, irs::ReadZV64(in));
-        ASSERT_TRUE(docs->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(91, irs::ReadZV64(in));
-        ASSERT_FALSE(docs->next());
+        ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
         ASSERT_EQ(irs::doc_limits::eof(), docs->value());
       }
 
@@ -340,7 +336,7 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
       {
         irs::tests::BlobPointReader values{segment, *column};
 
-        auto docs = prepared->execute({.segment = segment});
+        auto docs = prepared.Execute(0);
         ASSERT_EQ(irs::doc_limits::invalid(), docs->value());
         ASSERT_EQ((irs::doc_limits::min)() + 91, docs->seek(27));
         in.reset(values.Get(docs->value()));
@@ -349,7 +345,7 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
                   docs->seek(8));  // seek backwards
         ASSERT_EQ((irs::doc_limits::min)() + 91,
                   docs->seek(27));  // seek to same position
-        ASSERT_FALSE(docs->next());
+        ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
         ASSERT_EQ(irs::doc_limits::eof(), docs->value());
       }
     }
@@ -362,54 +358,54 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
       q.mutable_options()->terms.emplace_back(
         kCId, irs::ViewCast<irs::byte_type>(std::string_view("7")));
 
-      auto prepared = q.prepare({.index = index});
+      tests::PreparedFilter prepared{q, index};
 
       // next
       {
         irs::tests::BlobPointReader values{segment, *column};
 
-        auto docs = prepared->execute({.segment = segment});
+        auto docs = prepared.Execute(0);
         ASSERT_EQ(irs::doc_limits::invalid(), docs->value());
-        ASSERT_TRUE(docs->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(1, irs::ReadZV64(in));
-        ASSERT_TRUE(docs->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(6, irs::ReadZV64(in));
-        ASSERT_TRUE(docs->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(11, irs::ReadZV64(in));
-        ASSERT_TRUE(docs->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(17, irs::ReadZV64(in));
-        ASSERT_TRUE(docs->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(18, irs::ReadZV64(in));
-        ASSERT_TRUE(docs->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(23, irs::ReadZV64(in));
-        ASSERT_TRUE(docs->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(24, irs::ReadZV64(in));
-        ASSERT_TRUE(docs->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(28, irs::ReadZV64(in));
-        ASSERT_TRUE(docs->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(38, irs::ReadZV64(in));
-        ASSERT_TRUE(docs->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(51, irs::ReadZV64(in));
-        ASSERT_TRUE(docs->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(66, irs::ReadZV64(in));
-        ASSERT_TRUE(docs->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(79, irs::ReadZV64(in));
-        ASSERT_TRUE(docs->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(89, irs::ReadZV64(in));
-        ASSERT_FALSE(docs->next());
+        ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
         ASSERT_EQ(irs::doc_limits::eof(), docs->value());
       }
 
@@ -417,40 +413,40 @@ class SamePositionFilterTestCase : public tests::FilterTestCaseBase {
       {
         irs::tests::BlobPointReader values{segment, *column};
 
-        auto docs = prepared->execute({.segment = segment});
+        auto docs = prepared.Execute(0);
         ASSERT_EQ(irs::doc_limits::invalid(), docs->value());
-        ASSERT_TRUE(docs->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(1, irs::ReadZV64(in));
         ASSERT_EQ((irs::doc_limits::min)() + 28,
                   docs->seek((irs::doc_limits::min)() + 28));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(28, irs::ReadZV64(in));
-        ASSERT_TRUE(docs->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(38, irs::ReadZV64(in));
         ASSERT_EQ((irs::doc_limits::min)() + 51, docs->seek(45));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(51, irs::ReadZV64(in));
-        ASSERT_TRUE(docs->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(66, irs::ReadZV64(in));
-        ASSERT_TRUE(docs->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(79, irs::ReadZV64(in));
-        ASSERT_TRUE(docs->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
         in.reset(values.Get(docs->value()));
         ASSERT_EQ(89, irs::ReadZV64(in));
-        ASSERT_FALSE(docs->next());
+        ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
         ASSERT_EQ(irs::doc_limits::eof(), docs->value());
       }
 
       // seek to the end
       {
-        auto docs = prepared->execute({.segment = segment});
+        auto docs = prepared.Execute(0);
         ASSERT_EQ(irs::doc_limits::invalid(), docs->value());
         ASSERT_EQ(irs::doc_limits::eof(), docs->seek(irs::doc_limits::eof()));
-        ASSERT_FALSE(docs->next());
+        ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
         ASSERT_EQ(irs::doc_limits::eof(), docs->value());
       }
     }
@@ -485,8 +481,8 @@ TEST(by_same_position_test, boost) {
     {
       irs::BySamePosition q;
 
-      auto prepared = q.prepare({.index = irs::SubReader::empty()});
-      ASSERT_EQ(irs::kNoBoost, prepared->Boost());
+      tests::PreparedFilter prepared{q, irs::SubReader::empty()};
+      ASSERT_EQ(irs::kNoBoost, prepared.Query(0)->Boost());
     }
 
     // single term
@@ -495,8 +491,8 @@ TEST(by_same_position_test, boost) {
       q.mutable_options()->terms.emplace_back(
         kFieldId, irs::ViewCast<irs::byte_type>(std::string_view("quick")));
 
-      auto prepared = q.prepare({.index = irs::SubReader::empty()});
-      ASSERT_EQ(irs::kNoBoost, prepared->Boost());
+      tests::PreparedFilter prepared{q, irs::SubReader::empty()};
+      ASSERT_EQ(irs::kNoBoost, prepared.Query(0)->Boost());
     }
 
     // multiple terms
@@ -507,8 +503,8 @@ TEST(by_same_position_test, boost) {
       q.mutable_options()->terms.emplace_back(
         kFieldId, irs::ViewCast<irs::byte_type>(std::string_view("brown")));
 
-      auto prepared = q.prepare({.index = irs::SubReader::empty()});
-      ASSERT_EQ(irs::kNoBoost, prepared->Boost());
+      tests::PreparedFilter prepared{q, irs::SubReader::empty()};
+      ASSERT_EQ(irs::kNoBoost, prepared.Query(0)->Boost());
     }
   }
 
@@ -521,8 +517,8 @@ TEST(by_same_position_test, boost) {
       irs::BySamePosition q;
       q.boost(boost);
 
-      auto prepared = q.prepare({.index = irs::SubReader::empty()});
-      ASSERT_EQ(irs::kNoBoost, prepared->Boost());
+      tests::PreparedFilter prepared{q, irs::SubReader::empty()};
+      ASSERT_EQ(irs::kNoBoost, prepared.Query(0)->Boost());
     }
 
     // single term
@@ -532,8 +528,8 @@ TEST(by_same_position_test, boost) {
         kFieldId, irs::ViewCast<irs::byte_type>(std::string_view("quick")));
       q.boost(boost);
 
-      auto prepared = q.prepare({.index = irs::SubReader::empty()});
-      ASSERT_EQ(boost, prepared->Boost());
+      tests::PreparedFilter prepared{q, irs::SubReader::empty()};
+      ASSERT_EQ(irs::kNoBoost, prepared.Query(0)->Boost());
     }
 
     // single multiple terms
@@ -545,8 +541,8 @@ TEST(by_same_position_test, boost) {
         kFieldId, irs::ViewCast<irs::byte_type>(std::string_view("brown")));
       q.boost(boost);
 
-      auto prepared = q.prepare({.index = irs::SubReader::empty()});
-      ASSERT_EQ(boost, prepared->Boost());
+      tests::PreparedFilter prepared{q, irs::SubReader::empty()};
+      ASSERT_EQ(irs::kNoBoost, prepared.Query(0)->Boost());
     }
   }
 }

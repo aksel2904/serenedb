@@ -22,6 +22,8 @@
 
 #include "term_filter.hpp"
 
+#include <tuple>
+
 #include "iresearch/index/index_reader.hpp"
 #include "iresearch/search/collectors.hpp"
 #include "iresearch/search/filter_visitor.hpp"
@@ -30,102 +32,68 @@
 namespace irs {
 namespace {
 
-// Filter visitor for term queries
-class TermVisitor : private util::Noncopyable {
+class ByTermIterator : public WrappedTermIterator {
  public:
-  TermVisitor(TermCollectorsFlat& term_stats, TermQuery::States& states)
-    : _term_stats(term_stats), _states(states) {}
+  ByTermIterator(const TermReader& reader, bytes_view term)
+    : WrappedTermIterator{reader.iterator(SeekMode::RandomOnly)},
+      _found{_impl->seek(term)} {}
 
-  void Prepare(const SubReader& segment, const TermReader& field,
-               const SeekTermIterator& terms) noexcept {
-    _segment = &segment;
-    _reader = &field;
-    _terms = &terms;
-  }
-
-  void Visit(score_t /*boost*/) {
-    // collect statistics
-    SDB_ASSERT(_segment && _reader && _terms);
-    _term_stats.Collect(0, *_terms);
-
-    // Cache term state in prepared query attributes.
-    // Later, using cached state we could easily "jump" to
-    // postings without relatively expensive FST traversal
-    auto& state = _states.insert(*_segment);
-    state.reader = _reader;
-    state.cookie = _terms->cookie();
-  }
+  bool next() final { return std::exchange(_found, false); }
 
  private:
-  TermCollectorsFlat& _term_stats;
-  TermQuery::States& _states;
-  const SubReader* _segment{};
-  const TermReader* _reader{};
-  const SeekTermIterator* _terms{};
+  bool _found;
 };
-
-template<typename Visitor>
-void VisitImpl(const SubReader& segment, const TermReader& field,
-               bytes_view term, Visitor& visitor) {
-  // find term
-  auto terms = field.iterator(SeekMode::RandomOnly);
-
-  if (!terms) [[unlikely]] {
-    return;
-  }
-  if (!terms->seek(term)) {
-    return;
-  }
-
-  visitor.Prepare(segment, field, *terms);
-
-  // read term attributes
-  terms->read();
-
-  visitor.Visit(kNoBoost);
-}
 
 }  // namespace
 
-void ByTerm::visit(const SubReader& segment, const TermReader& field,
-                   bytes_view term, FilterVisitor& visitor) {
-  VisitImpl(segment, field, term, visitor);
+void ByTerm::Visit(const SubReader& segment, const TermReader& field,
+                   const ByTermOptions& options, FilterVisitor& visitor) {
+  auto terms = field.iterator(SeekMode::RandomOnly);
+  if (!terms || !terms->seek(options.term)) {
+    return;
+  }
+  visitor.Prepare(segment, field, *terms);
+  std::ignore = visitor.Visit(kNoBoost);
 }
 
-Filter::Query::ptr ByTerm::prepare(const PrepareContext& ctx, irs::field_id id,
-                                   bytes_view term) {
-  TermQuery::States states{ctx.memory, ctx.index.size()};
-  FieldCollector field_stats;
-  TermCollectorsFlat term_stats{ctx.scorer, 1};
-
-  TermVisitor visitor(term_stats, states);
-
-  // iterate over the segments
-  for (const auto& segment : ctx.index) {
-    const auto* reader = segment.field(id);
-    if (!reader) {
-      continue;
+QueryBuilder::ptr ByTerm::PrepareSegment(const SubReader& segment,
+                                         const PrepareContext& ctx,
+                                         const irs::field_id field,
+                                         const bytes_view term) {
+  const auto* reader = segment.field(field);
+  if (!reader) {
+    // field absent in this segment: a boost-carrying empty query so the boost
+    // is still observable and consistent with the multi-term path
+    return memory::make_tracked<TermQuery>(
+      ctx.memory, segment, TermState{nullptr, nullptr}, ctx.boost);
+  }
+  auto terms = reader->iterator(SeekMode::RandomOnly);
+  if (terms && !terms->seek(term)) {
+    terms = nullptr;
+  }
+  if (ctx.collector) {
+    auto& collector = sdb::basics::downCast<ByTermsCollector>(*ctx.collector);
+    SDB_ASSERT(collector.Terms().size() == 1);
+    collector.Field().Collect(*reader);
+    if (terms) {
+      collector.Terms()[0].Collect(*terms);
     }
-
-    // collect field statistics once per segment
-    field_stats.Collect(*reader);
-
-    VisitImpl(segment, *reader, term, visitor);
   }
+  TermState state{reader, terms ? terms->cookie() : nullptr};
+  return memory::make_tracked<TermQuery>(ctx.memory, segment, std::move(state),
+                                         ctx.boost);
+}
 
-#ifndef SDB_GTEST  // TODO(mbkkt) adjust tests
-  if (states.empty()) {
-    return Query::empty();
-  }
-#endif
+PrepareCollector::ptr ByTerm::MakeCollector(const Scorer* scorer) const {
+  return std::make_unique<ByTermsCollector>(scorer, 1);
+}
 
-  bstring stats(GetStatsSize(ctx.scorer), 0);
-  auto* stats_buf = stats.data();
+TermPredicate::ptr ByTerm::CompileTermPredicate() const {
+  return MakeTermPredicate(TermAcceptor{options().term});
+}
 
-  term_stats.Finish(stats_buf, 0, &field_stats);
-
-  return memory::make_tracked<TermQuery>(ctx.memory, std::move(states),
-                                         std::move(stats), ctx.boost);
+TermIterator::ptr ByTerm::CompileTermIterator(const TermReader& reader) const {
+  return memory::make_managed<ByTermIterator>(reader, options().term);
 }
 
 }  // namespace irs

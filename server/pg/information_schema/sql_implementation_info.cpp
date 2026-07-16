@@ -20,7 +20,7 @@
 
 #include "pg/information_schema/sql_implementation_info.h"
 
-#include "rest/version.h"
+#include "basics/build.h"
 
 namespace sdb::pg {
 namespace {
@@ -65,7 +65,8 @@ SystemTableSnapshot<SqlImplementationInfo>::GetTableData() {
   constexpr auto kNumRows = std::size(kRows);
   auto result = CreateColumns<SqlImplementationInfo>(kNumRows);
   for (size_t row = 0; row < kNumRows; ++row) {
-    WriteData(result, kRows[row].data, kRows[row].nulls, row);
+    WriteData(result, kRows[row].data, kRows[row].nulls, row,
+              *_config.CatalogSnapshot());
   }
   return {std::move(result), kNumRows};
 }

@@ -97,12 +97,11 @@ irs::bytes_view Term(std::string_view s) {
 // Collects matched doc ids across all segments for the prepared query.
 // The gather mode is read at iteration time, so the same prepared query
 // can be re-run under different GatherModeGuard scopes.
-std::vector<irs::doc_id_t> CollectDocs(const irs::Filter::Query::ptr& prepared,
-                                       const irs::DirectoryReader& rdr) {
+std::vector<irs::doc_id_t> CollectDocs(const tests::PreparedFilter& prepared) {
   std::vector<irs::doc_id_t> out;
-  for (auto sub = rdr.begin(); sub != rdr.end(); ++sub) {
-    auto docs = prepared->execute({.segment = *sub});
-    while (docs->next()) {
+  for (size_t i = 0; i < prepared.size(); ++i) {
+    auto docs = prepared.Execute(i);
+    while (!irs::doc_limits::eof(docs->advance())) {
       out.push_back(docs->value());
     }
   }
@@ -118,11 +117,18 @@ struct OffsetMatch {
 };
 
 template<typename PhraseQueryT>
-std::vector<OffsetMatch> CollectOffsets(const PhraseQueryT& phrase_query,
+std::vector<OffsetMatch> CollectOffsets(const tests::PreparedFilter& prepared,
                                         const irs::DirectoryReader& rdr) {
   std::vector<OffsetMatch> out;
-  for (auto sub = rdr.begin(); sub != rdr.end(); ++sub) {
-    auto docs = phrase_query.ExecuteWithOffsets(*sub);
+  size_t i = 0;
+  for (auto sub = rdr.begin(); sub != rdr.end(); ++sub, ++i) {
+    const auto* phrase_query =
+      dynamic_cast<const PhraseQueryT*>(prepared.Query(i));
+    EXPECT_NE(nullptr, phrase_query);
+    if (!phrase_query) {
+      continue;
+    }
+    auto docs = phrase_query->ExecuteWithOffsets(*sub);
     if (!docs) {
       continue;
     }
@@ -131,7 +137,7 @@ std::vector<OffsetMatch> CollectOffsets(const PhraseQueryT& phrase_query,
       continue;
     }
     auto* offs = irs::get<irs::OffsAttr>(*pos);
-    while (docs->next()) {
+    while (!irs::doc_limits::eof(docs->advance())) {
       OffsetMatch m{.doc = docs->value()};
       while (pos->next()) {
         m.offsets.emplace_back(offs ? offs->start : 0, offs ? offs->end : 0);
@@ -151,20 +157,19 @@ class SlopSeekGatherTestCase : public tests::FilterTestCaseBase {
   // keeps n == 2 queries - fixed and variadic alike - on the gather path this
   // helper exercises (production would route them to the join, making the
   // comparison vacuous); it is a no-op for n >= 3.
-  void AssertExecuteEquivalent(const irs::Filter::Query::ptr& prepared,
-                               const irs::DirectoryReader& rdr,
+  void AssertExecuteEquivalent(const tests::PreparedFilter& prepared,
                                std::string_view ctx) {
     std::vector<irs::doc_id_t> read_all;
     std::vector<irs::doc_id_t> seek;
     {
       PairJoinGuard pj;
       GatherModeGuard g{dp::GatherOverride::kForceReadAll};
-      read_all = CollectDocs(prepared, rdr);
+      read_all = CollectDocs(prepared);
     }
     {
       PairJoinGuard pj;
       GatherModeGuard g{dp::GatherOverride::kForceSeek};
-      seek = CollectDocs(prepared, rdr);
+      seek = CollectDocs(prepared);
     }
     ASSERT_EQ(read_all, seek) << "seek-gather diverged from read-all: " << ctx;
     ASSERT_FALSE(read_all.empty()) << "expected matches for: " << ctx;
@@ -268,9 +273,8 @@ TEST_P(SlopSeekGatherTestCase, equivalence_fixed) {
     }
     q.mutable_options()->set_slop(s.slop);
 
-    auto prepared = q.prepare({.index = rdr});
-    ASSERT_NE(nullptr, prepared) << s.ctx;
-    AssertExecuteEquivalent(prepared, rdr, s.ctx);
+    tests::PreparedFilter prepared{q, rdr};
+    AssertExecuteEquivalent(prepared, s.ctx);
   }
 }
 
@@ -290,9 +294,8 @@ TEST_P(SlopSeekGatherTestCase, equivalence_explicit_gap) {
     Term("moved");
   q.mutable_options()->set_slop(1);
 
-  auto prepared = q.prepare({.index = rdr});
-  ASSERT_NE(nullptr, prepared);
-  AssertExecuteEquivalent(prepared, rdr, "quick __ moved s1");
+  tests::PreparedFilter prepared{q, rdr};
+  AssertExecuteEquivalent(prepared, "quick __ moved s1");
 }
 
 TEST_P(SlopSeekGatherTestCase, equivalence_variadic) {
@@ -310,9 +313,8 @@ TEST_P(SlopSeekGatherTestCase, equivalence_variadic) {
   q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("fox");
   q.mutable_options()->set_slop(1);
 
-  auto prepared = q.prepare({.index = rdr});
-  ASSERT_NE(nullptr, prepared);
-  AssertExecuteEquivalent(prepared, rdr, "qui* fox s1 (variadic)");
+  tests::PreparedFilter prepared{q, rdr};
+  AssertExecuteEquivalent(prepared, "qui* fox s1 (variadic)");
 }
 
 // Offsets equivalence: ExecuteWithOffsets must emit identical per-match
@@ -333,10 +335,7 @@ TEST_P(SlopSeekGatherTestCase, equivalence_offsets_fixed) {
   q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("fox");
   q.mutable_options()->set_slop(1);
 
-  auto prepared = q.prepare({.index = rdr});
-  const auto* phrase_query =
-    dynamic_cast<const irs::FixedPhraseQuery*>(prepared.get());
-  ASSERT_NE(nullptr, phrase_query);
+  tests::PreparedFilter prepared{q, rdr};
 
   // n == 2: guard keeps the offsets runs on the gather path (see header).
   std::vector<OffsetMatch> read_all;
@@ -344,12 +343,12 @@ TEST_P(SlopSeekGatherTestCase, equivalence_offsets_fixed) {
   {
     PairJoinGuard pj;
     GatherModeGuard g{dp::GatherOverride::kForceReadAll};
-    read_all = CollectOffsets(*phrase_query, rdr);
+    read_all = CollectOffsets<irs::FixedPhraseQuery>(prepared, rdr);
   }
   {
     PairJoinGuard pj;
     GatherModeGuard g{dp::GatherOverride::kForceSeek};
-    seek = CollectOffsets(*phrase_query, rdr);
+    seek = CollectOffsets<irs::FixedPhraseQuery>(prepared, rdr);
   }
   ASSERT_FALSE(read_all.empty());
   ASSERT_EQ(read_all, seek);
@@ -369,10 +368,7 @@ TEST_P(SlopSeekGatherTestCase, equivalence_offsets_variadic) {
   q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("fox");
   q.mutable_options()->set_slop(1);
 
-  auto prepared = q.prepare({.index = rdr});
-  const auto* phrase_query =
-    dynamic_cast<const irs::VariadicPhraseQuery*>(prepared.get());
-  ASSERT_NE(nullptr, phrase_query);
+  tests::PreparedFilter prepared{q, rdr};
 
   // n == 2: without the guard both runs would take the variadic join and
   // never consult the gather gate at all (see file header).
@@ -381,12 +377,12 @@ TEST_P(SlopSeekGatherTestCase, equivalence_offsets_variadic) {
   {
     PairJoinGuard pj;
     GatherModeGuard g{dp::GatherOverride::kForceReadAll};
-    read_all = CollectOffsets(*phrase_query, rdr);
+    read_all = CollectOffsets<irs::VariadicPhraseQuery>(prepared, rdr);
   }
   {
     PairJoinGuard pj;
     GatherModeGuard g{dp::GatherOverride::kForceSeek};
-    seek = CollectOffsets(*phrase_query, rdr);
+    seek = CollectOffsets<irs::VariadicPhraseQuery>(prepared, rdr);
   }
   ASSERT_FALSE(read_all.empty());
   ASSERT_EQ(read_all, seek);
@@ -415,8 +411,7 @@ TEST_P(SlopSeekGatherTestCase, skewed_engages_and_matches) {
   q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("commonxyz");
   q.mutable_options()->set_slop(1);
 
-  auto prepared = q.prepare({.index = rdr});
-  ASSERT_NE(nullptr, prepared);
+  tests::PreparedFilter prepared{q, rdr};
 
   // Guard: without it this n == 2 query runs the join and the gate is
   // never consulted at all (see file header).
@@ -425,12 +420,12 @@ TEST_P(SlopSeekGatherTestCase, skewed_engages_and_matches) {
   {
     PairJoinGuard pj;
     GatherModeGuard g{dp::GatherOverride::kAuto};  // gate should pick seek
-    automatic = CollectDocs(prepared, rdr);
+    automatic = CollectDocs(prepared);
   }
   {
     PairJoinGuard pj;
     GatherModeGuard g{dp::GatherOverride::kForceReadAll};
-    read_all = CollectDocs(prepared, rdr);
+    read_all = CollectDocs(prepared);
   }
   ASSERT_EQ(1u, automatic.size());  // SK matches (rarexyz@1, commonxyz@2)
   ASSERT_EQ(read_all, automatic);
@@ -460,9 +455,8 @@ TEST_P(SlopSeekGatherTestCase, overlapping_windows_equivalent) {
   q.mutable_options()->set_slop(
     3);  // W = slop + 1 = 4; windows around 1 & 4 overlap
 
-  auto prepared = q.prepare({.index = rdr});
-  ASSERT_NE(nullptr, prepared);
-  AssertExecuteEquivalent(prepared, rdr, "overlapping windows");
+  tests::PreparedFilter prepared{q, rdr};
+  AssertExecuteEquivalent(prepared, "overlapping windows");
 }
 
 // Pair-join equivalence: the n == 2 merge-join (production default) must
@@ -500,21 +494,20 @@ TEST_P(SlopSeekGatherTestCase, pair_join_equivalence_fixed) {
       Term(s.terms[1]);
     q.mutable_options()->set_slop(s.slop);
 
-    auto prepared = q.prepare({.index = rdr});
-    ASSERT_NE(nullptr, prepared) << s.ctx;
+    tests::PreparedFilter prepared{q, rdr};
 
-    const auto join = CollectDocs(prepared, rdr);
+    const auto join = CollectDocs(prepared);
     std::vector<irs::doc_id_t> legacy_readall;
     std::vector<irs::doc_id_t> legacy_seek;
     {
       PairJoinGuard pj;
       GatherModeGuard g{dp::GatherOverride::kForceReadAll};
-      legacy_readall = CollectDocs(prepared, rdr);
+      legacy_readall = CollectDocs(prepared);
     }
     {
       PairJoinGuard pj;
       GatherModeGuard g{dp::GatherOverride::kForceSeek};
-      legacy_seek = CollectDocs(prepared, rdr);
+      legacy_seek = CollectDocs(prepared);
     }
     ASSERT_EQ(legacy_readall, join)
       << "pair join diverged from read-all: " << s.ctx;
@@ -540,16 +533,13 @@ TEST_P(SlopSeekGatherTestCase, pair_join_equivalence_offsets) {
   q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("fox");
   q.mutable_options()->set_slop(1);
 
-  auto prepared = q.prepare({.index = rdr});
-  const auto* phrase_query =
-    dynamic_cast<const irs::FixedPhraseQuery*>(prepared.get());
-  ASSERT_NE(nullptr, phrase_query);
+  tests::PreparedFilter prepared{q, rdr};
 
-  const auto join = CollectOffsets(*phrase_query, rdr);
+  const auto join = CollectOffsets<irs::FixedPhraseQuery>(prepared, rdr);
   std::vector<OffsetMatch> legacy;
   {
     PairJoinGuard pj;
-    legacy = CollectOffsets(*phrase_query, rdr);
+    legacy = CollectOffsets<irs::FixedPhraseQuery>(prepared, rdr);
   }
   ASSERT_FALSE(join.empty());
   ASSERT_EQ(legacy, join);
@@ -603,21 +593,20 @@ TEST_P(SlopSeekGatherTestCase, pair_join_equivalence_variadic) {
     }
     opts.set_slop(s.slop);
 
-    auto prepared = q.prepare({.index = rdr});
-    ASSERT_NE(nullptr, prepared) << s.ctx;
+    tests::PreparedFilter prepared{q, rdr};
 
-    const auto join = CollectDocs(prepared, rdr);
+    const auto join = CollectDocs(prepared);
     std::vector<irs::doc_id_t> legacy_readall;
     std::vector<irs::doc_id_t> legacy_seek;
     {
       PairJoinGuard pj;
       GatherModeGuard g{dp::GatherOverride::kForceReadAll};
-      legacy_readall = CollectDocs(prepared, rdr);
+      legacy_readall = CollectDocs(prepared);
     }
     {
       PairJoinGuard pj;
       GatherModeGuard g{dp::GatherOverride::kForceSeek};
-      legacy_seek = CollectDocs(prepared, rdr);
+      legacy_seek = CollectDocs(prepared);
     }
     ASSERT_EQ(legacy_readall, join)
       << "variadic pair join diverged from read-all: " << s.ctx;
@@ -646,16 +635,13 @@ TEST_P(SlopSeekGatherTestCase, pair_join_equivalence_offsets_variadic) {
   q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("fox");
   q.mutable_options()->set_slop(1);
 
-  auto prepared = q.prepare({.index = rdr});
-  const auto* phrase_query =
-    dynamic_cast<const irs::VariadicPhraseQuery*>(prepared.get());
-  ASSERT_NE(nullptr, phrase_query);
+  tests::PreparedFilter prepared{q, rdr};
 
-  const auto join = CollectOffsets(*phrase_query, rdr);
+  const auto join = CollectOffsets<irs::VariadicPhraseQuery>(prepared, rdr);
   std::vector<OffsetMatch> legacy;
   {
     PairJoinGuard pj;
-    legacy = CollectOffsets(*phrase_query, rdr);
+    legacy = CollectOffsets<irs::VariadicPhraseQuery>(prepared, rdr);
   }
   ASSERT_FALSE(join.empty());
   ASSERT_EQ(legacy, join);
@@ -689,27 +675,24 @@ TEST_P(SlopSeekGatherTestCase, pair_join_solo_dispatch_equivalence) {
     q.mutable_options()->push_back<irs::ByPrefixOptions>().term = Term("fo");
     q.mutable_options()->set_slop(slop);
 
-    auto prepared = q.prepare({.index = rdr});
-    ASSERT_NE(nullptr, prepared);
+    tests::PreparedFilter prepared{q, rdr};
     const auto ctx = "qui* fo* s" + std::to_string(slop);
 
-    const auto join = CollectDocs(prepared, rdr);
+    const auto join = CollectDocs(prepared);
     std::vector<irs::doc_id_t> legacy;
     {
       PairJoinGuard pj;
-      legacy = CollectDocs(prepared, rdr);
+      legacy = CollectDocs(prepared);
     }
     ASSERT_EQ(legacy, join) << "solo dispatch diverged from gather: " << ctx;
     ASSERT_FALSE(join.empty()) << "expected matches for: " << ctx;
 
-    const auto* phrase_query =
-      dynamic_cast<const irs::VariadicPhraseQuery*>(prepared.get());
-    ASSERT_NE(nullptr, phrase_query) << ctx;
-    const auto join_offs = CollectOffsets(*phrase_query, rdr);
+    const auto join_offs =
+      CollectOffsets<irs::VariadicPhraseQuery>(prepared, rdr);
     std::vector<OffsetMatch> legacy_offs;
     {
       PairJoinGuard pj;
-      legacy_offs = CollectOffsets(*phrase_query, rdr);
+      legacy_offs = CollectOffsets<irs::VariadicPhraseQuery>(prepared, rdr);
     }
     ASSERT_EQ(legacy_offs, join_offs) << ctx;
     ASSERT_FALSE(join_offs.empty()) << ctx;
@@ -756,24 +739,23 @@ TEST_P(SlopSeekGatherTestCase, equivalence_multi_block_postings) {
       q.mutable_options()->push_back<irs::ByTermOptions>().term = Term(t);
     }
     q.mutable_options()->set_slop(slop);
-    return q.prepare({.index = rdr});
+    return tests::PreparedFilter{q, rdr};
   };
 
   // Pair: production join vs both gather modes.
   {
     auto prepared = make({"bbb", "aaa"}, 1);
-    ASSERT_NE(nullptr, prepared);
-    const auto join = CollectDocs(prepared, rdr);
+    const auto join = CollectDocs(prepared);
     ASSERT_EQ(2u, join.size());  // D1 and D3
     {
       PairJoinGuard pj;
       GatherModeGuard g{dp::GatherOverride::kForceReadAll};
-      ASSERT_EQ(join, CollectDocs(prepared, rdr));
+      ASSERT_EQ(join, CollectDocs(prepared));
     }
     {
       PairJoinGuard pj;
       GatherModeGuard g{dp::GatherOverride::kForceSeek};
-      ASSERT_EQ(join, CollectDocs(prepared, rdr));
+      ASSERT_EQ(join, CollectDocs(prepared));
     }
   }
 
@@ -781,37 +763,33 @@ TEST_P(SlopSeekGatherTestCase, equivalence_multi_block_postings) {
   // decode with SkipBlock) vs the production heuristic.
   {
     auto prepared = make({"xxx", "bbb", "aaa"}, 1);
-    ASSERT_NE(nullptr, prepared);
     std::vector<irs::doc_id_t> read_all;
     {
       GatherModeGuard g{dp::GatherOverride::kForceReadAll};
-      read_all = CollectDocs(prepared, rdr);
+      read_all = CollectDocs(prepared);
     }
     ASSERT_EQ(2u, read_all.size());  // D1 and D3
     {
       GatherModeGuard g{dp::GatherOverride::kForceSeek};
-      ASSERT_EQ(read_all, CollectDocs(prepared, rdr));
+      ASSERT_EQ(read_all, CollectDocs(prepared));
     }
-    ASSERT_EQ(read_all, CollectDocs(prepared, rdr));  // kAuto
+    ASSERT_EQ(read_all, CollectDocs(prepared));  // kAuto
 
     // Offsets: bulk three-array ReadAll vs its scalar loop vs seek.
-    const auto* phrase_query =
-      dynamic_cast<const irs::FixedPhraseQuery*>(prepared.get());
-    ASSERT_NE(nullptr, phrase_query);
     std::vector<OffsetMatch> bulk;
     {
       GatherModeGuard g{dp::GatherOverride::kForceReadAll};
-      bulk = CollectOffsets(*phrase_query, rdr);
+      bulk = CollectOffsets<irs::FixedPhraseQuery>(prepared, rdr);
     }
     ASSERT_FALSE(bulk.empty());
     {
       GatherModeGuard g{dp::GatherOverride::kForceReadAll};
       OffsBulkScalarGuard scalar;
-      ASSERT_EQ(bulk, CollectOffsets(*phrase_query, rdr));
+      ASSERT_EQ(bulk, CollectOffsets<irs::FixedPhraseQuery>(prepared, rdr));
     }
     {
       GatherModeGuard g{dp::GatherOverride::kForceSeek};
-      ASSERT_EQ(bulk, CollectOffsets(*phrase_query, rdr));
+      ASSERT_EQ(bulk, CollectOffsets<irs::FixedPhraseQuery>(prepared, rdr));
     }
   }
 }

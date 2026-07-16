@@ -139,25 +139,23 @@ using AnalyzerProvider = std::function<catalog::ColumnTokenizer(uint64_t)>;
 
 catalog::ColumnTokenizer IdentityAnalyzerProvider(uint64_t) {
   static catalog::Tokenizer gStringTokenizer(
-    ObjectId{0}, ObjectId{12345}, "test_string_verbartim", {},
-    DEFAULT_ROW_GROUP_SIZE,
+    catalog::Permissions{}, ObjectId{0}, ObjectId{12345},
+    "test_string_verbartim", {}, DEFAULT_ROW_GROUP_SIZE,
     irs::analysis::TokenizerConfig{.config = irs::StringTokenizer::Options{}});
   auto tokenizer = gStringTokenizer.GetTokenizer();
-  EXPECT_TRUE(tokenizer);
-  return {.analyzer = *std::move(tokenizer),
+  return {.analyzer = std::move(tokenizer),
           .features = irs::IndexFeatures::None};
 }
 
 template<irs::IndexFeatures Features>
 catalog::ColumnTokenizer SegmentationAnalyzerProviderBase(uint64_t) {
   static catalog::Tokenizer gStringTokenizer(
-    ObjectId{0}, ObjectId{12346}, "test_segmentation", {},
-    DEFAULT_ROW_GROUP_SIZE,
+    catalog::Permissions{}, ObjectId{0}, ObjectId{12346}, "test_segmentation",
+    {}, DEFAULT_ROW_GROUP_SIZE,
     irs::analysis::TokenizerConfig{
       .config = irs::analysis::SegmentationTokenizer::Options{}});
   auto tokenizer = gStringTokenizer.GetTokenizer();
-  EXPECT_TRUE(tokenizer);
-  return {.analyzer = *std::move(tokenizer), .features = Features};
+  return {.analyzer = std::move(tokenizer), .features = Features};
 }
 
 catalog::ColumnTokenizer SegmentationAnalyzerProvider(uint64_t id) {
@@ -173,11 +171,11 @@ catalog::ColumnTokenizer SegmentationAnalyzerProvider(uint64_t id) {
     .stream_bytes_type = irs::analysis::NGramTokenizerBase::InputType::UTF8,
   };
   static catalog::Tokenizer gNgramTokenizer(
-    ObjectId{0}, ObjectId{12347}, "test_ngram", {}, DEFAULT_ROW_GROUP_SIZE,
+    catalog::Permissions{}, ObjectId{0}, ObjectId{12347}, "test_ngram", {},
+    DEFAULT_ROW_GROUP_SIZE,
     irs::analysis::TokenizerConfig{.config = std::move(ngram_opts)});
   auto tokenizer = gNgramTokenizer.GetTokenizer();
-  EXPECT_TRUE(tokenizer);
-  return {.analyzer = *std::move(tokenizer),
+  return {.analyzer = std::move(tokenizer),
           .features = irs::IndexFeatures::Pos | irs::IndexFeatures::Freq};
 }
 
@@ -189,12 +187,12 @@ catalog::ColumnTokenizer SegmentationAnalyzerProvider(uint64_t id) {
     .ngram_size = 3,
   };
   static catalog::Tokenizer gWildcardTokenizer(
-    ObjectId{0}, ObjectId{12348}, "test_wildcard", {}, DEFAULT_ROW_GROUP_SIZE,
+    catalog::Permissions{}, ObjectId{0}, ObjectId{12348}, "test_wildcard", {},
+    DEFAULT_ROW_GROUP_SIZE,
     irs::analysis::TokenizerConfig{.config = std::move(wildcard_opts)});
   auto tokenizer = gWildcardTokenizer.GetTokenizer();
-  EXPECT_TRUE(tokenizer);
   return {
-    .analyzer = *std::move(tokenizer),
+    .analyzer = std::move(tokenizer),
     .features = irs::IndexFeatures::Pos | irs::IndexFeatures::Freq,
     .tokenizer_column = kTestTokenizerColumnId,
   };
@@ -202,13 +200,13 @@ catalog::ColumnTokenizer SegmentationAnalyzerProvider(uint64_t id) {
 
 [[maybe_unused]] catalog::ColumnTokenizer GeoJsonAnalyzerProvider(uint64_t) {
   static catalog::Tokenizer gGeoTokenizer(
-    ObjectId{0}, ObjectId{12349}, "test_geojson", {}, DEFAULT_ROW_GROUP_SIZE,
+    catalog::Permissions{}, ObjectId{0}, ObjectId{12349}, "test_geojson", {},
+    DEFAULT_ROW_GROUP_SIZE,
     irs::analysis::TokenizerConfig{
       .config = irs::analysis::GeoJsonAnalyzer::Options{}});
   auto tokenizer = gGeoTokenizer.GetTokenizer();
-  EXPECT_TRUE(tokenizer);
   return {
-    .analyzer = *std::move(tokenizer),
+    .analyzer = std::move(tokenizer),
     .features = irs::IndexFeatures::None,
     .tokenizer_column = kTestTokenizerColumnId,
   };
@@ -606,13 +604,14 @@ class SearchFilterBuilderTest : public ::testing::Test {
     // valid and always have a primary index -- no defensive checks needed.
     const auto& projected = get_op->GetColumnIds();
     ColumnGetter getter =
-      [table_index = get_op->table_index, projected, &columns,
+      [ti = get_op->table_index, projected, &columns,
        &analyzer_provider](const duckdb::BoundColumnRefExpression& ref)
       -> std::optional<SearchColumnInfo> {
       // Mismatched table_index would mean the query referenced a table we
-      // didn't set up -- always a bug in the test itself.
-      SDB_ASSERT(ref.binding.table_index == table_index);
-      const auto local = ref.binding.column_index.GetIndexUnsafe();
+      // didn't set up -- always a bug in the test itself. SDB_VERIFY (not
+      // SDB_ASSERT) so `ti` is used in release builds too.
+      SDB_VERIFY(ref.Binding().table_index == ti);
+      const auto local = ref.Binding().column_index.GetIndexUnsafe();
       const auto phys = projected[local].GetPrimaryIndex();
       // FromIsNull SDB_ENSUREs `null_field_id` is valid; production mints a
       // separate NextId() for the IS-NULL marker. The test schema doesn't
@@ -626,7 +625,7 @@ class SearchFilterBuilderTest : public ::testing::Test {
 
     // Per-expression claim loop, mirroring production
     // (iresearch_plan.cpp:572-584): MakeSearchFilter is invoked once per
-    // LogicalFilter expression, and a predicate that cannot be translated
+    // LogicalFilter expression, and a predicate it declines (non-ok status)
     // is simply not claimed instead of failing the whole build. This is
     // also what lets us coexist with DuckDB optimizer rewrites (e.g. the
     // distributivity rule adding factored conjuncts to an OR) that may
@@ -644,9 +643,10 @@ class SearchFilterBuilderTest : public ::testing::Test {
         // filter builder's named-analyzer resolver runs with a real
         // context (the resolver returns nullptr for unknown names,
         // surfacing the "tokenizer not found in catalog" error).
-        auto result = sdb::connector::MakeSearchFilter(root, single, getter,
-                                                       *_conn.context);
-        if (result.ok() && root.size() > before) {
+        const bool ok =
+          sdb::connector::MakeSearchFilter(root, single, getter, *_conn.context)
+            .ok();
+        if (ok && root.size() > before) {
           ++claimed;
         } else {
           while (root.size() > before) {
@@ -671,8 +671,11 @@ class SearchFilterBuilderTest : public ::testing::Test {
       << "MakeSearchFilter threw unexpectedly: " << caught_message;
     ASSERT_EQ(claimed > 0, must_succeed);
     if (must_succeed) {
-      ASSERT_EQ(root, expected) << "actual:   " << irs::ToString(root) << "\n"
-                                << "expected: " << irs::ToString(expected);
+      ASSERT_EQ(root, expected)
+        << "actual:   "
+        << duckdb::ExplainValue(irs::ToExplainNode(root)).ToString() << "\n"
+        << "expected: "
+        << duckdb::ExplainValue(irs::ToExplainNode(expected)).ToString();
     }
   }
 
@@ -2301,7 +2304,7 @@ TEST_F(SearchFilterBuilderTest, test_Boost_Like) {
   std::vector<ColumnSpec> columns{
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;
-  AddPrefixFilter(expected, 1, "foo").boost(3.0f);
+  AddLikeFilter(expected, 1, "foo%").boost(3.0f);
   AssertFilter(expected, "SELECT * FROM foo WHERE b @@ (ts_like('foo%')) ^ 3.0",
                columns, true);
 }
@@ -2714,7 +2717,8 @@ TEST_F(SearchFilterBuilderTest, test_GeoInRange_NonConstantCentroid) {
   irs::And expected;
   AssertFilter(
     expected, "SELECT * FROM foo WHERE ST_Distance_Between(g, c, 100.0, 500.0)",
-    columns, false, GeoJsonAnalyzerProvider);
+    columns, false, GeoJsonAnalyzerProvider,
+    "ST_Distance_Between centroid must be a constant");
 }
 
 TEST_F(SearchFilterBuilderTest, test_GeoInRange_WrongAnalyzer) {
@@ -2726,7 +2730,8 @@ TEST_F(SearchFilterBuilderTest, test_GeoInRange_WrongAnalyzer) {
   AssertFilter(expected,
                "SELECT * FROM foo WHERE ST_Distance_Between(g, "
                "'{\"type\":\"Point\",\"coordinates\":[10,20]}', 100.0, 500.0)",
-               columns, false, SegmentationAnalyzerProvider);
+               columns, false, SegmentationAnalyzerProvider,
+               "Analyzer for field is not a geo analyzer");
 }
 
 TEST_F(SearchFilterBuilderTest, test_GeoInRange_InvalidGeoJsonCentroid) {
@@ -2736,7 +2741,8 @@ TEST_F(SearchFilterBuilderTest, test_GeoInRange_InvalidGeoJsonCentroid) {
   AssertFilter(expected,
                "SELECT * FROM foo WHERE ST_Distance_Between(g, "
                "'not a geojson', 100.0, 500.0)",
-               columns, false, GeoJsonAnalyzerProvider);
+               columns, false, GeoJsonAnalyzerProvider,
+               "Geo argument is not valid JSON");
 }
 
 // ===========================================================================
@@ -2838,7 +2844,8 @@ TEST_F(SearchFilterBuilderTest, test_GeoDistance_NonConstantDistance) {
   AssertFilter(expected,
                "SELECT * FROM foo WHERE ST_Distance_Centroid(g,"
                "'{\"type\":\"Point\",\"coordinates\":[10,20]}') < d",
-               columns, false, GeoJsonAnalyzerProvider);
+               columns, false, GeoJsonAnalyzerProvider,
+               "Geo distance: comparison value must be a constant DOUBLE");
 }
 
 TEST_F(SearchFilterBuilderTest, test_GeoDistance_WrongAnalyzer) {
@@ -2848,7 +2855,8 @@ TEST_F(SearchFilterBuilderTest, test_GeoDistance_WrongAnalyzer) {
   AssertFilter(expected,
                "SELECT * FROM foo WHERE ST_Distance_Centroid(g,"
                "'{\"type\":\"Point\",\"coordinates\":[10,20]}') < 100.0",
-               columns, false, SegmentationAnalyzerProvider);
+               columns, false, SegmentationAnalyzerProvider,
+               "Analyzer for field is not a geo analyzer");
 }
 
 TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_BoostCastLevenshtein) {
@@ -2876,7 +2884,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_BoostCastLike) {
   std::vector<ColumnSpec> columns{
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;
-  AddPrefixFilter(expected, 1, "foo").boost(3.0f);
+  AddLikeFilter(expected, 1, "foo%").boost(3.0f);
   AssertFilter(expected,
                "SELECT * FROM foo WHERE b @@ (ts_like('foo%'))::boost(3.0)",
                columns, true);
@@ -3644,7 +3652,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_CommutativeLhsLike) {
   std::vector<ColumnSpec> columns{
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;
-  AddPrefixFilter(expected, 1, std::string_view{"quic"});
+  AddLikeFilter(expected, 1, std::string_view{"quic%"});
   AssertFilter(expected, "SELECT * FROM foo WHERE ts_like('quic%') @@ b",
                columns, true);
 }
@@ -3691,7 +3699,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_LikeWildcard) {
   std::vector<ColumnSpec> columns{
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;
-  AddPrefixFilter(expected, 1, std::string_view{"quic"});
+  AddLikeFilter(expected, 1, std::string_view{"quic%"});
   AssertFilter(expected, "SELECT * FROM foo WHERE b @@ ts_like('quic%')",
                columns, true);
 }
@@ -3741,9 +3749,8 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_RegexpSyntaxCaseInsensitive) {
   std::vector<ColumnSpec> columns{
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;
-  expected.add(irs::CreateByRegexp(
-    ExpectedFieldId(1),
-    irs::ViewCast<irs::byte_type>(std::string_view{"abc"})));
+  AddRegexpFilter(expected, 1, std::string_view{"abc"},
+                  irs::RegexpSyntax::PosixEre);
   AssertFilter(expected,
                "SELECT * FROM foo WHERE b @@ ts_regexp('abc', 'POSIX')",
                columns, true);
@@ -4777,7 +4784,7 @@ TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_AnyOfTokenizeListMinMatch) {
 }
 
 // Negation via NOT(b @@ ts_any(ts_tokenize(...))): wraps the resulting
-// ByTerms in irs::Not.
+// ByTerms in irs::Exclusion.
 TEST_F(SearchFilterBuilderTest, test_TSQueryMatch_AnyOfTokenizeListWithNot) {
   std::vector<ColumnSpec> columns{
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};

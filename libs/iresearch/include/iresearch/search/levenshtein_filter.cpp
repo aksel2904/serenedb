@@ -26,17 +26,19 @@
 #include "basics/shared.hpp"
 #include "basics/std.hpp"
 #include "iresearch/index/index_reader.hpp"
-#include "iresearch/search/all_terms_collector.hpp"
+#include "iresearch/search/all_terms_visitor.hpp"
+#include "iresearch/search/automaton_filter.hpp"
 #include "iresearch/search/filter_visitor.hpp"
-#include "iresearch/search/limited_sample_collector.hpp"
 #include "iresearch/search/multiterm_query.hpp"
 #include "iresearch/search/term_filter.hpp"
-#include "iresearch/search/top_terms_collector.hpp"
+#include "iresearch/search/term_iterator.hpp"
+#include "iresearch/search/top_terms_selector.hpp"
 #include "iresearch/utils/automaton_utils.hpp"
 #include "iresearch/utils/hash_utils.hpp"
 #include "iresearch/utils/levenshtein_default_pdp.hpp"
 #include "iresearch/utils/levenshtein_utils.hpp"
 #include "iresearch/utils/utf8_utils.hpp"
+#include "pg/sql_exception_macro.h"
 
 namespace irs {
 namespace {
@@ -52,257 +54,260 @@ IRS_FORCE_INLINE score_t Similarity(uint32_t distance, uint32_t size) noexcept {
   return 1.f - static_cast<score_t>(distance) / static_cast<score_t>(size);
 }
 
-template<typename Invalid, typename Term, typename Levenshtein>
-inline auto ExecuteLevenshtein(uint8_t max_distance,
-                               ByEditDistanceOptions::pdp_f provider,
-                               bool with_transpositions,
-                               const bytes_view prefix, const bytes_view target,
-                               Invalid&& inv, Term&& t, Levenshtein&& lev) {
-  if (!provider) {
-    provider = &DefaultPDP;
-  }
-
-  if (0 == max_distance) {
-    return t();
-  }
-
-  SDB_ASSERT(provider);
-  const auto& d = (*provider)(max_distance, with_transpositions);
-
-  if (!d) {
-    return inv();
-  }
-
-  return lev(d, prefix, target);
-}
-
-template<typename StatesType>
 struct AggregatedStatsVisitor : util::Noncopyable {
-  AggregatedStatsVisitor(StatesType& states, TermCollectorsFlat& stats) noexcept
-    : stats(stats), states(states) {}
+  AggregatedStatsVisitor(MultiTermState& state, FieldCollector* field_stat,
+                         TermCollector* term_stat) noexcept
+    : state{state}, field_stat{field_stat}, term_stat{term_stat} {}
 
-  void operator()(const irs::SubReader& segment, const irs::TermReader& field,
-                  uint32_t docs_count) const {
-    this->segment = &segment;
-    this->field = &field;
-    state = &states.insert(segment);
-    state->reader = &field;
-    state->scored_states_estimation += docs_count;
+  void operator()(const SubReader&, const TermReader& field, uint32_t) const {
+    if (field_stat && !field_collected) {
+      field_stat->Collect(field);
+      field_collected = true;
+    }
+    state.Prepare(&field);
   }
 
   void operator()(SeekCookie::ptr& cookie) const {
-    SDB_ASSERT(segment);
-    SDB_ASSERT(field);
-    stats.Collect(0, *cookie);
-    state->scored_states.emplace_back(std::move(cookie), 0, boost);
+    if (term_stat) {
+      term_stat->Collect(*cookie);
+    }
+    uint32_t docs_count = 0;
+    if (auto* meta = irs::get<TermMeta>(*cookie)) {
+      docs_count = meta->docs_count;
+    }
+    state.Push(MultiTermState::Entry{
+      .cookie = std::move(cookie),
+      .docs_count = docs_count,
+      .boost = boost,
+      .stat_offset = 0,
+    });
   }
 
-  TermCollectorsFlat& stats;
-  StatesType& states;
-  mutable typename StatesType::state_type* state{};
-  mutable const SubReader* segment{};
-  mutable const TermReader* field{};
-  score_t boost{irs::kNoBoost};
+  MultiTermState& state;
+  FieldCollector* field_stat;
+  TermCollector* term_stat;
+  score_t boost{kNoBoost};
+  mutable bool field_collected{false};
 };
 
-class TopTermsCollectorImpl
-  : public irs::TopTermsCollector<TopTermState<score_t>> {
+class LevenshteinIterator : public WrappedTermIterator {
  public:
-  using BaseType = irs::TopTermsCollector<TopTermState<score_t>>;
+  LevenshteinIterator(const TermReader& reader,
+                      const LevenshteinAutomatonOptions& options)
+    : LevenshteinIterator{reader,
+                          [&]() -> const automaton_table_matcher& {
+                            SDB_ENSURE(options.compiled,
+                                       "filter has no compiled acceptor");
+                            return options.compiled->matcher;
+                          }(),
+                          options.no_distance, options.utf8_target_size} {}
 
-  TopTermsCollectorImpl(size_t size, FieldCollector& stats)
-    : BaseType(size), _stats(stats) {}
+  LevenshteinIterator(const TermReader& reader,
+                      const automaton_table_matcher& matcher,
+                      byte_type no_distance, uint32_t target_size)
+    : WrappedTermIterator{reader.iterator(matcher)},
+      _payload{irs::get<PayAttr>(*_impl)},
+      _no_distance{no_distance},
+      _target_size{target_size} {}
 
-  void Prepare(const SubReader& segment, const TermReader& field,
-               const SeekTermIterator& terms) {
-    _stats.Collect(field);
-    BaseType::Prepare(segment, field, terms);
+  score_t Boost() const noexcept { return _boost.value; }
+
+  bool next() final {
+    if (!_impl->next()) {
+      return false;
+    }
+    const byte_type distance =
+      _payload->value.empty() ? _no_distance : _payload->value.front();
+    const auto utf8_value_size =
+      static_cast<uint32_t>(utf8_utils::Length(_impl->value()));
+    _boost.value =
+      Similarity(distance, std::min(utf8_value_size, _target_size));
+    return true;
+  }
+
+  Attribute* GetMutable(TypeInfo::type_id id) noexcept final {
+    if (irs::Type<TermBoost>::id() == id) {
+      return &_boost;
+    }
+    return _impl->GetMutable(id);
   }
 
  private:
-  FieldCollector& _stats;
+  const PayAttr* _payload;
+  byte_type _no_distance;
+  uint32_t _target_size;
+  TermBoost _boost;
 };
 
-//////////////////////////////////////////////////////////////////////////////
-/// @brief visitation logic for levenshtein filter
-/// @param segment segment reader
-/// @param field term reader
-/// @param matcher input matcher
-/// @param visitor visitor
-//////////////////////////////////////////////////////////////////////////////
 template<typename Visitor>
 void VisitImpl(const SubReader& segment, const TermReader& reader,
                const byte_type no_distance, const uint32_t utf8_target_size,
                const automaton_table_matcher& matcher, Visitor&& visitor) {
   SDB_ASSERT(fst::kError != matcher.Properties(0));
-  auto terms = reader.iterator(matcher);
-
-  if (!terms) [[unlikely]] {
+  LevenshteinIterator it(reader, matcher, no_distance, utf8_target_size);
+  if (!it.next()) {
     return;
   }
-
-  if (terms->next()) {
-    auto* payload = irs::get<PayAttr>(*terms);
-
-    const byte_type* distance{&no_distance};
-    if (payload && !payload->value.empty()) {
-      distance = &payload->value.front();
-    }
-
-    visitor.Prepare(segment, reader, *terms);
-
-    do {
-      terms->read();
-
-      const auto utf8_value_size =
-        static_cast<uint32_t>(utf8_utils::Length(terms->value()));
-      const auto boost =
-        Similarity(*distance, std::min(utf8_value_size, utf8_target_size));
-
-      visitor.Visit(boost);
-    } while (terms->next());
-  }
+  visitor.Prepare(segment, reader, it.GetImpl());
+  VisitTerms(it, visitor);
 }
 
-template<typename Collector>
-bool CollectTerms(const IndexReader& index, irs::field_id id, bytes_view prefix,
-                  bytes_view term, const ParametricDescription& d,
-                  Collector& collector) {
-  const auto acceptor = MakeLevenshteinAutomaton(d, prefix, term);
-
-  if (!Validate(acceptor)) {
-    return false;
-  }
-
-  auto matcher = MakeAutomatonMatcher(acceptor);
-  const auto utf8_term_size =
-    std::max(1U, static_cast<uint32_t>(utf8_utils::Length(prefix) +
-                                       utf8_utils::Length(term)));
-  const uint8_t max_distance = d.max_distance() + 1;
-
-  for (auto& segment : index) {
-    if (auto* reader = segment.field(id); reader) {
-      VisitImpl(segment, *reader, max_distance, utf8_term_size, matcher,
-                collector);
-    }
-  }
-
-  return true;
+uint32_t Utf8TargetSize(bytes_view prefix, bytes_view term) {
+  return std::max(1U, static_cast<uint32_t>(utf8_utils::Length(prefix) +
+                                            utf8_utils::Length(term)));
 }
 
-Filter::Query::ptr PrepareLevenshteinFilter(const PrepareContext& ctx,
-                                            irs::field_id id, bytes_view prefix,
-                                            bytes_view term, size_t terms_limit,
-                                            const ParametricDescription& d) {
-  FieldCollector field_stats;
-  TermCollectorsFlat term_stats{ctx.scorer, 1};
-  MultiTermQuery::States states{ctx.memory, ctx.index.size()};
+QueryBuilder::ptr PrepareLevenshteinSegment(
+  const SubReader& segment, const PrepareContext& ctx, irs::field_id field,
+  const automaton_table_matcher& matcher, uint32_t utf8_target_size,
+  byte_type no_distance, size_t terms_limit, score_t boost) {
+  auto query = memory::make_tracked<MultiTermQuery>(
+    ctx.memory, segment, ctx.memory, ctx.boost * boost, ScoreMergeType::Max,
+    size_t{1});
+
+  const auto* reader = segment.field(field);
+  if (!reader) {
+    return query;
+  }
+
+  auto* collector = ctx.collector
+                      ? &sdb::basics::downCast<ByTermsCollector>(*ctx.collector)
+                      : nullptr;
 
   if (!terms_limit) {
-    AllTermsCollector term_collector{states, field_stats, term_stats};
-    term_collector.stat_index(0);  // aggregate stats from different terms
-
-    if (!CollectTerms(ctx.index, id, prefix, term, d, term_collector)) {
-      return Filter::Query::empty();
-    }
+    AllTermsVisitor term_collector{query->State(),
+                                   collector ? &collector->Field() : nullptr,
+                                   collector ? &collector->Terms() : nullptr};
+    VisitImpl(segment, *reader, no_distance, utf8_target_size, matcher,
+              term_collector);
   } else {
-    TopTermsCollectorImpl term_collector(terms_limit, field_stats);
+    TopTermsSelector<TopTermState<score_t>> selector{terms_limit};
+    VisitImpl(segment, *reader, no_distance, utf8_target_size, matcher,
+              selector);
 
-    if (!CollectTerms(ctx.index, id, prefix, term, d, term_collector)) {
-      return Filter::Query::empty();
-    }
-
-    AggregatedStatsVisitor aggregate_stats{states, term_stats};
-    term_collector.Visit([&aggregate_stats](TopTermState<score_t>& state) {
-      aggregate_stats.boost = std::max(0.f, state.key);
-      state.Visit(aggregate_stats);
+    AggregatedStatsVisitor aggregate_stats{
+      query->State(), collector ? &collector->Field() : nullptr,
+      collector ? &collector->Terms()[0] : nullptr};
+    selector.Visit([&aggregate_stats](TopTermState<score_t>& s) {
+      aggregate_stats.boost = std::max(0.f, s.key);
+      s.Visit(aggregate_stats);
     });
   }
 
-  MultiTermQuery::Stats stats(
-    1, MultiTermQuery::Stats::allocator_type{ctx.memory});
-  stats.back().resize(GetStatsSize(ctx.scorer), 0);
-  auto* stats_buf = stats[0].data();
-  term_stats.Finish(stats_buf, 0, &field_stats);
-
-  return memory::make_tracked<MultiTermQuery>(ctx.memory, std::move(states),
-                                              std::move(stats), ctx.boost,
-                                              ScoreMergeType::Max, size_t{1});
+  return query;
 }
 
 }  // namespace
 
-field_visitor ByEditDistance::visitor(const ByEditDistanceAllOptions& opts) {
+QueryBuilder::ptr ByEditDistance::PrepareSegment(const SubReader&,
+                                                 const PrepareContext&) const {
+  THROW_SQL_ERROR(
+    ERR_MSG("ByEditDistance must be lowered by the optimizer before prepare"));
+}
+
+QueryBuilder::ptr LevenshteinAutomatonFilter::PrepareSegment(
+  const SubReader& segment, const PrepareContext& ctx, irs::field_id id,
+  const LevenshteinAutomatonOptions& options, score_t boost) {
+  SDB_ASSERT(options.compiled);
+  return PrepareLevenshteinSegment(
+    segment, ctx, id, options.compiled->matcher, options.utf8_target_size,
+    options.no_distance, options.max_terms, boost);
+}
+
+field_visitor LevenshteinAutomatonFilter::visitor(
+  const LevenshteinAutomatonOptions& options) {
+  if (!options.compiled ||
+      fst::kError == options.compiled->matcher.Properties(0)) {
+    return [](const SubReader&, const TermReader&, FilterVisitor&) {};
+  }
+
+  return
+    [compiled = options.compiled, utf8_target_size = options.utf8_target_size,
+     no_distance = options.no_distance](const SubReader& segment,
+                                        const TermReader& field,
+                                        FilterVisitor& visitor) {
+      return VisitImpl(segment, field, no_distance, utf8_target_size,
+                       compiled->matcher, visitor);
+    };
+}
+
+QueryBuilder::ptr LevenshteinAutomatonFilter::PrepareSegment(
+  const SubReader& segment, const PrepareContext& ctx) const {
+  return PrepareSegment(segment, ctx, field_id(), options(), Boost());
+}
+
+PrepareCollector::ptr LevenshteinAutomatonFilter::MakeCollector(
+  const Scorer* scorer) const {
+  return std::make_unique<ByTermsCollector>(scorer, 1);
+}
+
+LevenshteinAutomatonOptions::LevenshteinAutomatonOptions(
+  const ParametricDescription& d, bytes_view prefix, bytes_view term,
+  size_t max_terms)
+  : compiled{std::make_shared<const CompiledAcceptor>(
+      MakeLevenshteinAutomaton(d, prefix, term))},
+    utf8_target_size{Utf8TargetSize(prefix, term)},
+    no_distance{static_cast<byte_type>(d.max_distance() + 1)},
+    max_terms{max_terms} {
+  target.reserve(prefix.size() + term.size());
+  target += prefix;
+  target += term;
+}
+
+Filter::ptr LowerLevenshtein(irs::field_id id,
+                             const ByEditDistanceOptions& opts, score_t boost) {
   return ExecuteLevenshtein(
     opts.max_distance, opts.provider, opts.with_transpositions, opts.prefix,
-    opts.term,
-    [] -> field_visitor {
-      return [](const SubReader&, const TermReader&, FilterVisitor&) {};
+    opts.term, [] -> Filter::ptr { return std::make_unique<Empty>(); },
+    [&] -> Filter::ptr {
+      auto filter = std::make_unique<ByTerm>();
+      *filter->mutable_field_id() = id;
+      auto& target = filter->mutable_options()->term;
+      target.reserve(opts.prefix.size() + opts.term.size());
+      target += opts.prefix;
+      target += opts.term;
+      filter->boost(boost);
+      return filter;
     },
-    [&opts] -> field_visitor {
-      // must copy term as it may point to temporary string
-      return [target = opts.prefix + opts.term](const SubReader& segment,
-                                                const TermReader& field,
-                                                FilterVisitor& visitor) {
-        return ByTerm::visit(segment, field, target, visitor);
-      };
-    },
-    [](const ParametricDescription& d, const bytes_view prefix,
-       const bytes_view term) -> field_visitor {
-      struct AutomatonContext : util::Noncopyable {
-        AutomatonContext(const ParametricDescription& d, bytes_view prefix,
-                         bytes_view term)
-          : acceptor(MakeLevenshteinAutomaton(d, prefix, term)),
-            matcher(MakeAutomatonMatcher(acceptor)) {}
-
-        automaton acceptor;
-        automaton_table_matcher matcher;
-      };
-
-      auto ctx = std::make_shared<AutomatonContext>(d, prefix, term);
-
-      if (!Validate(ctx->acceptor)) {
-        return [](const SubReader&, const TermReader&, FilterVisitor&) {};
+    [&](const ParametricDescription& d, const bytes_view prefix,
+        const bytes_view term) -> Filter::ptr {
+      LevenshteinAutomatonOptions lowered{d, prefix, term, opts.max_terms};
+      if (fst::kError == lowered.compiled->matcher.Properties(0)) {
+        return std::make_unique<Empty>();
       }
-
-      const auto utf8_term_size =
-        std::max(1U, static_cast<uint32_t>(utf8_utils::Length(prefix) +
-                                           utf8_utils::Length(term)));
-      const uint8_t max_distance = d.max_distance() + 1;
-
-      return [ctx = std::move(ctx), utf8_term_size, max_distance](
-               const SubReader& segment, const TermReader& field,
-               FilterVisitor& visitor) mutable {
-        return VisitImpl(segment, field, max_distance, utf8_term_size,
-                         ctx->matcher, visitor);
-      };
+      auto filter = std::make_unique<LevenshteinAutomatonFilter>();
+      *filter->mutable_field_id() = id;
+      *filter->mutable_options() = std::move(lowered);
+      filter->boost(boost);
+      return filter;
     });
 }
 
-Filter::Query::ptr ByEditDistance::prepare(
-  const PrepareContext& ctx, irs::field_id id, bytes_view term,
-  size_t scored_terms_limit, uint8_t max_distance, options_type::pdp_f provider,
-  bool with_transpositions, bytes_view prefix) {
-  return ExecuteLevenshtein(
-    max_distance, provider, with_transpositions, prefix, term,
-    [] -> Query::ptr { return Query::empty(); },
-    [&] -> Query::ptr {
-      if (!prefix.empty() && !term.empty()) {
-        bstring target;
-        target.reserve(prefix.size() + term.size());
-        target += prefix;
-        target += term;
-        return ByTerm::prepare(ctx, id, target);
-      }
+TermPredicate::ptr LevenshteinAutomatonFilter::CompileTermPredicate() const {
+  return MakeAutomatonTermPredicate(options().compiled);
+}
 
-      return ByTerm::prepare(ctx, id, prefix.empty() ? term : prefix);
-    },
-    [&, scored_terms_limit](const ParametricDescription& d,
-                            const bytes_view prefix,
-                            const bytes_view term) -> Query::ptr {
-      return PrepareLevenshteinFilter(ctx, id, prefix, term, scored_terms_limit,
-                                      d);
-    });
+TermPredicate::ptr ByEditDistance::CompileTermPredicate() const {
+  auto lowered = LowerLevenshtein(field_id(), options(), kNoBoost);
+  if (!lowered) {
+    return nullptr;
+  }
+  auto predicate = lowered->CompileTermPredicate();
+  if (!predicate) {
+    return nullptr;
+  }
+  return MakeTermPredicate([lowered = std::move(lowered),
+                            predicate = std::move(predicate)](bytes_view term) {
+    return predicate->Accepts(term);
+  });
+}
+
+TermIterator::ptr LevenshteinAutomatonFilter::CompileTermIterator(
+  const TermReader& reader) const {
+  if (!options().compiled) {
+    return nullptr;
+  }
+  return memory::make_managed<LevenshteinIterator>(reader, options());
 }
 
 }  // namespace irs

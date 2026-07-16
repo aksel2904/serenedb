@@ -1,0 +1,529 @@
+# DOCS_TEST: example_001
+
+control substitution on
+
+statement ok
+DROP TABLE IF EXISTS tbl1;
+
+statement ok
+CREATE TABLE tbl1 AS SELECT * FROM (VALUES
+    (1, 1, 10, 100, 1, 2, 3, 1, 2, 3, 1, 1, 1, 1, 1, 1, 1, 'Intro to Search', 'search analytics body', 'search content', 'alien galaxy film', 'alpha', 'search', 'engineering', 'sci-fi', 'north', 'US', 'Berlin', 'widget', 'Alice', 'open', 'AAPL', 100, 10, 9.5e0, 4200, 120, 2024, 1000, 70000, 1, 500, 1, 42, DATE '2025-01-15', TIMESTAMP '2025-01-15 10:00:00', TIMESTAMP '2025-01-16 10:00:00', DATE '2025-01-15', DATE '2025-01-15', TIMESTAMP '2025-01-15 10:00:00', TIMESTAMP '2025-01-15 10:00:00', 1, 1, 1, 1, 10, 100e0, 5e-2, 1e-2, 'N', 'O', DATE '1998-09-01', DATE '1998-08-15', DATE '1998-09-05', 'DELIVER IN PERSON', 'AIR', 'first lineitem'),
+    (2, 2, 20, 200, 2, 3, 4, 2, 3, 4, 2, 2, 2, 2, 2, 2, 2, 'Scaling Analytics', 'another text body', 'analytics content', 'biggest blockbuster story', 'beta', 'analytics', 'product', 'drama', 'south', 'DE', 'Paris', 'gadget', 'Bob', 'closed', 'MSFT', 200, 20, 19.5e0, 5100, 95, 2025, 2500, 80000, 2, 700, 2, 84, DATE '2025-03-01', TIMESTAMP '2025-03-01 11:00:00', TIMESTAMP '2025-03-02 11:00:00', DATE '2025-03-01', DATE '2025-03-01', TIMESTAMP '2025-03-01 11:00:00', TIMESTAMP '2025-03-01 11:00:00', 2, 2, 2, 2, 20, 200e0, 1e-1, 2e-2, 'R', 'F', DATE '1998-09-02', DATE '1998-08-16', DATE '1998-09-06', 'TAKE BACK RETURN', 'MAIL', 'second lineitem')
+) AS t(id, i, j, k, x, y, z, a, b, c, article_id, comment_id, author_id, customer_id, order_id, product_id, employee_id, title, body, content, description, name, tag, category, genre, region, country, city, product, customer, status, symbol, amount, quantity, price, views, runtime, year, revenue, salary, grade, balance, count, value, published_at, created_at, updated_at, date, sale_date, ts, time, l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment);
+
+statement ok
+DROP TABLE IF EXISTS tbl2;
+
+statement ok
+CREATE TABLE tbl2 AS SELECT * FROM (VALUES
+    (1, 1, 10, 100, 1, 2, 3, 1, 2, 3, 1, 1, 1, 1, 1, 1, 1, 'Intro to Search', 'search analytics body', 'search content', 'alien galaxy film', 'alpha', 'search', 'engineering', 'sci-fi', 'north', 'US', 'Berlin', 'widget', 'Alice', 'open', 'AAPL', 100, 10, 9.5e0, 4200, 120, 2024, 1000, 70000, 1, 500, 1, 42, DATE '2025-01-15', TIMESTAMP '2025-01-15 10:00:00', TIMESTAMP '2025-01-16 10:00:00', DATE '2025-01-15', DATE '2025-01-15', TIMESTAMP '2025-01-15 10:00:00', TIMESTAMP '2025-01-15 10:00:00', 1, 1, 1, 1, 10, 100e0, 5e-2, 1e-2, 'N', 'O', DATE '1998-09-01', DATE '1998-08-15', DATE '1998-09-05', 'DELIVER IN PERSON', 'AIR', 'first lineitem'),
+    (2, 2, 20, 200, 2, 3, 4, 2, 3, 4, 2, 2, 2, 2, 2, 2, 2, 'Scaling Analytics', 'another text body', 'analytics content', 'biggest blockbuster story', 'beta', 'analytics', 'product', 'drama', 'south', 'DE', 'Paris', 'gadget', 'Bob', 'closed', 'MSFT', 200, 20, 19.5e0, 5100, 95, 2025, 2500, 80000, 2, 700, 2, 84, DATE '2025-03-01', TIMESTAMP '2025-03-01 11:00:00', TIMESTAMP '2025-03-02 11:00:00', DATE '2025-03-01', DATE '2025-03-01', TIMESTAMP '2025-03-01 11:00:00', TIMESTAMP '2025-03-01 11:00:00', 2, 2, 2, 2, 20, 200e0, 1e-1, 2e-2, 'R', 'F', DATE '1998-09-02', DATE '1998-08-16', DATE '1998-09-06', 'TAKE BACK RETURN', 'MAIL', 'second lineitem')
+) AS t(id, i, j, k, x, y, z, a, b, c, article_id, comment_id, author_id, customer_id, order_id, product_id, employee_id, title, body, content, description, name, tag, category, genre, region, country, city, product, customer, status, symbol, amount, quantity, price, views, runtime, year, revenue, salary, grade, balance, count, value, published_at, created_at, updated_at, date, sale_date, ts, time, l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment);
+
+# DOCS_TEST_RAW
+#| ATTACH 'file.db';
+
+# DOCS_TEST_BODY
+
+statement ok
+ATTACH '${__TEST_DIR__}/db25.csv';
+
+# DOCS_TEST: example_002
+
+# DOCS_TEST_RAW
+#| ATTACH 'file.db' AS file_db;
+
+# DOCS_TEST_BODY
+
+statement ok
+DETACH IF EXISTS db15;
+
+statement ok
+ATTACH '${__TEST_DIR__}/db15.csv' AS db15;
+
+# DOCS_TEST: example_003
+
+statement ok
+DETACH IF EXISTS db16;
+
+statement ok
+DETACH IF EXISTS db17;
+
+statement ok
+ATTACH '${__TEST_DIR__}/db17.db' AS db17;
+
+statement ok
+CREATE TABLE db17.items AS SELECT 1 AS id, 'alpha' AS name;
+
+statement ok
+DETACH db17;
+
+# DOCS_TEST_RAW
+#| ATTACH 'file.db' (READ_ONLY);
+
+# DOCS_TEST_BODY
+
+statement ok
+ATTACH '${__TEST_DIR__}/db17.db' AS db16 (READ_ONLY);
+
+statement ok
+DETACH db16;
+
+# DOCS_TEST: example_004
+
+# DOCS_TEST_RAW
+#| ATTACH 'file.db' (BLOCK_SIZE 16_384);
+
+# DOCS_TEST_BODY
+
+statement ok
+ATTACH '${__TEST_DIR__}/db26.csv' (BLOCK_SIZE 16_384);
+
+# DOCS_TEST: example_005
+
+# DOCS_TEST_RAW
+#| ATTACH 'file.db' (ROW_GROUP_SIZE 2048);
+
+# DOCS_TEST_BODY
+
+statement ok
+ATTACH '${__TEST_DIR__}/db27.csv' (ROW_GROUP_SIZE 2048);
+
+# DOCS_TEST: example_006
+
+# DOCS_TEST_RAW
+#| ATTACH 'file.db' (RECOVERY_MODE no_wal_writes);
+
+# DOCS_TEST_BODY
+
+statement ok
+ATTACH '${__TEST_DIR__}/db28.csv' (RECOVERY_MODE no_wal_writes);
+
+# DOCS_TEST: example_008
+
+# DOCS_TEST_RAW
+#| ATTACH IF NOT EXISTS 'file.db';
+
+# DOCS_TEST_BODY
+
+statement ok
+ATTACH IF NOT EXISTS '${__TEST_DIR__}/db29.csv';
+
+# DOCS_TEST: example_009
+
+# DOCS_TEST_RAW
+#| ATTACH IF NOT EXISTS 'file.db' AS file_db;
+
+# DOCS_TEST_BODY
+
+statement ok
+ATTACH IF NOT EXISTS '${__TEST_DIR__}/db15b.csv' AS db15;
+
+# DOCS_TEST: example_010
+
+# DOCS_TEST_RAW
+#| ATTACH OR REPLACE 'file2.db' AS file_db;
+
+# DOCS_TEST_BODY
+
+statement ok
+ATTACH OR REPLACE '${__TEST_DIR__}/db15c.csv' AS db15;
+
+# DOCS_TEST: example_011
+
+statement ok
+DETACH IF EXISTS db16;
+
+statement ok
+ATTACH ':memory:' AS db16;
+
+# DOCS_TEST_BODY
+
+statement ok
+CREATE TABLE db16.new_table (i INTEGER);
+
+# DOCS_TEST: example_012
+
+# DOCS_TEST_BODY
+
+statement ok
+DETACH db16;
+
+# DOCS_TEST: example_013
+
+# DOCS_TEST_BODY
+
+statement ok
+SHOW DATABASES;
+
+# DOCS_TEST: example_014
+
+statement ok
+DETACH IF EXISTS db16;
+
+statement ok
+ATTACH ':memory:' AS db16;
+
+# DOCS_TEST_BODY
+
+statement ok
+USE db16;
+
+# DOCS_TEST: example_015
+
+statement ok
+USE $__DATABASE__;
+
+statement ok
+DETACH IF EXISTS db16;
+
+statement ok
+DETACH IF EXISTS db18;
+
+statement ok
+ATTACH '${__TEST_DIR__}/db18.duckdb' AS db18;
+
+statement ok
+CREATE TABLE db18.stations AS SELECT * FROM (VALUES
+    (1, 'Amsterdam Centraal'),
+    (2, 'Rotterdam Centraal')
+) AS t(station_id, station_name);
+
+statement ok
+DETACH db18;
+
+# DOCS_TEST_RAW
+#| ATTACH 'https://blobs.duckdb.org/databases/stations.duckdb' AS stations_db;
+#|
+#| ATTACH 'https://blobs.duckdb.org/databases/stations.duckdb' AS stations_db (READ_ONLY);
+
+# DOCS_TEST_BODY
+
+statement ok
+DETACH IF EXISTS db19;
+
+statement ok
+ATTACH '${__TEST_DIR__}/db18.duckdb' AS db19;
+
+statement ok
+DETACH db19;
+
+statement ok
+ATTACH '${__TEST_DIR__}/db18.duckdb' AS db19 (READ_ONLY);
+
+# DOCS_TEST: example_016
+
+statement ok
+DETACH IF EXISTS db19;
+
+statement ok
+DETACH IF EXISTS db18;
+
+statement ok
+ATTACH '${__TEST_DIR__}/db18b.duckdb' AS db18;
+
+statement ok
+CREATE TABLE db18.stations AS SELECT * FROM (VALUES
+    (1, 'Amsterdam Centraal'),
+    (2, 'Rotterdam Centraal')
+) AS t(station_id, station_name);
+
+statement ok
+DETACH db18;
+
+# DOCS_TEST_RAW
+#| ATTACH 's3://⟨blobs-duckdb⟩/databases/stations.duckdb' AS stations_db;
+#|
+#| ATTACH 's3://⟨blobs-duckdb⟩/databases/stations.duckdb' AS stations_db (READ_ONLY);
+
+# DOCS_TEST_BODY
+
+statement ok
+ATTACH '${__TEST_DIR__}/db18b.duckdb' AS db19;
+
+statement ok
+DETACH db19;
+
+statement ok
+ATTACH '${__TEST_DIR__}/db18b.duckdb' AS db19 (READ_ONLY);
+
+# DOCS_TEST: example_017
+
+# DOCS_TEST_RAW
+#| ATTACH 'file.db' (STORAGE_VERSION 'v1.2.0');
+
+# DOCS_TEST_BODY
+
+statement ok
+ATTACH '${__TEST_DIR__}/db30.csv' (STORAGE_VERSION 'v1.2.0');
+
+# DOCS_TEST: example_018
+
+# DOCS_TEST_RAW
+#| ATTACH 'encrypted.db' AS enc_db (ENCRYPTION_KEY 'secret_key');
+
+# DOCS_TEST_BODY
+
+statement ok
+DETACH IF EXISTS db20;
+
+statement ok
+ATTACH '${__TEST_DIR__}/db20.csv' AS db20 (ENCRYPTION_KEY 'secret_key');
+
+statement ok
+DETACH db20;
+
+# DOCS_TEST: example_020
+
+# DOCS_TEST_RAW
+#| ATTACH 'encrypted.db' AS enc_db (ENCRYPTION_KEY 'secret_key', ENCRYPTION_CIPHER 'CTR');
+
+# DOCS_TEST_BODY
+
+statement ok
+DETACH IF EXISTS db20;
+
+statement ok
+ATTACH '${__TEST_DIR__}/db20b.csv' AS db20 (ENCRYPTION_KEY 'secret_key', ENCRYPTION_CIPHER 'CTR');
+
+statement ok
+DETACH db20;
+
+# DOCS_TEST: example_021
+
+statement ok
+DETACH IF EXISTS db21;
+
+# DOCS_TEST_BODY
+
+statement ok
+ATTACH ':memory:' AS db21;
+
+statement ok
+USE db21;
+
+# DOCS_TEST: example_022
+
+statement ok
+DETACH IF EXISTS db22;
+
+# DOCS_TEST_BODY
+
+statement ok
+ATTACH ':memory:' AS db22;
+
+# DOCS_TEST: example_023
+
+# DOCS_TEST_BODY
+
+statement ok
+CREATE SCHEMA db22.my_schema;
+
+# DOCS_TEST: example_024
+
+# DOCS_TEST_BODY
+
+statement ok
+CREATE TABLE db22.my_schema.my_table (col INTEGER);
+
+# DOCS_TEST: example_025
+
+# DOCS_TEST_BODY
+
+query
+SELECT db22.my_schema.my_table.col FROM db22.my_schema.my_table;
+----
+col
+
+# DOCS_TEST: example_026
+
+# DOCS_TEST_BODY
+
+statement ok
+CREATE TABLE my_table (col INTEGER);
+
+# DOCS_TEST: example_027
+
+# DOCS_TEST_BODY
+
+statement ok
+USE db22;
+
+# DOCS_TEST: example_028
+
+# DOCS_TEST_BODY
+
+statement ok
+USE db22.my_schema;
+
+# DOCS_TEST: example_029
+
+statement ok
+USE $__DATABASE__;
+
+statement ok
+DETACH IF EXISTS db22;
+
+statement ok
+DROP SCHEMA IF EXISTS db22 CASCADE;
+
+statement ok
+DROP SCHEMA IF EXISTS my_schema CASCADE;
+
+# DOCS_TEST_BODY
+
+statement ok
+ATTACH ':memory:' AS db22;
+
+statement ok
+CREATE SCHEMA my_schema;
+
+# DOCS_TEST: example_030
+
+# DOCS_TEST_BODY
+
+statement ok
+CREATE TABLE db22.tbl (i INTEGER);
+
+# DOCS_TEST: example_031
+
+# DOCS_TEST_BODY
+
+statement ok
+CREATE TABLE my_schema.tbl (i INTEGER);
+
+# DOCS_TEST: example_032
+
+statement ok
+CREATE SCHEMA db22;
+
+# DOCS_TEST_BODY
+
+statement error
+CREATE TABLE db22.tbl2 (i INTEGER);
+----
+db error: ERROR: Ambiguous reference to catalog or schema "db22" - use a fully qualified path like "<slt:ignore>.db22"
+
+
+# DOCS_TEST: example_033
+
+statement ok
+USE $__DATABASE__;
+
+statement ok
+DROP TABLE IF EXISTS tbl1;
+
+statement ok
+DROP TABLE IF EXISTS tbl2;
+
+statement ok
+DETACH IF EXISTS db23;
+
+statement ok
+DETACH IF EXISTS db24;
+
+# DOCS_TEST_BODY
+
+statement ok
+ATTACH ':memory:' AS db23;
+
+statement ok
+ATTACH ':memory:' AS db24;
+
+statement ok
+CREATE TABLE db23.tbl1 (i INTEGER);
+
+statement ok
+CREATE TABLE db24.tbl2 (j INTEGER);
+
+# DOCS_TEST: example_034
+
+# DOCS_TEST_BODY
+
+query
+SELECT * FROM db23.tbl1;
+----
+i
+
+query
+SELECT * FROM db24.tbl2;
+----
+j
+
+# DOCS_TEST: example_035
+
+# DOCS_TEST_RAW
+#| SET search_path TO db1, db2;
+#|
+#| SELECT * FROM tbl1;
+#|
+#| SELECT * FROM tbl2;
+
+# DOCS_TEST_BODY
+
+statement ok
+SET search_path TO db23, db24;
+
+query
+SELECT * FROM tbl1;
+----
+i
+
+query
+SELECT * FROM tbl2;
+----
+j
+
+statement ok
+USE $__DATABASE__;
+
+statement ok
+SET search_path TO main;
+
+statement ok
+DETACH IF EXISTS db15;
+
+statement ok
+DETACH IF EXISTS db16;
+
+statement ok
+DETACH IF EXISTS db17;
+
+statement ok
+DETACH IF EXISTS db18;
+
+statement ok
+DETACH IF EXISTS db19;
+
+statement ok
+DETACH IF EXISTS db20;
+
+statement ok
+DETACH IF EXISTS db21;
+
+statement ok
+DETACH IF EXISTS db22;
+
+statement ok
+DETACH IF EXISTS db23;
+
+statement ok
+DETACH IF EXISTS db24;
+
+statement ok
+DETACH IF EXISTS db25;
+
+statement ok
+DETACH IF EXISTS db26;
+
+statement ok
+DETACH IF EXISTS db27;
+
+statement ok
+DETACH IF EXISTS db28;
+
+statement ok
+DETACH IF EXISTS db29;
+
+statement ok
+DETACH IF EXISTS db30;

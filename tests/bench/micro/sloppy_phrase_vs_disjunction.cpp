@@ -43,6 +43,7 @@
 // Europarl path comes from env SERENEDB_BENCH_EUROPARL, with a fallback
 // relative to the working directory. Aborts if the file is missing.
 
+#include <absl/algorithm/container.h>
 #include <benchmark/benchmark.h>
 #include <utf8.h>
 
@@ -940,13 +941,40 @@ struct MaxMemoryCounter final : irs::IResourceManager {
   size_t max{0};
 };
 
+// Per-segment prepared queries plus an empty StatsBuffer for unscored
+// execution: the NoCollector shape of tests::PreparedFilter, inlined here
+// because the bench target has no access to the test helpers.
+struct BenchPrepared {
+  std::vector<irs::QueryBuilder::ptr> queries;
+  irs::StatsBuffer stats;
+
+  bool AnyNull() const noexcept {
+    return absl::c_any_of(queries, [](const auto& q) { return !q; });
+  }
+};
+
+template<typename Filter>
+BenchPrepared Prepare(
+  const Filter& q, const irs::DirectoryReader& rdr,
+  irs::IResourceManager& memory = irs::IResourceManager::gNoop) {
+  BenchPrepared out;
+  out.queries.reserve(rdr.size());
+  for (const auto& sub : rdr) {
+    out.queries.emplace_back(q.PrepareSegment(sub, {
+                                                     .collector = nullptr,
+                                                     .memory = memory,
+                                                   }));
+  }
+  return out;
+}
+
 template<typename MakeFn>
 void BenchPrepare(benchmark::State& state, const irs::DirectoryReader& rdr,
                   MakeFn make) {
   {
     auto q = make();
-    auto check = q.prepare({.index = rdr});
-    if (!check) {
+    auto check = Prepare(q, rdr);
+    if (check.AnyNull()) {
       state.SkipWithError("prepare returned null");
       return;
     }
@@ -956,7 +984,7 @@ void BenchPrepare(benchmark::State& state, const irs::DirectoryReader& rdr,
   for (auto _ : state) {
     counter.Reset();
     auto q = make();
-    auto prepared = q.prepare({.index = rdr, .memory = counter});
+    auto prepared = Prepare(q, rdr, counter);
     benchmark::DoNotOptimize(prepared);
   }
 
@@ -970,8 +998,8 @@ template<typename MakeFn>
   GatherModeGuard guard{mode};
 
   auto q = make();
-  auto prepared = q.prepare({.index = rdr});
-  if (!prepared) {
+  auto prepared = Prepare(q, rdr);
+  if (prepared.AnyNull()) {
     state.SkipWithError("prepare returned null");
     return;
   }
@@ -984,9 +1012,9 @@ template<typename MakeFn>
 #endif
   for (auto _ : state) {
     per_iter = 0;
-    for (const auto& sub : rdr) {
-      auto docs = prepared->execute({.segment = sub});
-      while (docs->next()) {
+    for (const auto& query : prepared.queries) {
+      auto docs = query->Execute({}, prepared.stats);
+      while (!irs::doc_limits::eof(docs->advance())) {
         ++per_iter;
       }
     }
@@ -1066,15 +1094,20 @@ template<typename PhraseQueryT = irs::FixedPhraseQuery, typename MakeFn>
   GatherModeGuard guard{mode};
 
   auto q = make();
-  auto prepared = q.prepare({.index = rdr});
-  if (!prepared) {
+  auto prepared = Prepare(q, rdr);
+  if (prepared.AnyNull()) {
     state.SkipWithError("prepare returned null");
     return;
   }
-  const auto* phrase_query = dynamic_cast<const PhraseQueryT*>(prepared.get());
-  if (!phrase_query) {
-    state.SkipWithError("prepared query has unexpected type");
-    return;
+  std::vector<const PhraseQueryT*> phrase_queries;
+  phrase_queries.reserve(prepared.queries.size());
+  for (const auto& query : prepared.queries) {
+    const auto* phrase_query = dynamic_cast<const PhraseQueryT*>(query.get());
+    if (!phrase_query) {
+      state.SkipWithError("prepared query has unexpected type");
+      return;
+    }
+    phrase_queries.push_back(phrase_query);
   }
 
   size_t docs_per_iter = 0;
@@ -1087,8 +1120,9 @@ template<typename PhraseQueryT = irs::FixedPhraseQuery, typename MakeFn>
   for (auto _ : state) {
     docs_per_iter = 0;
     matches_per_iter = 0;
+    size_t seg = 0;
     for (const auto& sub : rdr) {
-      auto docs = phrase_query->ExecuteWithOffsets(sub);
+      auto docs = phrase_queries[seg++]->ExecuteWithOffsets(sub);
       if (!docs) {
         continue;
       }
@@ -1096,7 +1130,7 @@ template<typename PhraseQueryT = irs::FixedPhraseQuery, typename MakeFn>
       if (!pos) {
         continue;
       }
-      while (docs->next()) {
+      while (!irs::doc_limits::eof(docs->advance())) {
         ++docs_per_iter;
         while (pos->next()) {
           ++matches_per_iter;

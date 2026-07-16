@@ -22,6 +22,7 @@
 
 #include <absl/synchronization/mutex.h>
 
+#include <expected>
 #include <iresearch/analysis/analyzer.hpp>
 #include <iresearch/analysis/ngram_tokenizer.hpp>
 #include <iresearch/analysis/normalizing_tokenizer.hpp>
@@ -29,6 +30,7 @@
 #include <iresearch/analysis/text_tokenizer.hpp>
 #include <iresearch/analysis/tokenizer_config.hpp>
 #include <memory>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -63,7 +65,7 @@ class Tokenizer : public Object {
   static std::shared_ptr<Tokenizer> Deserialize(duckdb::Deserializer& src,
                                                 ReadContext ctx);
 
-  ResultOr<TokenizerWrapper> GetTokenizer();
+  TokenizerWrapper GetTokenizer();
 
   void PushTokenizer(irs::analysis::Analyzer::ptr analyzer) noexcept;
 
@@ -72,8 +74,9 @@ class Tokenizer : public Object {
   void Serialize(duckdb::Serializer& sink) const final;
   std::shared_ptr<Object> Clone() const final;
 
-  Tokenizer(ObjectId schema_id, ObjectId id, std::string_view name,
-            search::Features features, uint32_t norm_row_group_size,
+  Tokenizer(Permissions perm, ObjectId schema_id, ObjectId id,
+            std::string_view name, search::Features features,
+            uint32_t norm_row_group_size,
             irs::analysis::TokenizerConfig config);
 
   const search::Features& GetFeatures() const noexcept { return _features; }

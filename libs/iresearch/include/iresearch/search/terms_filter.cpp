@@ -23,162 +23,121 @@
 #include "terms_filter.hpp"
 
 #include "iresearch/index/index_reader.hpp"
-#include "iresearch/search/all_filter.hpp"
-#include "iresearch/search/all_terms_collector.hpp"
-#include "iresearch/search/boolean_filter.hpp"
+#include "iresearch/search/all_terms_visitor.hpp"
 #include "iresearch/search/collectors.hpp"
 #include "iresearch/search/filter_visitor.hpp"
 #include "iresearch/search/multiterm_query.hpp"
 #include "iresearch/search/term_filter.hpp"
+#include "iresearch/search/term_iterator.hpp"
 
 namespace irs {
 namespace {
 
-template<typename Visitor>
-void VisitImpl(const SubReader& segment, const TermReader& field,
-               const ByTermsOptions::search_terms& search_terms,
-               Visitor& visitor) {
-  auto terms = field.iterator(SeekMode::NORMAL);
-
-  if (!terms) [[unlikely]] {
-    return;
-  }
-
-  visitor.Prepare(segment, field, *terms);
-
-  [[maybe_unused]] uint32_t idx = 0;
-  for (auto& term : search_terms) {
-    if constexpr (requires { visitor.SetIndex(idx); }) {
-      visitor.SetIndex(idx++);
-    }
-
-    if (!terms->seek(term.term)) {
-      continue;
-    }
-
-    terms->read();
-
-    visitor.Visit(term.boost);
-  }
-}
-
-template<typename Collector>
-class TermsVisitor {
+class ByTermsIterator : public WrappedTermIterator {
  public:
-  explicit TermsVisitor(Collector& collector) noexcept
-    : _collector(collector) {}
+  ByTermsIterator(const TermReader& reader,
+                  const ByTermsOptions::search_terms& terms)
+    : WrappedTermIterator{reader.iterator(SeekMode::NORMAL)},
+      _cursor{terms.begin()},
+      _end{terms.end()} {}
 
-  void SetIndex(uint32_t term_idx) noexcept { _collector.stat_index(term_idx); }
+  score_t Boost() const noexcept { return _boost; }
+  uint32_t Index() const noexcept { return _index; }
 
-  void Prepare(const SubReader& segment, const TermReader& field,
-               const SeekTermIterator& terms) {
-    _collector.Prepare(segment, field, terms);
+  bool next() final {
+    if (_started) {
+      if (_cursor == _end) {
+        return false;
+      }
+      ++_cursor;
+      ++_index;
+    }
+    _started = true;
+    while (_cursor != _end) {
+      if (_impl->seek(_cursor->term)) {
+        _boost = _cursor->boost;
+        return true;
+      }
+      ++_cursor;
+      ++_index;
+    }
+    return false;
   }
-
-  void Visit(score_t boost) { _collector.Visit(boost); }
 
  private:
-  Collector& _collector;
+  ByTermsOptions::search_terms::const_iterator _cursor;
+  ByTermsOptions::search_terms::const_iterator _end;
+  score_t _boost = kNoBoost;
+  uint32_t _index = 0;
+  bool _started = false;
 };
-
-template<typename Collector>
-void CollectTerms(const IndexReader& index, irs::field_id id,
-                  const ByTermsOptions::search_terms& terms,
-                  Collector& collector) {
-  TermsVisitor<Collector> visitor(collector);
-
-  for (auto& segment : index) {
-    auto* reader = segment.field(id);
-
-    if (!reader) {
-      continue;
-    }
-
-    VisitImpl(segment, *reader, terms, visitor);
-  }
-}
 
 }  // namespace
 
 void ByTerms::visit(const SubReader& segment, const TermReader& field,
-                    const ByTermsOptions::search_terms& terms,
-                    FilterVisitor& visitor) {
-  VisitImpl(segment, field, terms, visitor);
+                    const ByTermsOptions& options, FilterVisitor& visitor) {
+  ByTermsIterator terms(field, options.terms);
+  visitor.Prepare(segment, field, terms.GetImpl());
+  if (!terms.next()) {
+    return;
+  }
+  VisitTerms(terms, visitor);
 }
 
-Filter::Query::ptr ByTerms::Prepare(const PrepareContext& ctx, irs::field_id id,
-                                    const ByTermsOptions& options) {
+QueryBuilder::ptr ByTerms::PrepareSegment(const SubReader& segment,
+                                          const PrepareContext& ctx,
+                                          irs::field_id field,
+                                          const ByTermsOptions& options,
+                                          score_t boost) {
   const auto& [terms, min_match, merge_type] = options;
   const size_t size = terms.size();
-
-  if (0 == size || min_match > size) {
-    // Empty or unreachable search criteria
-    return Query::empty();
-  }
+  SDB_ASSERT(size);
+  SDB_ASSERT(min_match <= size);
+  SDB_ASSERT(size > 1);
   SDB_ASSERT(min_match != 0);
 
-  if (1 == size) {
-    const auto term = std::begin(terms);
-    auto sub_ctx = ctx;
-    sub_ctx.boost = ctx.boost * term->boost;
-    return ByTerm::prepare(sub_ctx, id, term->term);
+  auto query = memory::make_tracked<MultiTermQuery>(
+    ctx.memory, segment, ctx.memory, ctx.boost * boost, merge_type, min_match);
+
+  const auto* reader = segment.field(field);
+  if (!reader) {
+    return query;
   }
 
-  FieldCollector field_stats;
-  TermCollectorsFlat term_stats{ctx.scorer, size};
-  MultiTermQuery::States states{ctx.memory, ctx.index.size()};
-  AllTermsCollector collector{states, field_stats, term_stats};
-  CollectTerms(ctx.index, id, terms, collector);
-
-  // FIXME(gnusi): Filter out unmatched states during collection
-  if (min_match > 1) {
-    states.erase_if([min = min_match](const auto& state) noexcept {
-      return state.scored_states.size() < min;
-    });
+  auto* collector = ctx.collector
+                      ? &sdb::basics::downCast<ByTermsCollector>(*ctx.collector)
+                      : nullptr;
+  AllTermsVisitor mtv{query->State(), collector ? &collector->Field() : nullptr,
+                      collector ? &collector->Terms() : nullptr};
+  ByTermsIterator it(*reader, options.terms);
+  if (it.next()) {
+    mtv.Prepare(segment, *reader, it.GetImpl());
+    VisitTerms(it, mtv);
   }
-
-  if (states.empty()) {
-    return Query::empty();
-  }
-
-  MultiTermQuery::Stats stats{{ctx.memory}};
-  stats.resize(size);
-  for (size_t term_idx = 0; auto& stat : stats) {
-    stat.resize(GetStatsSize(ctx.scorer), 0);
-    auto* stats_buf = stat.data();
-    term_stats.Finish(stats_buf, term_idx++, &field_stats);
-  }
-
-  return memory::make_tracked<MultiTermQuery>(ctx.memory, std::move(states),
-                                              std::move(stats), ctx.boost,
-                                              merge_type, min_match);
+  return query;
 }
 
-Filter::Query::ptr ByTerms::prepare(const PrepareContext& ctx) const {
-  if (options().terms.empty() || options().min_match != 0) {
-    return Prepare(ctx.Boost(Boost()), field_id(), options());
+QueryBuilder::ptr ByTerms::PrepareSegment(const SubReader& segment,
+                                          const PrepareContext& ctx) const {
+  return PrepareSegment(segment, ctx, field_id(), options(), Boost());
+}
+
+PrepareCollector::ptr ByTerms::MakeCollector(const Scorer* scorer) const {
+  return std::make_unique<ByTermsCollector>(scorer, options().terms.size());
+}
+
+TermPredicate::ptr ByTerms::CompileTermPredicate() const {
+  if (options().min_match != 1) {
+    return nullptr;
   }
-  if (!ctx.scorer) {
-    return MakeAllDocsFilter(kNoBoost)->prepare({
-      .index = ctx.index,
-      .memory = ctx.memory,
-    });
+  return MakeTermPredicate(TermSetAcceptor{&options().terms});
+}
+
+TermIterator::ptr ByTerms::CompileTermIterator(const TermReader& reader) const {
+  if (options().min_match != 1) {
+    return nullptr;
   }
-  Or disj;
-  // Don't contribute to the score
-  disj.add(MakeAllDocsFilter(0.F));
-  // Reset min_match to 1
-  auto& terms = disj.add<ByTerms>();
-  terms.boost(Boost());
-  *terms.mutable_field_id() = field_id();
-  *terms.mutable_options() = options();
-  terms.mutable_options()->min_match = 1;
-  return disj.prepare({
-    .index = ctx.index,
-    .memory = ctx.memory,
-    .scorer = ctx.scorer,
-    .ctx = ctx.ctx,
-  });
+  return memory::make_managed<ByTermsIterator>(reader, options().terms);
 }
 
 }  // namespace irs

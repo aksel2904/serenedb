@@ -23,9 +23,17 @@
 #include "filter_test_case_base.hpp"
 #include "index/doc_generator.hpp"
 #include "iresearch/index/field_meta.hpp"
+#include "iresearch/search/automaton_filter.hpp"
+#include "iresearch/search/levenshtein_filter.hpp"
+#include "iresearch/search/prefix_filter.hpp"
+#include "iresearch/search/range_filter.hpp"
 #include "iresearch/search/raw_boost.hpp"
 #include "iresearch/search/scorer.hpp"
+#include "iresearch/search/term_filter.hpp"
+#include "iresearch/search/term_iterator.hpp"
+#include "iresearch/search/term_predicate.hpp"
 #include "iresearch/search/terms_filter.hpp"
+#include "iresearch/utils/regexp_utils.hpp"
 #include "tests_shared.hpp"
 
 namespace {
@@ -101,11 +109,9 @@ TEST_P(TermsFilterTestCase, boost) {
   {
     irs::ByTerms q = MakeFilter(kFieldId, {{"bar", 0.5f}, {"baz", 0.25f}});
 
-    auto prepared = q.prepare({
-      .index = irs::SubReader::empty(),
-      .memory = counter,
-    });
-    ASSERT_EQ(irs::kNoBoost, prepared->Boost());
+    tests::PreparedFilter prepared{q, irs::SubReader::empty(), nullptr,
+                                   counter};
+    ASSERT_EQ(irs::kNoBoost, prepared.Query(0)->Boost());
   }
   EXPECT_EQ(counter.current, 0);
   EXPECT_GT(counter.max, 0);
@@ -118,12 +124,9 @@ TEST_P(TermsFilterTestCase, boost) {
     irs::ByTerms q = MakeFilter(kFieldId, {{"bar", 0.5f}, {"baz", 0.25f}});
     q.boost(boost);
 
-    auto prepared = q.prepare({
-      .index = irs::SubReader::empty(),
-      .memory = counter,
-    });
-    ASSERT_EQ(irs::kNoBoost,
-              prepared->Boost());  // no boost because index is empty
+    tests::PreparedFilter prepared{q, irs::SubReader::empty(), nullptr,
+                                   counter};
+    ASSERT_EQ(boost, prepared.Query(0)->Boost());
   }
   EXPECT_EQ(counter.current, 0);
   EXPECT_GT(counter.max, 0);
@@ -144,11 +147,8 @@ TEST_P(TermsFilterTestCase, boost) {
       MakeFilter(kDuplicatedId, {{"abcd", 0.5f}, {"vczc", 0.25f}});
     q.boost(boost);
 
-    auto prepared = q.prepare({
-      .index = *rdr,
-      .memory = counter,
-    });
-    ASSERT_EQ(boost, prepared->Boost());
+    tests::PreparedFilter prepared{q, *rdr, nullptr, counter};
+    ASSERT_EQ(boost, prepared.Query(0)->Boost());
   }
   EXPECT_EQ(counter.current, 0);
   EXPECT_GT(counter.max, 0);
@@ -234,21 +234,23 @@ TEST_P(TermsFilterTestCase, simple_sequential) {
   auto& segment = rdr[0];
 
   // empty query
-  CheckQuery(irs::ByTerms(), Docs{}, Costs{0}, rdr);
+  CheckQuery(*tests::Optimized(irs::ByTerms()), Docs{}, Costs{0}, rdr);
 
   // empty field
-  CheckQuery(MakeFilter(kEmptyFieldId, {{"xyz", 0.5f}}), Docs{}, Costs{0}, rdr);
+  CheckQuery(*tests::Optimized(MakeFilter(kEmptyFieldId, {{"xyz", 0.5f}})),
+             Docs{}, Costs{0}, rdr);
 
   // invalid field
-  CheckQuery(MakeFilter(kInvalidFieldId, {{"xyz", 0.5f}}), Docs{}, Costs{0},
-             rdr);
+  CheckQuery(*tests::Optimized(MakeFilter(kInvalidFieldId, {{"xyz", 0.5f}})),
+             Docs{}, Costs{0}, rdr);
 
   // invalid term
-  CheckQuery(MakeFilter(kSameId, {{"invalid_term", 0.5f}}), Docs{}, Costs{0},
-             rdr);
+  CheckQuery(*tests::Optimized(MakeFilter(kSameId, {{"invalid_term", 0.5f}})),
+             Docs{}, Costs{0}, rdr);
 
   // no value requested to match
-  CheckQuery(MakeFilter(kDuplicatedId, {}), Docs{}, Costs{0}, rdr);
+  CheckQuery(*tests::Optimized(MakeFilter(kDuplicatedId, {})), Docs{}, Costs{0},
+             rdr);
 
   // match all
   {
@@ -256,13 +258,13 @@ TEST_P(TermsFilterTestCase, simple_sequential) {
     std::iota(std::begin(result), std::end(result), irs::doc_limits::min());
     Costs costs{result.size()};
     const auto filter = MakeFilter(kSameId, {{"xyz", 1.f}});
-    CheckQuery(filter, result, costs, rdr);
+    CheckQuery(*tests::Optimized(filter), result, costs, rdr);
 
     // test visit
     tests::EmptyFilterVisitor visitor;
     const auto* reader = segment.field(kSameId);
     ASSERT_NE(nullptr, reader);
-    irs::ByTerms::visit(segment, *reader, filter.options().terms, visitor);
+    irs::ByTerms::visit(segment, *reader, filter.options(), visitor);
     ASSERT_EQ(1, visitor.prepare_calls_counter());
     ASSERT_EQ(1, visitor.visit_calls_counter());
     ASSERT_EQ(
@@ -276,13 +278,13 @@ TEST_P(TermsFilterTestCase, simple_sequential) {
     std::iota(std::begin(result), std::end(result), irs::doc_limits::min());
     Costs costs{result.size()};
     const auto filter = MakeFilter(kSameId, {{"invalid", 1.f}}, 0);
-    CheckQuery(filter, result, costs, rdr);
+    CheckQuery(*tests::Optimized(filter), result, costs, rdr);
 
     // test visit
     tests::EmptyFilterVisitor visitor;
     const auto* reader = segment.field(kSameId);
     ASSERT_NE(nullptr, reader);
-    irs::ByTerms::visit(segment, *reader, filter.options().terms, visitor);
+    irs::ByTerms::visit(segment, *reader, filter.options(), visitor);
     ASSERT_EQ(1, visitor.prepare_calls_counter());
     ASSERT_EQ(0, visitor.visit_calls_counter());
     ASSERT_EQ((std::vector<std::pair<std::string_view, irs::score_t>>{}),
@@ -302,7 +304,7 @@ TEST_P(TermsFilterTestCase, simple_sequential) {
     tests::EmptyFilterVisitor visitor;
     const auto* reader = segment.field(kSameId);
     ASSERT_NE(nullptr, reader);
-    irs::ByTerms::visit(segment, *reader, filter.options().terms, visitor);
+    irs::ByTerms::visit(segment, *reader, filter.options(), visitor);
     ASSERT_EQ(1, visitor.prepare_calls_counter());
     ASSERT_EQ(1, visitor.visit_calls_counter());
     ASSERT_EQ(
@@ -322,7 +324,7 @@ TEST_P(TermsFilterTestCase, simple_sequential) {
     tests::EmptyFilterVisitor visitor;
     const auto* reader = segment.field(kPrefixId);
     ASSERT_NE(nullptr, reader);
-    irs::ByTerms::visit(segment, *reader, filter.options().terms, visitor);
+    irs::ByTerms::visit(segment, *reader, filter.options(), visitor);
     ASSERT_EQ(1, visitor.prepare_calls_counter());
     ASSERT_EQ(3, visitor.visit_calls_counter());
     ASSERT_EQ((std::vector<std::pair<std::string_view, irs::score_t>>{
@@ -342,7 +344,7 @@ TEST_P(TermsFilterTestCase, simple_sequential) {
     tests::EmptyFilterVisitor visitor;
     const auto* reader = segment.field(kPrefixId);
     ASSERT_NE(nullptr, reader);
-    irs::ByTerms::visit(segment, *reader, filter.options().terms, visitor);
+    irs::ByTerms::visit(segment, *reader, filter.options(), visitor);
     ASSERT_EQ(1, visitor.prepare_calls_counter());
     ASSERT_EQ(3, visitor.visit_calls_counter());
     ASSERT_EQ((std::vector<std::pair<std::string_view, irs::score_t>>{
@@ -363,7 +365,7 @@ TEST_P(TermsFilterTestCase, simple_sequential) {
     tests::EmptyFilterVisitor visitor;
     const auto* reader = segment.field(kPrefixId);
     ASSERT_NE(nullptr, reader);
-    irs::ByTerms::visit(segment, *reader, filter.options().terms, visitor);
+    irs::ByTerms::visit(segment, *reader, filter.options(), visitor);
     ASSERT_EQ(1, visitor.prepare_calls_counter());
     ASSERT_EQ(3, visitor.visit_calls_counter());
     ASSERT_EQ((std::vector<std::pair<std::string_view, irs::score_t>>{
@@ -432,7 +434,7 @@ TEST_P(TermsFilterTestCase, min_match) {
     ASSERT_NE(nullptr, reader);
     const auto filter = MakeFilter(
       kFieldsSchemaId, {{"BusinessEntityID", 1.f}, {"StartDate", 1.f}}, 1);
-    irs::ByTerms::visit(segment, *reader, filter.options().terms, visitor);
+    irs::ByTerms::visit(segment, *reader, filter.options(), visitor);
     ASSERT_EQ(1, visitor.prepare_calls_counter());
     ASSERT_EQ(2, visitor.visit_calls_counter());
     ASSERT_EQ((std::vector<std::pair<std::string_view, irs::score_t>>{
@@ -474,7 +476,7 @@ TEST_P(TermsFilterTestCase, min_match) {
     const Costs costs{0, 0, 0, 0};
     const auto filter = MakeFilter(
       kFieldsSchemaId, {{"BusinessEntityID", 1.f}, {"StartDate", 1.f}}, 3);
-    CheckQuery(filter, result, costs, rdr);
+    CheckQuery(*tests::Optimized(filter), result, costs, rdr);
   }
 
   {
@@ -535,11 +537,134 @@ TEST_P(TermsFilterTestCase, min_match) {
     const auto filter = MakeFilter(
       kFieldsSchemaId, {{"BusinessEntityID", 1.f}, {"StartDate", 1.f}}, 0);
 
-    CheckQuery(filter, std::span{&impl, 1}, result, rdr[0]);
+    CheckQuery(*tests::Optimized(filter, impl.get()), std::span{&impl, 1},
+               result, rdr[0]);
     ASSERT_EQ(3, finish_count);
     ASSERT_GT(finish_docs_with_field, 0u);  // scorer collected field stats
     ASSERT_GT(finish_docs_with_term, 0u);   // scorer collected term stats
   }
+}
+
+irs::bytes_view B(std::string_view value) {
+  return irs::ViewCast<irs::byte_type>(value);
+}
+
+std::vector<irs::bstring> DrainTerms(irs::TermIterator& it) {
+  std::vector<irs::bstring> terms;
+  while (it.next()) {
+    terms.emplace_back(it.value());
+  }
+  return terms;
+}
+
+std::vector<irs::bstring> AcceptedTerms(const irs::TermReader& reader,
+                                        const irs::TermPredicate& pred) {
+  std::vector<irs::bstring> terms;
+  auto it = reader.iterator(irs::SeekMode::NORMAL);
+  while (it->next()) {
+    if (pred.Accepts(it->value())) {
+      terms.emplace_back(it->value());
+    }
+  }
+  return terms;
+}
+
+TEST_P(TermsFilterTestCase, compile_term_iterator_matches_predicate) {
+  tests::JsonDocGenerator gen(resource("simple_sequential.json"),
+                              &tests::GenericJsonFieldFactory);
+  add_segment(gen);
+  auto rdr = open_reader();
+  ASSERT_EQ(1, rdr.size());
+  const auto* reader = rdr[0].field(kDuplicatedId);
+  ASSERT_NE(nullptr, reader);
+
+  const auto check = [&](const irs::Filter& filter, bool expect_nonempty) {
+    const auto pred = filter.CompileTermPredicate();
+    ASSERT_NE(nullptr, pred);
+    const auto expected = AcceptedTerms(*reader, *pred);
+    auto cursor = filter.CompileTermIterator(*reader);
+    ASSERT_NE(nullptr, cursor);
+    EXPECT_EQ(expected, DrainTerms(*cursor));
+    if (expect_nonempty) {
+      EXPECT_FALSE(expected.empty());
+    }
+  };
+
+  {
+    irs::ByTerm f;
+    *f.mutable_field_id() = kDuplicatedId;
+    f.mutable_options()->term = irs::bstring{B("abcd")};
+    check(f, true);
+    f.mutable_options()->term = irs::bstring{B("missing_term")};
+    check(f, false);
+  }
+  {
+    check(MakeFilter(kDuplicatedId,
+                     {{"abcd", 1.f}, {"vczc", 1.f}, {"missing_term", 1.f}}),
+          true);
+  }
+  {
+    irs::ByPrefix f;
+    *f.mutable_field_id() = kDuplicatedId;
+    f.mutable_options()->term = irs::bstring{B("a")};
+    check(f, true);
+  }
+  {
+    irs::ByRange f;
+    *f.mutable_field_id() = kDuplicatedId;
+    f.mutable_options()->range.min = irs::bstring{B("a")};
+    f.mutable_options()->range.min_type = irs::BoundType::Inclusive;
+    f.mutable_options()->range.max = irs::bstring{B("w")};
+    f.mutable_options()->range.max_type = irs::BoundType::Exclusive;
+    check(f, true);
+  }
+  {
+    auto dfa = irs::FromRegexp(std::string_view{"a.*|v.*"});
+    ASSERT_NE(0, dfa.NumStates());
+    irs::AutomatonFilter f;
+    *f.mutable_field_id() = kDuplicatedId;
+    *f.mutable_options() =
+      irs::AutomatonOptions{std::move(dfa), B("a.*|v.*"), 1024};
+    check(f, true);
+  }
+}
+
+TEST_P(TermsFilterTestCase, levenshtein_iterator_boosts) {
+  tests::JsonDocGenerator gen(resource("simple_sequential.json"),
+                              &tests::GenericJsonFieldFactory);
+  add_segment(gen);
+  auto rdr = open_reader();
+  ASSERT_EQ(1, rdr.size());
+  const auto* reader = rdr[0].field(kDuplicatedId);
+  ASSERT_NE(nullptr, reader);
+
+  irs::ByEditDistanceOptions options;
+  options.term = irs::bstring{B("abcd")};
+  options.max_distance = 1;
+  const auto lowered = irs::LowerLevenshtein(kDuplicatedId, options, 2.f);
+  ASSERT_NE(nullptr, lowered);
+
+  const auto pred = lowered->CompileTermPredicate();
+  ASSERT_NE(nullptr, pred);
+  const auto expected = AcceptedTerms(*reader, *pred);
+  EXPECT_FALSE(expected.empty());
+
+  auto cursor = lowered->CompileTermIterator(*reader);
+  ASSERT_NE(nullptr, cursor);
+  const auto* boost = irs::get<irs::TermBoost>(*cursor);
+  ASSERT_NE(nullptr, boost);
+  std::vector<irs::bstring> actual;
+  bool exact_scored_highest = false;
+  while (cursor->next()) {
+    actual.emplace_back(cursor->value());
+    EXPECT_GT(boost->value, 0.f);
+    EXPECT_LE(boost->value, 1.f);
+    if (cursor->value() == B("abcd")) {
+      exact_scored_highest = boost->value == 1.f;
+    }
+  }
+  EXPECT_EQ(expected, actual);
+  EXPECT_TRUE(exact_scored_highest);
 }
 
 static constexpr auto kTestDirs = tests::GetDirectories<tests::kTypesDefault>();

@@ -22,50 +22,23 @@
 
 #include "wildcard_filter.hpp"
 
-#include "iresearch/index/index_reader.hpp"
-#include "iresearch/search/filter_visitor.hpp"
+#include "iresearch/search/automaton_filter.hpp"
 #include "iresearch/search/prefix_filter.hpp"
 #include "iresearch/search/term_filter.hpp"
 #include "iresearch/utils/automaton_utils.hpp"
 #include "iresearch/utils/wildcard_utils.hpp"
+#include "pg/sql_exception_macro.h"
 
 namespace irs {
 
-ByWildcardFilterOptions::ByWildcardFilterOptions(bytes_view pattern)
-  : term{pattern}, acceptor{FromWildcard(pattern)} {}
-
-field_visitor ByWildcard::visitor(const automaton& acceptor) {
-  if (!Validate(acceptor)) {
-    return [](const SubReader&, const TermReader&, FilterVisitor&) {};
-  }
-
-  struct AutomatonContext : util::Noncopyable {
-    explicit AutomatonContext(const automaton& a)
-      : matcher{MakeAutomatonMatcher(a)} {}
-
-    automaton_table_matcher matcher;
-  };
-
-  auto ctx = AutomatonContext{acceptor};
-
-  return [context = std::move(ctx)](const SubReader& segment,
-                                    const TermReader& field,
-                                    FilterVisitor& visitor) mutable {
-    return irs::Visit(segment, field, context.matcher, visitor);
-  };
+QueryBuilder::ptr ByWildcard::PrepareSegment(const SubReader&,
+                                             const PrepareContext&) const {
+  THROW_SQL_ERROR(
+    ERR_MSG("ByWildcard must be lowered by the optimizer before prepare"));
 }
 
-Filter::Query::ptr ByWildcard::prepare(const PrepareContext& ctx) const {
-  if (options().term.empty()) {
-    return Query::empty();
-  }
-  return PrepareAutomatonFilter(ctx.Boost(Boost()), field_id(),
-                                options().acceptor,
-                                options().scored_terms_limit);
-}
-
-Filter::ptr CreateByWildcard(irs::field_id id, bytes_view term,
-                             size_t scored_terms_limit, score_t boost) {
+Filter::ptr LowerWildcard(irs::field_id id, bytes_view term,
+                          size_t scored_terms_limit, score_t boost) {
   bstring buf;
   return ExecuteWildcard(
     buf, term,
@@ -85,14 +58,32 @@ Filter::ptr CreateByWildcard(irs::field_id id, bytes_view term,
       return filter;
     },
     [&](bytes_view term) -> Filter::ptr {
-      auto filter = std::make_unique<ByWildcard>();
+      auto filter = std::make_unique<AutomatonFilter>();
       *filter->mutable_field_id() = id;
-      auto& options = *filter->mutable_options();
-      options = ByWildcardOptions{term};
-      options.scored_terms_limit = scored_terms_limit;
+      *filter->mutable_options() =
+        AutomatonOptions{FromWildcard(term), term, scored_terms_limit};
       filter->boost(boost);
       return filter;
     });
+}
+
+Filter::ptr CreateByWildcard(irs::field_id id, bytes_view term,
+                             size_t scored_terms_limit, score_t boost) {
+  auto filter = std::make_unique<ByWildcard>();
+  *filter->mutable_field_id() = id;
+  filter->mutable_options()->term = term;
+  filter->mutable_options()->scored_terms_limit = scored_terms_limit;
+  filter->boost(boost);
+  return filter;
+}
+
+TermPredicate::ptr ByWildcard::CompileTermPredicate() const {
+  auto acceptor = FromWildcard(options().term);
+  if (!Validate(acceptor)) {
+    return nullptr;
+  }
+  return MakeAutomatonTermPredicate(
+    std::make_shared<const CompiledAcceptor>(std::move(acceptor)));
 }
 
 }  // namespace irs

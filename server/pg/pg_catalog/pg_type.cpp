@@ -22,9 +22,11 @@
 
 #include <deque>
 #include <string>
+#include <vector>
 
 #include "basics/containers/flat_hash_set.h"
 #include "catalog/catalog.h"
+#include "catalog/role.h"
 #include "catalog/user_type.h"
 #include "pg/pg_catalog/fwd.h"
 
@@ -613,6 +615,41 @@ constexpr auto kSampleData = std::to_array<PgType>({
     .typanalyze = 0,
     .typalign = PgType::Typalign::Char,
     .typstorage = PgType::Typstorage::Plain,
+    .typnotnull = false,
+    .typbasetype = 0,
+    .typtypmod = -1,
+    .typndims = 0,
+    .typcollation = 0,
+    .typdefaultbin = {},
+    .typdefault = {},
+    .typacl = {},
+  },
+  // inet (OID 869) -- registered by the `inet` DuckDB extension
+  {
+    .oid = 869,
+    .typname = "inet",
+    .typnamespace = id::kPgCatalogSchema.id(),
+    .typowner = id::kRootUser.id(),
+    .typlen = -1,
+    .typbyval = false,
+    .typtype = PgType::Typetype::Base,
+    .typcategory = PgType::Typcategory::Network,
+    .typispreferred = false,
+    .typisdefined = true,
+    .typdelim = ',',
+    .typrelid = 0,
+    .typsubscript = 0,
+    .typelem = 0,
+    .typarray = 1041,    // _inet
+    .typinput = 910,     // inet_in
+    .typoutput = 911,    // inet_out
+    .typreceive = 2429,  // inet_recv
+    .typsend = 2430,     // inet_send
+    .typmodin = 0,
+    .typmodout = 0,
+    .typanalyze = 0,
+    .typalign = PgType::Typalign::Int,
+    .typstorage = PgType::Typstorage::Main,
     .typnotnull = false,
     .typbasetype = 0,
     .typtypmod = -1,
@@ -1472,14 +1509,13 @@ constexpr auto kSampleData = std::to_array<PgType>({
 constexpr uint64_t kNullMask = MaskFromNulls({
   GetIndex(&PgType::typdefaultbin),
   GetIndex(&PgType::typdefault),
-  GetIndex(&PgType::typacl),
 });
 
 }  // namespace
 
 template<>
 catalog::MaterializedData SystemTableSnapshot<PgType>::GetTableData() {
-  auto snapshot = _config.EnsureCatalogSnapshot();
+  auto snapshot = _config.CatalogSnapshot();
   auto database_id = GetDatabaseId();
 
   std::vector<PgType> rows;
@@ -1564,13 +1600,14 @@ catalog::MaterializedData SystemTableSnapshot<PgType>::GetTableData() {
       const auto namespace_oid = schema->GetId().id();
       const auto array_oid = type->GetArrayOid().id();
       const auto array_name = make_array_name(type->GetName());
+      const AclColumn type_acl{type->GetAcl()};
 
       auto make_row = [&](bool as_array) {
         return PgType{
           .oid = as_array ? array_oid : type_oid,
           .typname = as_array ? array_name : std::string_view{type->GetName()},
           .typnamespace = namespace_oid,
-          .typowner = id::kRootUser.id(),
+          .typowner = type->GetOwner().id(),
           .typlen = (!as_array && is_enum) ? int16_t{4} : int16_t{-1},
           .typbyval = !as_array && is_enum,
           .typtype = as_array       ? PgType::Typetype::Base
@@ -1605,7 +1642,9 @@ catalog::MaterializedData SystemTableSnapshot<PgType>::GetTableData() {
           .typcollation = 0,
           .typdefaultbin = {},
           .typdefault = {},
-          .typacl = {},
+          // Only the scalar type carries an ACL; the array type's typacl is
+          // NULL in PG.
+          .typacl = as_array ? AclColumn{} : type_acl,
         };
       };
 
@@ -1616,7 +1655,7 @@ catalog::MaterializedData SystemTableSnapshot<PgType>::GetTableData() {
 
   auto result = CreateColumns<PgType>(rows.size());
   for (size_t i = 0; i < rows.size(); ++i) {
-    WriteData(result, rows[i], kNullMask, i);
+    WriteData(result, rows[i], kNullMask, i, *_config.GetCatalogSnapshot());
   }
   return {std::move(result), rows.size()};
 }

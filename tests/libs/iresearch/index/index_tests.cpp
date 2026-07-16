@@ -757,8 +757,8 @@ class IndexTestCase : public tests::IndexTestBase {
               ASSERT_FALSE(!actual_pos);
               ASSERT_FALSE(!expected_pos);
 
-              while (act_docs_itr->next()) {
-                ASSERT_TRUE(exp_docs_itr->next());
+              while (!irs::doc_limits::eof(act_docs_itr->advance())) {
+                ASSERT_TRUE(!irs::doc_limits::eof(exp_docs_itr->advance()));
                 ASSERT_EQ(exp_docs_itr->value(), act_docs_itr->value());
                 act_docs_itr->FetchScoreArgs(0);
                 ASSERT_EQ(expected_freq->value[0], actual_freq->value[0]);
@@ -787,7 +787,7 @@ class IndexTestCase : public tests::IndexTestBase {
                 ASSERT_FALSE(expected_pos->next());
               }
 
-              ASSERT_FALSE(exp_docs_itr->next());
+              ASSERT_FALSE(!irs::doc_limits::eof(exp_docs_itr->advance()));
             });
           }
         }
@@ -1046,10 +1046,10 @@ class IndexTestCase : public tests::IndexTestBase {
         auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
         ASSERT_TRUE(term_itr->next());
         auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));
-        ASSERT_FALSE(docs_itr->next());
+        ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
       }
 
       // segment #1
@@ -1063,10 +1063,10 @@ class IndexTestCase : public tests::IndexTestBase {
         auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
         ASSERT_TRUE(term_itr->next());
         auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));
-        ASSERT_FALSE(docs_itr->next());
+        ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
       }
     }
   }
@@ -1151,10 +1151,10 @@ class IndexTestCase : public tests::IndexTestBase {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc2
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 
@@ -1226,10 +1226,10 @@ class IndexTestCase : public tests::IndexTestBase {
     ASSERT_TRUE(term_itr->next());
     // skip docs deleted during batch rollback
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc3
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   void ConcurrentReadSingleColumnSmoke() {
@@ -2222,7 +2222,7 @@ TEST_P(IndexTestCase, concurrent_add_remove_mt) {
       ASSERT_TRUE(term_itr->next());
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
-      while (docs_itr->next()) {
+      while (!irs::doc_limits::eof(docs_itr->advance())) {
         ASSERT_EQ(1, expected.erase(irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value())));
       }
@@ -2443,13 +2443,13 @@ TEST_P(IndexTestCase, document_context) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // holding document_context after insert across commit does not block
@@ -2489,10 +2489,10 @@ TEST_P(IndexTestCase, document_context) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // holding document_context after remove across commit does not block
@@ -2558,10 +2558,10 @@ TEST_P(IndexTestCase, document_context) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // holding document_context after replace across commit does not block (single
@@ -2632,10 +2632,10 @@ TEST_P(IndexTestCase, document_context) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // rollback empty
@@ -2670,10 +2670,10 @@ TEST_P(IndexTestCase, document_context) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // rollback inserts
@@ -2709,10 +2709,10 @@ TEST_P(IndexTestCase, document_context) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // rollback inserts + some more
@@ -2752,10 +2752,10 @@ TEST_P(IndexTestCase, document_context) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // rollback multiple inserts + some more
@@ -2803,13 +2803,13 @@ TEST_P(IndexTestCase, document_context) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc4
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // rollback inserts split over multiple segment_writers
@@ -2860,10 +2860,10 @@ TEST_P(IndexTestCase, document_context) {
       ASSERT_TRUE(term_itr->next());
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     {
@@ -2876,10 +2876,10 @@ TEST_P(IndexTestCase, document_context) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc4
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 
@@ -2913,10 +2913,10 @@ TEST_P(IndexTestCase, document_context) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // rollback removals + some more
@@ -2955,13 +2955,13 @@ TEST_P(IndexTestCase, document_context) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // rollback removals split over multiple segment_writers
@@ -3016,10 +3016,10 @@ TEST_P(IndexTestCase, document_context) {
       ASSERT_TRUE(term_itr->next());
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     {
@@ -3032,10 +3032,10 @@ TEST_P(IndexTestCase, document_context) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc4
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 
@@ -3073,10 +3073,10 @@ TEST_P(IndexTestCase, document_context) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // rollback replace (single doc) + some more
@@ -3119,13 +3119,13 @@ TEST_P(IndexTestCase, document_context) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc3
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // rollback flushed but not committed doc
@@ -3184,10 +3184,10 @@ TEST_P(IndexTestCase, document_context) {
       ASSERT_TRUE(term_itr->next());
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     {
@@ -3202,10 +3202,10 @@ TEST_P(IndexTestCase, document_context) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc4
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 
@@ -3260,13 +3260,13 @@ TEST_P(IndexTestCase, document_context) {
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
       for (size_t i = 0; i != 2; ++i) {
-        ASSERT_TRUE(docs_itr->next()) << i;
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance())) << i;
         // 'name' value in doc1
         ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()))
           << i;
       }
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 
@@ -3320,10 +3320,10 @@ TEST_P(IndexTestCase, document_context) {
       ASSERT_TRUE(term_itr->next());
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     {
@@ -3336,10 +3336,10 @@ TEST_P(IndexTestCase, document_context) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc4
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 
@@ -3384,10 +3384,10 @@ TEST_P(IndexTestCase, document_context) {
       ASSERT_TRUE(term_itr->next());
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     {
@@ -3400,10 +3400,10 @@ TEST_P(IndexTestCase, document_context) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc2
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 
@@ -3545,10 +3545,10 @@ TEST_P(IndexTestCase, document_context) {
       ASSERT_TRUE(term_itr->next());
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     {
@@ -3561,10 +3561,10 @@ TEST_P(IndexTestCase, document_context) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc2
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 
@@ -3930,10 +3930,10 @@ TEST_P(IndexTestCase, doc_removal) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // new segment: add + remove 1st (as reference)
@@ -3960,10 +3960,10 @@ TEST_P(IndexTestCase, doc_removal) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // new segment: add + remove 1st (as unique_ptr)
@@ -3990,10 +3990,10 @@ TEST_P(IndexTestCase, doc_removal) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // new segment: add + remove 1st (as shared_ptr)
@@ -4020,10 +4020,10 @@ TEST_P(IndexTestCase, doc_removal) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // new segment: remove + add
@@ -4050,13 +4050,13 @@ TEST_P(IndexTestCase, doc_removal) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // new segment: add + remove + readd
@@ -4083,10 +4083,10 @@ TEST_P(IndexTestCase, doc_removal) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // new segment: add + remove, old segment: remove
@@ -4119,10 +4119,10 @@ TEST_P(IndexTestCase, doc_removal) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // new segment: add + add, old segment: remove + remove + add
@@ -4153,10 +4153,10 @@ TEST_P(IndexTestCase, doc_removal) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc3
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // new segment: add, old segment: remove
@@ -4189,10 +4189,10 @@ TEST_P(IndexTestCase, doc_removal) {
       ASSERT_TRUE(term_itr->next());
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     {
@@ -4205,10 +4205,10 @@ TEST_P(IndexTestCase, doc_removal) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc3
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 
@@ -4244,10 +4244,10 @@ TEST_P(IndexTestCase, doc_removal) {
       ASSERT_TRUE(term_itr->next());
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc2
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     {
@@ -4261,10 +4261,10 @@ TEST_P(IndexTestCase, doc_removal) {
       ASSERT_TRUE(term_itr->next());
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc4
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 
@@ -4313,10 +4313,10 @@ TEST_P(IndexTestCase, doc_removal) {
       ASSERT_TRUE(term_itr->next());
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     {
@@ -4330,10 +4330,10 @@ TEST_P(IndexTestCase, doc_removal) {
       ASSERT_TRUE(term_itr->next());
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("E", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc5
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     {
@@ -4347,10 +4347,10 @@ TEST_P(IndexTestCase, doc_removal) {
       ASSERT_TRUE(term_itr->next());
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("H", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc8
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 }
@@ -4459,10 +4459,10 @@ TEST_P(IndexTestCase, doc_update) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // new segment update (as unique_ptr)
@@ -4488,10 +4488,10 @@ TEST_P(IndexTestCase, doc_update) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // new segment update (as shared_ptr)
@@ -4518,10 +4518,10 @@ TEST_P(IndexTestCase, doc_update) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // old segment update
@@ -4553,10 +4553,10 @@ TEST_P(IndexTestCase, doc_update) {
       ASSERT_TRUE(term_itr->next());
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc2
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     {
@@ -4570,10 +4570,10 @@ TEST_P(IndexTestCase, doc_update) {
       ASSERT_TRUE(term_itr->next());
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc3
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 
@@ -4604,10 +4604,10 @@ TEST_P(IndexTestCase, doc_update) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc4
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // 3x updates (different segments)
@@ -4643,10 +4643,10 @@ TEST_P(IndexTestCase, doc_update) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc4
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // no matching documnts
@@ -4675,10 +4675,10 @@ TEST_P(IndexTestCase, doc_update) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // update + delete (same segment)
@@ -4706,13 +4706,13 @@ TEST_P(IndexTestCase, doc_update) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc3
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // update + delete (different segments)
@@ -4747,10 +4747,10 @@ TEST_P(IndexTestCase, doc_update) {
       ASSERT_TRUE(term_itr->next());
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     {
@@ -4764,10 +4764,10 @@ TEST_P(IndexTestCase, doc_update) {
       ASSERT_TRUE(term_itr->next());
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc3
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 
@@ -4797,10 +4797,10 @@ TEST_P(IndexTestCase, doc_update) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // delete + update (different segments)
@@ -4833,10 +4833,10 @@ TEST_P(IndexTestCase, doc_update) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // delete + update then update (2nd - update of modified doc)
@@ -4867,10 +4867,10 @@ TEST_P(IndexTestCase, doc_update) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // delete + update then update (2nd - update of modified doc)
@@ -4907,10 +4907,10 @@ TEST_P(IndexTestCase, doc_update) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // new segment failed update (due to field features mismatch or
@@ -4998,14 +4998,14 @@ TEST_P(IndexTestCase, doc_update) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_FALSE(docs_itr->next());
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 }
 
@@ -5162,13 +5162,13 @@ TEST_P(IndexTestCase, import_reader) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // add a reader with 1 sparse segment
@@ -5202,10 +5202,10 @@ TEST_P(IndexTestCase, import_reader) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // add a reader with 2 full segments
@@ -5240,19 +5240,19 @@ TEST_P(IndexTestCase, import_reader) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc3
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc4
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // add a reader with 2 sparse segments
@@ -5289,13 +5289,13 @@ TEST_P(IndexTestCase, import_reader) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc4
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // add a reader with 2 mixed segments
@@ -5332,16 +5332,16 @@ TEST_P(IndexTestCase, import_reader) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc3
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // new: add + add + delete, old: import
@@ -5379,13 +5379,13 @@ TEST_P(IndexTestCase, import_reader) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc2
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     {
@@ -5399,10 +5399,10 @@ TEST_P(IndexTestCase, import_reader) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc3
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 }
@@ -5453,13 +5453,13 @@ TEST_P(IndexTestCase, refresh_reader) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // modify state (delete doc2)
@@ -5486,13 +5486,13 @@ TEST_P(IndexTestCase, refresh_reader) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc2
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     {
@@ -5508,10 +5508,10 @@ TEST_P(IndexTestCase, refresh_reader) {
       ASSERT_TRUE(term_itr->next());
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 
@@ -5538,10 +5538,10 @@ TEST_P(IndexTestCase, refresh_reader) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = segment.mask(term_itr->postings(irs::IndexFeatures::None));
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc1
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
 
     reader = reader.Reopen();
     ASSERT_EQ(2, reader.size());
@@ -5557,10 +5557,10 @@ TEST_P(IndexTestCase, refresh_reader) {
       ASSERT_TRUE(term_itr->next());
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     {
@@ -5574,13 +5574,13 @@ TEST_P(IndexTestCase, refresh_reader) {
       ASSERT_TRUE(term_itr->next());
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc3
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc4
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 
@@ -5610,10 +5610,10 @@ TEST_P(IndexTestCase, refresh_reader) {
       ASSERT_TRUE(term_itr->next());
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     {
@@ -5627,13 +5627,13 @@ TEST_P(IndexTestCase, refresh_reader) {
       ASSERT_TRUE(term_itr->next());
       auto docs_itr =
         segment.mask(term_itr->postings(irs::IndexFeatures::None));
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc3
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc4
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     reader = reader.Reopen();
@@ -5647,13 +5647,13 @@ TEST_P(IndexTestCase, refresh_reader) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc3
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc4
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 }
 
@@ -5823,7 +5823,7 @@ TEST_P(IndexTestCase, segment_column_user_system) {
   ASSERT_TRUE(term_itr->next());
 
   for (auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-       docs_itr->next();) {
+       !irs::doc_limits::eof(docs_itr->advance());) {
     ASSERT_EQ(1,
               expected_name.erase(irs::tests::ReadStoredStr<std::string_view>(
                 values, docs_itr->value())));
@@ -5952,12 +5952,12 @@ TEST_P(IndexTestCase, import_concurrent) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    while (docs_itr->next()) {
+    while (!irs::doc_limits::eof(docs_itr->advance())) {
       ASSERT_EQ(1, names.erase(irs::tests::ReadStoredStr<std::string>(
                      values, docs_itr->value())));
       ++removed;
     }
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
   ASSERT_EQ(removed, reader.docs_count());
   ASSERT_TRUE(names.empty());
@@ -6082,12 +6082,12 @@ TEST_P(IndexTestCase, concurrent_compaction) {
   auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
   ASSERT_TRUE(term_itr->next());
   auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-  while (docs_itr->next()) {
+  while (!irs::doc_limits::eof(docs_itr->advance())) {
     ASSERT_EQ(1, names.erase(irs::tests::ReadStoredStr<std::string>(
                    values, docs_itr->value())));
     ++removed;
   }
-  ASSERT_FALSE(docs_itr->next());
+  ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
 
   ASSERT_EQ(removed, reader.docs_count());
   ASSERT_TRUE(names.empty());
@@ -6210,12 +6210,12 @@ TEST_P(IndexTestCase, concurrent_compaction_dedicated_commit) {
   auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
   ASSERT_TRUE(term_itr->next());
   auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-  while (docs_itr->next()) {
+  while (!irs::doc_limits::eof(docs_itr->advance())) {
     ASSERT_EQ(1, names.erase(irs::tests::ReadStoredStr<std::string>(
                    values, docs_itr->value())));
     ++removed;
   }
-  ASSERT_FALSE(docs_itr->next());
+  ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
 
   ASSERT_EQ(removed, reader.docs_count());
   ASSERT_TRUE(names.empty());
@@ -6340,12 +6340,12 @@ TEST_P(IndexTestCase, concurrent_compaction_two_phase_dedicated_commit) {
   auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
   ASSERT_TRUE(term_itr->next());
   auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-  while (docs_itr->next()) {
+  while (!irs::doc_limits::eof(docs_itr->advance())) {
     ASSERT_EQ(1, names.erase(irs::tests::ReadStoredStr<std::string>(
                    values, docs_itr->value())));
     ++removed;
   }
-  ASSERT_FALSE(docs_itr->next());
+  ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
 
   ASSERT_EQ(removed, reader.docs_count());
   ASSERT_TRUE(names.empty());
@@ -6455,12 +6455,12 @@ TEST_P(IndexTestCase, concurrent_compaction_cleanup) {
   auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
   ASSERT_TRUE(term_itr->next());
   auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-  while (docs_itr->next()) {
+  while (!irs::doc_limits::eof(docs_itr->advance())) {
     ASSERT_EQ(1, names.erase(irs::tests::ReadStoredStr<std::string>(
                    values, docs_itr->value())));
     ++removed;
   }
-  ASSERT_FALSE(docs_itr->next());
+  ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
 
   ASSERT_EQ(removed, reader.docs_count());
   ASSERT_TRUE(names.empty());
@@ -6590,10 +6590,10 @@ TEST_P(IndexTestCase, compact_single_segment) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 }
@@ -6747,10 +6747,10 @@ TEST_P(IndexTestCase, segment_compact_long_running) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     // assume 1 is 'segment 4'
@@ -6765,10 +6765,10 @@ TEST_P(IndexTestCase, segment_compact_long_running) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     // assume 2 is merged segment
@@ -6783,13 +6783,13 @@ TEST_P(IndexTestCase, segment_compact_long_running) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc2
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 
@@ -6823,9 +6823,13 @@ TEST_P(IndexTestCase, segment_compact_long_running) {
     dir.intermediate_commits_lock.lock();
 
     std::thread compaction_thread([&writer]() {
-      // compaction will fail because of
-      ASSERT_FALSE(writer->Compact(irs::index_utils::MakePolicy(
-        irs::index_utils::CompactionCount())));  // compact
+      // A concurrent commit removed a doc from a candidate, so the merge can't
+      // be reconciled against the moved snapshot: transient Busy, not Fail.
+      ASSERT_EQ(irs::CompactionError::Busy,
+                writer
+                  ->Compact(irs::index_utils::MakePolicy(
+                    irs::index_utils::CompactionCount()))
+                  .error);  // compact
 
       auto check_compacting_segments =
         [](irs::Compaction& /*candidates*/, const irs::IndexReader& /*meta*/,
@@ -6903,10 +6907,10 @@ TEST_P(IndexTestCase, segment_compact_long_running) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     // assume 1 is 'segment 3'
@@ -6921,10 +6925,10 @@ TEST_P(IndexTestCase, segment_compact_long_running) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     // assume 1 is 'segment 4'
@@ -6939,10 +6943,10 @@ TEST_P(IndexTestCase, segment_compact_long_running) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc2
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 
@@ -7059,16 +7063,16 @@ TEST_P(IndexTestCase, segment_compact_long_running) {
         irs::tests::BlobPointReader values{segment, *column};
 
         auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc1
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc2
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc3
-        ASSERT_FALSE(docs_itr->next());
+        ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
       }
 
       // only live docs
@@ -7077,13 +7081,13 @@ TEST_P(IndexTestCase, segment_compact_long_running) {
 
         auto docs_itr =
           segment.mask(term_itr->postings(irs::IndexFeatures::None));
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc2
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc3
-        ASSERT_FALSE(docs_itr->next());
+        ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
       }
     }
   }
@@ -7207,19 +7211,19 @@ TEST_P(IndexTestCase, segment_compact_long_running) {
         irs::tests::BlobPointReader values{segment, *column};
 
         auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc1
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc2
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc3
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc4
-        ASSERT_FALSE(docs_itr->next());
+        ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
       }
 
       // only live docs
@@ -7228,13 +7232,13 @@ TEST_P(IndexTestCase, segment_compact_long_running) {
 
         auto docs_itr =
           segment.mask(term_itr->postings(irs::IndexFeatures::None));
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc2
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc3
-        ASSERT_FALSE(docs_itr->next());
+        ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
       }
     }
   }
@@ -7480,9 +7484,14 @@ TEST_P(IndexTestCase, segment_compact_commit) {
 
     ASSERT_EQ(0, irs::DirectoryCleaner::clean(dir()));
 
-    // all segments are already marked for compaction
-    ASSERT_FALSE(writer->Compact(
-      irs::index_utils::MakePolicy(irs::index_utils::CompactionCount())));
+    // Segments already marked for compaction are skipped by the policy, so
+    // there is nothing left to compact (Ok, no candidates).
+    {
+      const auto result = writer->Compact(
+        irs::index_utils::MakePolicy(irs::index_utils::CompactionCount()));
+      ASSERT_EQ(irs::CompactionError::Ok, result.error);
+      ASSERT_EQ(0, result.size);
+    }
 
     // check compacting segments
     expected_compacting_segments = {0, 1};
@@ -7524,13 +7533,13 @@ TEST_P(IndexTestCase, segment_compact_commit) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc2
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 
@@ -7568,9 +7577,14 @@ TEST_P(IndexTestCase, segment_compact_commit) {
     expected_compacting_segments = {0, 1};
     ASSERT_TRUE(writer->Compact(check_compacting_segments));
 
-    // can't compact segments that are already marked for compaction
-    ASSERT_FALSE(writer->Compact(
-      irs::index_utils::MakePolicy(irs::index_utils::CompactionCount())));
+    // Segments already marked for compaction are skipped by the policy, so
+    // there is nothing left to compact (Ok, no candidates).
+    {
+      const auto result = writer->Compact(
+        irs::index_utils::MakePolicy(irs::index_utils::CompactionCount()));
+      ASSERT_EQ(irs::CompactionError::Ok, result.error);
+      ASSERT_EQ(0, result.size);
+    }
 
     // check compacting segments
     expected_compacting_segments = {0, 1};
@@ -7609,13 +7623,13 @@ TEST_P(IndexTestCase, segment_compact_commit) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc2
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     // assume 1 is the newly created segment (doc3+doc4)
@@ -7630,13 +7644,13 @@ TEST_P(IndexTestCase, segment_compact_commit) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc3
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc4
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 
@@ -7674,9 +7688,14 @@ TEST_P(IndexTestCase, segment_compact_commit) {
     expected_compacting_segments = {0, 1};
     ASSERT_TRUE(writer->Compact(check_compacting_segments));
 
-    // can't compact segments that are already marked for compaction
-    ASSERT_FALSE(writer->Compact(
-      irs::index_utils::MakePolicy(irs::index_utils::CompactionCount())));
+    // Segments already marked for compaction are skipped by the policy, so
+    // there is nothing left to compact (Ok, no candidates).
+    {
+      const auto result = writer->Compact(
+        irs::index_utils::MakePolicy(irs::index_utils::CompactionCount()));
+      ASSERT_EQ(irs::CompactionError::Ok, result.error);
+      ASSERT_EQ(0, result.size);
+    }
 
     // check compacting segments
     expected_compacting_segments = {0, 1};
@@ -7721,13 +7740,13 @@ TEST_P(IndexTestCase, segment_compact_commit) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc2
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     // assume 1 is the newly crated segment
@@ -7742,16 +7761,16 @@ TEST_P(IndexTestCase, segment_compact_commit) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc3
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc4
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("E", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc4
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 }
@@ -7864,16 +7883,16 @@ TEST_P(IndexTestCase, compact_check_compacting_segments) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ(expected_name,
               irs::tests::ReadStoredStr<std::string_view>(
                 values, docs_itr->value()));  // 'name' value in doc1
     ++expected_name[0];
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ(expected_name,
               irs::tests::ReadStoredStr<std::string_view>(
                 values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     ++expected_name[0];
   }
 }
@@ -7971,9 +7990,15 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
     ASSERT_TRUE(writer->Compact(check_compacting_segments));
 
     ASSERT_EQ(0, irs::DirectoryCleaner::clean(dir()));
-    // all segments are already marked for compaction
-    ASSERT_FALSE(writer->Compact(
-      irs::index_utils::MakePolicy(irs::index_utils::CompactionCount())));
+    // Both segments are already registered for compaction, so the policy skips
+    // them and finds nothing to compact (Ok, no candidates) instead of picking
+    // an in-flight segment.
+    {
+      const auto result = writer->Compact(
+        irs::index_utils::MakePolicy(irs::index_utils::CompactionCount()));
+      ASSERT_EQ(irs::CompactionError::Ok, result.error);
+      ASSERT_EQ(0, result.size);
+    }
 
     // check compacting segments
     expected_compacting_segments = {0, 1};
@@ -8026,13 +8051,13 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc2
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 
@@ -8077,9 +8102,14 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
     expected_compacting_segments = {0, 1};
     ASSERT_TRUE(writer->Compact(check_compacting_segments));
 
-    // can't compact segments that are already marked for compaction
-    ASSERT_FALSE(writer->Compact(
-      irs::index_utils::MakePolicy(irs::index_utils::CompactionCount())));
+    // Segments already marked for compaction are skipped by the policy, so
+    // there is nothing left to compact (Ok, no candidates).
+    {
+      const auto result = writer->Compact(
+        irs::index_utils::MakePolicy(irs::index_utils::CompactionCount()));
+      ASSERT_EQ(irs::CompactionError::Ok, result.error);
+      ASSERT_EQ(0, result.size);
+    }
 
     // check compacting segments
     expected_compacting_segments = {0, 1};
@@ -8134,13 +8164,13 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc3
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc4
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     // assume 1 is merged segment
@@ -8155,13 +8185,13 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc2
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 
@@ -8207,9 +8237,14 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
     expected_compacting_segments = {0, 1};
     ASSERT_TRUE(writer->Compact(check_compacting_segments));
 
-    // can't compact segments that are already marked for compaction
-    ASSERT_FALSE(writer->Compact(
-      irs::index_utils::MakePolicy(irs::index_utils::CompactionCount())));
+    // Segments already marked for compaction are skipped by the policy, so
+    // there is nothing left to compact (Ok, no candidates).
+    {
+      const auto result = writer->Compact(
+        irs::index_utils::MakePolicy(irs::index_utils::CompactionCount()));
+      ASSERT_EQ(irs::CompactionError::Ok, result.error);
+      ASSERT_EQ(0, result.size);
+    }
 
     // check compacting segments
     expected_compacting_segments = {0, 1};
@@ -8275,13 +8310,13 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc3
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc4
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     // assume 1 is merged segment
@@ -8296,13 +8331,13 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc2
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     // assume 2 is the last added segment
@@ -8317,13 +8352,13 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
       auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
       ASSERT_TRUE(term_itr->next());
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("E", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("F", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc2
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
   }
 
@@ -8369,9 +8404,14 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
     expected_compacting_segments = {0, 1};
     ASSERT_TRUE(writer->Compact(check_compacting_segments));
 
-    // can't compact segments that are already marked for compaction
-    ASSERT_FALSE(writer->Compact(
-      irs::index_utils::MakePolicy(irs::index_utils::CompactionCount())));
+    // Segments already marked for compaction are skipped by the policy, so
+    // there is nothing left to compact (Ok, no candidates).
+    {
+      const auto result = writer->Compact(
+        irs::index_utils::MakePolicy(irs::index_utils::CompactionCount()));
+      ASSERT_EQ(irs::CompactionError::Ok, result.error);
+      ASSERT_EQ(0, result.size);
+    }
 
     // check compacting segments
     expected_compacting_segments = {0, 1};
@@ -8434,16 +8474,16 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
         irs::tests::BlobPointReader values{segment, *column};
 
         auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc3
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc3
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc4
-        ASSERT_FALSE(docs_itr->next());
+        ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
       }
 
       // without deleted docs
@@ -8452,13 +8492,13 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
 
         auto docs_itr =
           segment.mask(term_itr->postings(irs::IndexFeatures::None));
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc3
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc4
-        ASSERT_FALSE(docs_itr->next());
+        ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
       }
     }
   }
@@ -8507,9 +8547,14 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
     expected_compacting_segments = {0, 1};
     ASSERT_TRUE(writer->Compact(check_compacting_segments));
 
-    // can't compact segments that are already marked for compaction
-    ASSERT_FALSE(writer->Compact(
-      irs::index_utils::MakePolicy(irs::index_utils::CompactionCount())));
+    // Segments already marked for compaction are skipped by the policy, so
+    // there is nothing left to compact (Ok, no candidates).
+    {
+      const auto result = writer->Compact(
+        irs::index_utils::MakePolicy(irs::index_utils::CompactionCount()));
+      ASSERT_EQ(irs::CompactionError::Ok, result.error);
+      ASSERT_EQ(0, result.size);
+    }
 
     // check compacting segments
     expected_compacting_segments = {0, 1};
@@ -8569,19 +8614,19 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
         irs::tests::BlobPointReader values{segment, *column};
 
         auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc3
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc3
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc4
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc4
-        ASSERT_FALSE(docs_itr->next());
+        ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
       }
 
       // without deleted docs
@@ -8590,13 +8635,13 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
 
         auto docs_itr =
           segment.mask(term_itr->postings(irs::IndexFeatures::None));
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc3
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc4
-        ASSERT_FALSE(docs_itr->next());
+        ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
       }
     }
   }
@@ -8653,9 +8698,14 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
     expected_compacting_segments = {0, 1};
     ASSERT_TRUE(writer->Compact(check_compacting_segments_name_only));
 
-    // can't compact segments that are already marked for compaction
-    ASSERT_FALSE(writer->Compact(
-      irs::index_utils::MakePolicy(irs::index_utils::CompactionCount())));
+    // Segments already marked for compaction are skipped by the policy, so
+    // there is nothing left to compact (Ok, no candidates).
+    {
+      const auto result = writer->Compact(
+        irs::index_utils::MakePolicy(irs::index_utils::CompactionCount()));
+      ASSERT_EQ(irs::CompactionError::Ok, result.error);
+      ASSERT_EQ(0, result.size);
+    }
 
     tests::Remove(*writer, *query_doc4);
 
@@ -8699,19 +8749,19 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
           irs::tests::BlobPointReader values{segment, *column};
 
           auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-          ASSERT_TRUE(docs_itr->next());
+          ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
           ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                            values, docs_itr->value()));  // 'name' value in doc3
-          ASSERT_TRUE(docs_itr->next());
+          ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
           ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                            values, docs_itr->value()));  // 'name' value in doc3
-          ASSERT_TRUE(docs_itr->next());
+          ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
           ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                            values, docs_itr->value()));  // 'name' value in doc4
-          ASSERT_TRUE(docs_itr->next());
+          ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
           ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                            values, docs_itr->value()));  // 'name' value in doc4
-          ASSERT_FALSE(docs_itr->next());
+          ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
         }
 
         // without deleted docs
@@ -8720,13 +8770,13 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
 
           auto docs_itr =
             segment.mask(term_itr->postings(irs::IndexFeatures::None));
-          ASSERT_TRUE(docs_itr->next());
+          ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
           ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                            values, docs_itr->value()));  // 'name' value in doc3
-          ASSERT_TRUE(docs_itr->next());
+          ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
           ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                            values, docs_itr->value()));  // 'name' value in doc4
-          ASSERT_FALSE(docs_itr->next());
+          ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
         }
       }
     }
@@ -8805,9 +8855,14 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
     expected_compacting_segments = {0, 1};
     ASSERT_TRUE(writer->Compact(check_compacting_segments));
 
-    // can't compact segments that are already marked for compaction
-    ASSERT_FALSE(writer->Compact(
-      irs::index_utils::MakePolicy(irs::index_utils::CompactionCount())));
+    // Segments already marked for compaction are skipped by the policy, so
+    // there is nothing left to compact (Ok, no candidates).
+    {
+      const auto result = writer->Compact(
+        irs::index_utils::MakePolicy(irs::index_utils::CompactionCount()));
+      ASSERT_EQ(irs::CompactionError::Ok, result.error);
+      ASSERT_EQ(0, result.size);
+    }
 
     auto do_commit_and_compact_count =
       [&](irs::Compaction& candidates, const irs::IndexReader& reader,
@@ -8823,9 +8878,10 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
         sub_policy(candidates, reader, compacting_segments);
       };
 
-    // this should fail as segments 1 and 0 are actually compacted on
-    // previous  commit inside our test policy
-    ASSERT_FALSE(writer->Compact(do_commit_and_compact_count));
+    // The candidates were already compacted by the commit the test policy ran,
+    // so they are no longer in the merged snapshot: transient Busy, not Fail.
+    ASSERT_EQ(irs::CompactionError::Busy,
+              writer->Compact(do_commit_and_compact_count).error);
     ASSERT_NE(0, irs::DirectoryCleaner::clean(dir()));
     // check all data is deleted
     const auto one_segment_count = count;
@@ -8880,9 +8936,14 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
     expected_compacting_segments = {0, 1};
     ASSERT_TRUE(writer->Compact(check_compacting_segments));
 
-    // can't compact segments that are already marked for compaction
-    ASSERT_FALSE(writer->Compact(
-      irs::index_utils::MakePolicy(irs::index_utils::CompactionCount())));
+    // Segments already marked for compaction are skipped by the policy, so
+    // there is nothing left to compact (Ok, no candidates).
+    {
+      const auto result = writer->Compact(
+        irs::index_utils::MakePolicy(irs::index_utils::CompactionCount()));
+      ASSERT_EQ(irs::CompactionError::Ok, result.error);
+      ASSERT_EQ(0, result.size);
+    }
 
     auto do_commit_and_compact_count =
       [&](irs::Compaction& candidates, const irs::IndexReader& reader,
@@ -8901,9 +8962,10 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
         sub_policy(candidates, reader, compacting_segments);
       };
 
-    // this should fail as segments 1 and 0 are actually compacted on
-    // previous  commit inside our test policy
-    ASSERT_FALSE(writer->Compact(do_commit_and_compact_count));
+    // The candidates were already compacted by the commit the test policy ran,
+    // so they are no longer in the merged snapshot: transient Busy, not Fail.
+    ASSERT_EQ(irs::CompactionError::Busy,
+              writer->Compact(do_commit_and_compact_count).error);
     writer->RefreshCommit();
     AssertSnapshotEquality(*writer);
     ASSERT_NE(0, irs::DirectoryCleaner::clean(dir()));
@@ -9031,9 +9093,14 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
     expected_compacting_segments = {0, 1};
     ASSERT_TRUE(writer->Compact(check_compacting_segments));
 
-    // can't compact segments that are already marked for compaction
-    ASSERT_FALSE(writer->Compact(
-      irs::index_utils::MakePolicy(irs::index_utils::CompactionCount())));
+    // Segments already marked for compaction are skipped by the policy, so
+    // there is nothing left to compact (Ok, no candidates).
+    {
+      const auto result = writer->Compact(
+        irs::index_utils::MakePolicy(irs::index_utils::CompactionCount()));
+      ASSERT_EQ(irs::CompactionError::Ok, result.error);
+      ASSERT_EQ(0, result.size);
+    }
 
     // check compacting segments
     expected_compacting_segments = {0, 1};
@@ -9096,19 +9163,19 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
         irs::tests::BlobPointReader values{segment, *column};
 
         auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc1
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc2
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc3
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc4
-        ASSERT_FALSE(docs_itr->next());
+        ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
       }
 
       // without deleted docs
@@ -9117,13 +9184,13 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
 
         auto docs_itr =
           segment.mask(term_itr->postings(irs::IndexFeatures::None));
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc3
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc4
-        ASSERT_FALSE(docs_itr->next());
+        ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
       }
     }
 
@@ -9141,7 +9208,7 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
       ASSERT_TRUE(term_itr->next());
 
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("E", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
     }
@@ -9191,9 +9258,14 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
     expected_compacting_segments = {0, 1};
     ASSERT_TRUE(writer->Compact(check_compacting_segments));
 
-    // can't compact segments that are already marked for compaction
-    ASSERT_FALSE(writer->Compact(
-      irs::index_utils::MakePolicy(irs::index_utils::CompactionCount())));
+    // Segments already marked for compaction are skipped by the policy, so
+    // there is nothing left to compact (Ok, no candidates).
+    {
+      const auto result = writer->Compact(
+        irs::index_utils::MakePolicy(irs::index_utils::CompactionCount()));
+      ASSERT_EQ(irs::CompactionError::Ok, result.error);
+      ASSERT_EQ(0, result.size);
+    }
 
     // check compacting segments
     expected_compacting_segments = {0, 1};
@@ -9257,7 +9329,7 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
       ASSERT_TRUE(term_itr->next());
 
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("E", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
     }
@@ -9279,19 +9351,19 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
         irs::tests::BlobPointReader values{segment, *column};
 
         auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc1
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc2
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc3
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc4
-        ASSERT_FALSE(docs_itr->next());
+        ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
       }
 
       // without deleted docs
@@ -9300,13 +9372,13 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
 
         auto docs_itr =
           segment.mask(term_itr->postings(irs::IndexFeatures::None));
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc3
-        ASSERT_TRUE(docs_itr->next());
+        ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
         ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                          values, docs_itr->value()));  // 'name' value in doc4
-        ASSERT_FALSE(docs_itr->next());
+        ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
       }
     }
   }
@@ -9367,9 +9439,14 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
     expected_compacting_segments = {0, 1};
     ASSERT_TRUE(writer->Compact(check_compacting_segments));
 
-    // can't compact segments that are already marked for compaction
-    ASSERT_FALSE(writer->Compact(
-      irs::index_utils::MakePolicy(irs::index_utils::CompactionCount())));
+    // Segments already marked for compaction are skipped by the policy, so
+    // there is nothing left to compact (Ok, no candidates).
+    {
+      const auto result = writer->Compact(
+        irs::index_utils::MakePolicy(irs::index_utils::CompactionCount()));
+      ASSERT_EQ(irs::CompactionError::Ok, result.error);
+      ASSERT_EQ(0, result.size);
+    }
 
     // check compacting segments
     expected_compacting_segments = {0, 1};
@@ -9438,13 +9515,13 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
       ASSERT_TRUE(term_itr->next());
 
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("A", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc2
-      ASSERT_FALSE(docs_itr->next());
+      ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
     }
 
     // assume 1 is the recently added segment
@@ -9461,7 +9538,7 @@ TEST_P(IndexTestCase, segment_compact_pending_commit) {
       ASSERT_TRUE(term_itr->next());
 
       auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-      ASSERT_TRUE(docs_itr->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
       ASSERT_EQ("E", irs::tests::ReadStoredStr<std::string_view>(
                        values, docs_itr->value()));  // 'name' value in doc1
     }
@@ -9501,7 +9578,8 @@ TEST_P(IndexTestCase, compact_progress) {
 
     irs::MergeWriter::FlushProgress progress;
 
-    ASSERT_TRUE(writer->Compact(policy, get_codec(), progress));
+    ASSERT_TRUE(writer->Compact(policy, /*field_options=*/nullptr, get_codec(),
+                                progress));
     writer->RefreshCommit();  // write compacted segment
     reader = irs::DirectoryReader(dir, get_codec(),
                                   irs::tests::DefaultReaderOptions());
@@ -9537,7 +9615,8 @@ TEST_P(IndexTestCase, compact_progress) {
 
     irs::MergeWriter::FlushProgress progress = []() -> bool { return false; };
 
-    ASSERT_FALSE(writer->Compact(policy, get_codec(), progress));
+    ASSERT_FALSE(writer->Compact(policy, /*field_options=*/nullptr, get_codec(),
+                                 progress));
     writer->RefreshCommit();  // write compacted segment
     reader = writer->GetSnapshot();
     tests::AssertSnapshotEquality(
@@ -9586,7 +9665,8 @@ TEST_P(IndexTestCase, compact_progress) {
       return true;
     };
 
-    ASSERT_TRUE(writer->Compact(policy, get_codec(), progress));
+    ASSERT_TRUE(writer->Compact(policy, /*field_options=*/nullptr, get_codec(),
+                                progress));
     writer->RefreshCommit();  // write compacted segment
     reader = writer->GetSnapshot();
     tests::AssertSnapshotEquality(
@@ -9632,7 +9712,8 @@ TEST_P(IndexTestCase, compact_progress) {
       return --call_count;
     };
 
-    ASSERT_FALSE(writer->Compact(policy, get_codec(), progress));
+    ASSERT_FALSE(writer->Compact(policy, /*field_options=*/nullptr, get_codec(),
+                                 progress));
     writer->RefreshCommit();  // write compacted segment
 
     reader = irs::DirectoryReader(dir, get_codec(),
@@ -9745,10 +9826,10 @@ TEST_P(IndexTestCase, segment_compact) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc3
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // remove empty old, defragment new
@@ -9789,10 +9870,10 @@ TEST_P(IndexTestCase, segment_compact) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc3
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // remove empty old, defragment old
@@ -9835,10 +9916,10 @@ TEST_P(IndexTestCase, segment_compact) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc3
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // remove empty old, defragment old
@@ -9881,10 +9962,10 @@ TEST_P(IndexTestCase, segment_compact) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("C", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc3
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   auto merge_if_masked = [](irs::Compaction& candidates,
@@ -10002,13 +10083,13 @@ TEST_P(IndexTestCase, segment_compact) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc4
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // merge new+old segment
@@ -10051,13 +10132,13 @@ TEST_P(IndexTestCase, segment_compact) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc4
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // merge old+old segment
@@ -10102,13 +10183,13 @@ TEST_P(IndexTestCase, segment_compact) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc4
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // merge old+old segment
@@ -10153,13 +10234,13 @@ TEST_P(IndexTestCase, segment_compact) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc4
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // merge old+old+old segment
@@ -10209,16 +10290,16 @@ TEST_P(IndexTestCase, segment_compact) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc4
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("F", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc6
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // merge old+old+old segment
@@ -10268,16 +10349,16 @@ TEST_P(IndexTestCase, segment_compact) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc4
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("F", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc6
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // merge two segments with different fields
@@ -10339,28 +10420,28 @@ TEST_P(IndexTestCase, segment_compact) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc4
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("F", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc6
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(
              upper_case_values, docs_itr->value()));  // 'name' value in doc1_1
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ(
       "B", irs::tests::ReadStoredStr<std::string_view>(
              upper_case_values, docs_itr->value()));  // 'name' value in doc1_2
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ(
       "C", irs::tests::ReadStoredStr<std::string_view>(
              upper_case_values, docs_itr->value()));  // 'name' value in doc1_3
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 
   // merge two segments with different fields
@@ -10422,28 +10503,28 @@ TEST_P(IndexTestCase, segment_compact) {
     auto term_itr = terms->iterator(irs::SeekMode::NORMAL);
     ASSERT_TRUE(term_itr->next());
     auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("B", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc2
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("D", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc4
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ("F", irs::tests::ReadStoredStr<std::string_view>(
                      values, docs_itr->value()));  // 'name' value in doc6
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(
              upper_case_values, docs_itr->value()));  // 'name' value in doc1_1
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ(
       "B", irs::tests::ReadStoredStr<std::string_view>(
              upper_case_values, docs_itr->value()));  // 'name' value in doc1_2
-    ASSERT_TRUE(docs_itr->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs_itr->advance()));
     ASSERT_EQ(
       "C", irs::tests::ReadStoredStr<std::string_view>(
              upper_case_values, docs_itr->value()));  // 'name' value in doc1_3
-    ASSERT_FALSE(docs_itr->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs_itr->advance()));
   }
 }
 
@@ -10511,7 +10592,7 @@ TEST_P(IndexTestCase, segment_compact_policy) {
       ASSERT_TRUE(term_itr->next());
 
       for (auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-           docs_itr->next();) {
+           !irs::doc_limits::eof(docs_itr->advance());) {
         ASSERT_EQ(
           1, expected_name.erase(irs::tests::ReadStoredStr<std::string_view>(
                values, docs_itr->value())));
@@ -10535,7 +10616,7 @@ TEST_P(IndexTestCase, segment_compact_policy) {
       ASSERT_TRUE(term_itr->next());
 
       for (auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-           docs_itr->next();) {
+           !irs::doc_limits::eof(docs_itr->advance());) {
         ASSERT_EQ(
           1, expected_name.erase(irs::tests::ReadStoredStr<std::string_view>(
                values, docs_itr->value())));
@@ -10585,7 +10666,7 @@ TEST_P(IndexTestCase, segment_compact_policy) {
       ASSERT_NE(nullptr, column);
       irs::tests::BlobPointReader values{segment, *column};
       for (auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-           docs_itr->next();) {
+           !irs::doc_limits::eof(docs_itr->advance());) {
         ASSERT_EQ(
           1, expected_name.erase(irs::tests::ReadStoredStr<std::string_view>(
                values, docs_itr->value())));
@@ -10609,7 +10690,7 @@ TEST_P(IndexTestCase, segment_compact_policy) {
       ASSERT_NE(nullptr, column);
       irs::tests::BlobPointReader values{segment, *column};
       for (auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-           docs_itr->next();) {
+           !irs::doc_limits::eof(docs_itr->advance());) {
         ASSERT_EQ(
           1, expected_name.erase(irs::tests::ReadStoredStr<std::string_view>(
                values, docs_itr->value())));
@@ -10656,7 +10737,7 @@ TEST_P(IndexTestCase, segment_compact_policy) {
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{segment, *column};
     for (auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-         docs_itr->next();) {
+         !irs::doc_limits::eof(docs_itr->advance());) {
       ASSERT_EQ(1,
                 expected_name.erase(irs::tests::ReadStoredStr<std::string_view>(
                   values, docs_itr->value())));
@@ -10702,7 +10783,7 @@ TEST_P(IndexTestCase, segment_compact_policy) {
       ASSERT_NE(nullptr, column);
       irs::tests::BlobPointReader values{segment, *column};
       for (auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-           docs_itr->next();) {
+           !irs::doc_limits::eof(docs_itr->advance());) {
         ASSERT_EQ(
           1, expected_name.erase(irs::tests::ReadStoredStr<std::string_view>(
                values, docs_itr->value())));
@@ -10725,7 +10806,7 @@ TEST_P(IndexTestCase, segment_compact_policy) {
       ASSERT_NE(nullptr, column);
       irs::tests::BlobPointReader values{segment, *column};
       for (auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-           docs_itr->next();) {
+           !irs::doc_limits::eof(docs_itr->advance());) {
         ASSERT_EQ(
           1, expected_name.erase(irs::tests::ReadStoredStr<std::string_view>(
                values, docs_itr->value())));
@@ -10776,7 +10857,7 @@ TEST_P(IndexTestCase, segment_compact_policy) {
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{segment, *column};
     for (auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-         docs_itr->next();) {
+         !irs::doc_limits::eof(docs_itr->advance());) {
       ASSERT_EQ(1,
                 expected_name.erase(irs::tests::ReadStoredStr<std::string_view>(
                   values, docs_itr->value())));
@@ -10830,7 +10911,7 @@ TEST_P(IndexTestCase, segment_compact_policy) {
       irs::tests::BlobPointReader values{segment, *column};
       for (auto docs_itr =
              segment.mask(term_itr->postings(irs::IndexFeatures::None));
-           docs_itr->next();) {
+           !irs::doc_limits::eof(docs_itr->advance());) {
         ASSERT_EQ(
           1, expected_name.erase(irs::tests::ReadStoredStr<std::string_view>(
                values, docs_itr->value())));
@@ -10854,7 +10935,7 @@ TEST_P(IndexTestCase, segment_compact_policy) {
       ASSERT_NE(nullptr, column);
       irs::tests::BlobPointReader values{segment, *column};
       for (auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-           docs_itr->next();) {
+           !irs::doc_limits::eof(docs_itr->advance());) {
         ASSERT_EQ(
           1, expected_name.erase(irs::tests::ReadStoredStr<std::string_view>(
                values, docs_itr->value())));
@@ -10906,7 +10987,7 @@ TEST_P(IndexTestCase, segment_compact_policy) {
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{segment, *column};
     for (auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-         docs_itr->next();) {
+         !irs::doc_limits::eof(docs_itr->advance());) {
       ASSERT_EQ(1,
                 expected_name.erase(irs::tests::ReadStoredStr<std::string_view>(
                   values, docs_itr->value())));
@@ -10961,7 +11042,7 @@ TEST_P(IndexTestCase, segment_compact_policy) {
       irs::tests::BlobPointReader values{segment, *column};
       for (auto docs_itr =
              segment.mask(term_itr->postings(irs::IndexFeatures::None));
-           docs_itr->next();) {
+           !irs::doc_limits::eof(docs_itr->advance());) {
         ASSERT_EQ(
           1, expected_name.erase(irs::tests::ReadStoredStr<std::string_view>(
                values, docs_itr->value())));
@@ -10987,7 +11068,7 @@ TEST_P(IndexTestCase, segment_compact_policy) {
       irs::tests::BlobPointReader values{segment, *column};
       for (auto docs_itr =
              segment.mask(term_itr->postings(irs::IndexFeatures::None));
-           docs_itr->next();) {
+           !irs::doc_limits::eof(docs_itr->advance());) {
         ASSERT_EQ(
           1, expected_name.erase(irs::tests::ReadStoredStr<std::string_view>(
                values, docs_itr->value())));
@@ -11085,7 +11166,7 @@ TEST_P(IndexTestCase, segment_options) {
       ASSERT_TRUE(term_itr->next());
 
       for (auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-           docs_itr->next();) {
+           !irs::doc_limits::eof(docs_itr->advance());) {
         ASSERT_EQ(
           1, expected_name.erase(irs::tests::ReadStoredStr<std::string_view>(
                values, docs_itr->value())));
@@ -11130,7 +11211,7 @@ TEST_P(IndexTestCase, segment_options) {
       ASSERT_TRUE(term_itr->next());
 
       for (auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-           docs_itr->next();) {
+           !irs::doc_limits::eof(docs_itr->advance());) {
         ASSERT_EQ(
           1, expected_name.erase(irs::tests::ReadStoredStr<std::string_view>(
                values, docs_itr->value())));
@@ -11154,7 +11235,7 @@ TEST_P(IndexTestCase, segment_options) {
       ASSERT_TRUE(term_itr->next());
 
       for (auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-           docs_itr->next();) {
+           !irs::doc_limits::eof(docs_itr->advance());) {
         ASSERT_EQ(
           1, expected_name.erase(irs::tests::ReadStoredStr<std::string_view>(
                values, docs_itr->value())));
@@ -11199,7 +11280,7 @@ TEST_P(IndexTestCase, segment_options) {
       ASSERT_TRUE(term_itr->next());
 
       for (auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-           docs_itr->next();) {
+           !irs::doc_limits::eof(docs_itr->advance());) {
         ASSERT_EQ(
           1, expected_name.erase(irs::tests::ReadStoredStr<std::string_view>(
                values, docs_itr->value())));
@@ -11223,7 +11304,7 @@ TEST_P(IndexTestCase, segment_options) {
       ASSERT_TRUE(term_itr->next());
 
       for (auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-           docs_itr->next();) {
+           !irs::doc_limits::eof(docs_itr->advance());) {
         ASSERT_EQ(
           1, expected_name.erase(irs::tests::ReadStoredStr<std::string_view>(
                values, docs_itr->value())));
@@ -11280,7 +11361,7 @@ TEST_P(IndexTestCase, segment_options) {
       ASSERT_TRUE(term_itr->next());
 
       for (auto docs_itr = term_itr->postings(irs::IndexFeatures::None);
-           docs_itr->next();) {
+           !irs::doc_limits::eof(docs_itr->advance());) {
         ASSERT_EQ(
           1, expected_name.erase(irs::tests::ReadStoredStr<std::string_view>(
                values, docs_itr->value())));
@@ -11714,8 +11795,8 @@ TEST_P(IndexTestCase11, compact_old_format) {
   // compact
   auto old_codec = irs::formats::Get("1_5simd");
   irs::index_utils::CompactionCount compact_all;
-  ASSERT_TRUE(
-    writer->Compact(irs::index_utils::MakePolicy(compact_all), old_codec));
+  ASSERT_TRUE(writer->Compact(irs::index_utils::MakePolicy(compact_all),
+                              /*field_options=*/nullptr, old_codec));
   writer->RefreshCommit();
   AssertSnapshotEquality(*writer);
   validate_codec(old_codec, 1);
@@ -12472,73 +12553,6 @@ TEST_P(IndexTestCase14, buffered_column_reopen) {
                   "relied on are gone with the new columnstore";
 }
 
-// Minimal stand-ins for the original HNSW search fixtures. Bodies of the
-// two tests below `GTEST_SKIP()` -- the production HNSW path is now driven
-// through the typed columnstore (`ColWriter::AttachHNSW`,
-// `HnswReader`) and `SubReader::Search(field_id, ...)`; the
-// legacy `irs::ColumnInfo`/`IndexWriterOptions::column_info` lambda and
-// `DirectoryReader::Search(name, info, buffer)` overloads the original
-// tests built on are gone. SQL-level coverage lives at
-// `tests/sqllogic/sdb/pg/index/vector_search.test`. These fixtures stay so
-// the parametrized test names still appear in the runner's output and we
-// have an obvious place to restore them when a gtest harness for the new
-// HNSW API lands.
-struct SearchTestFeatureBase {
-  irs::HNSWMetric metric = irs::HNSWMetric::L2Sqr;
-};
-
-struct ANNSearchFeature : SearchTestFeatureBase {};
-struct RangeSearchFeature : SearchTestFeatureBase {};
-
-template<typename Feature>
-class VectorSearchTestBase
-  : public virtual TestParamBase<
-      std::tuple<tests::dir_param_f, tests::FormatInfo, Feature>> {
- public:
-  using Param = std::tuple<tests::dir_param_f, tests::FormatInfo, Feature>;
-
-  static std::string to_string(const testing::TestParamInfo<Param>& info) {
-    const auto& [dir_f, fmt, feat] = info.param;
-    std::string name = (*dir_f)(nullptr).second;
-    if (fmt.codec) {
-      name += "_";
-      name += fmt.codec;
-    }
-    switch (feat.metric) {
-      case irs::HNSWMetric::L2Sqr:
-        name += "_L2Sqr";
-        break;
-      case irs::HNSWMetric::NegativeIP:
-        name += "_IP";
-        break;
-      case irs::HNSWMetric::Cosine:
-        name += "_Cosine";
-        break;
-      case irs::HNSWMetric::L1:
-        name += "_L1";
-        break;
-    }
-    return name;
-  }
-};
-
-class ANNSearchTest : public VectorSearchTestBase<ANNSearchFeature> {};
-class RangeSearchTest : public VectorSearchTestBase<RangeSearchFeature> {};
-
-TEST_P(ANNSearchTest, hnsw_search_basic) {
-  GTEST_SKIP() << "Legacy IndexWriterOptions::column_info / irs::ColumnInfo "
-                  "and DirectoryReader::Search(name, ...) overloads are "
-                  "removed; SQL-level coverage at "
-                  "tests/sqllogic/sdb/pg/index/vector_search.test";
-}
-
-TEST_P(RangeSearchTest, hnsw_range_search_basic) {
-  GTEST_SKIP() << "Legacy IndexWriterOptions::column_info / irs::ColumnInfo "
-                  "and DirectoryReader::RangeSearch(name, ...) overloads "
-                  "are removed; SQL-level coverage at "
-                  "tests/sqllogic/sdb/pg/index/vector_search.test";
-}
-
 static const auto kTestFormats =
   ::testing::Values(tests::FormatInfo{"1_5simd"});
 
@@ -12555,25 +12569,3 @@ INSTANTIATE_TEST_SUITE_P(index_test_14, IndexTestCase14, kTestValues,
 
 INSTANTIATE_TEST_SUITE_P(index_test_15, IndexTestCase, kTestValues,
                          IndexTestCase::to_string);
-
-INSTANTIATE_TEST_SUITE_P(
-  BasicANNSearch, ANNSearchTest,
-  ::testing::Combine(kTestDirs, kTestFormats,
-                     ::testing::ValuesIn(std::vector<ANNSearchFeature>{
-                       ANNSearchFeature{{irs::HNSWMetric::L2Sqr}},
-                       ANNSearchFeature{{irs::HNSWMetric::NegativeIP}},
-                       ANNSearchFeature{{irs::HNSWMetric::Cosine}},
-                       ANNSearchFeature{{irs::HNSWMetric::L1}},
-                     })),
-  ANNSearchTest::to_string);
-
-INSTANTIATE_TEST_SUITE_P(
-  BasicRangeSearch, RangeSearchTest,
-  ::testing::Combine(kTestDirs, kTestFormats,
-                     ::testing::ValuesIn(std::vector<RangeSearchFeature>{
-                       RangeSearchFeature{{irs::HNSWMetric::L2Sqr}},
-                       RangeSearchFeature{{irs::HNSWMetric::NegativeIP}},
-                       RangeSearchFeature{{irs::HNSWMetric::Cosine}},
-                       RangeSearchFeature{{irs::HNSWMetric::L1}},
-                     })),
-  RangeSearchTest::to_string);

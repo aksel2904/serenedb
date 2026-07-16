@@ -155,19 +155,17 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         MakeFilter(kSeqFieldId, min_term->value, irs::BoundType::Inclusive,
                    max_term->value, irs::BoundType::Inclusive);
 
-      auto prepared = query.prepare({
-        .index = rdr,
-        .memory = counter,
-      });
+      tests::PreparedFilter prepared{query, rdr, nullptr, counter};
 
       std::vector<irs::doc_id_t> expected{8};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -191,16 +189,17 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         MakeFilter(kSeqFieldId, min_term->value, irs::BoundType::Inclusive,
                    max_term->value, irs::BoundType::Inclusive);
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{2, 3, 4, 5, 6, 7, 8};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -217,16 +216,17 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
                    (irs::numeric_utils::numeric_traits<int64_t>::max)(),
                    irs::BoundType::Inclusive);
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{30, 31, 32};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -242,16 +242,17 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         kSeqFieldId, (irs::numeric_utils::numeric_traits<int64_t>::min)(),
         irs::BoundType::Inclusive, max_term->value, irs::BoundType::Inclusive);
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{1, 2, 3, 4, 5, 6};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -272,16 +273,17 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         MakeFilter(kSeqFieldId, min_term->value, irs::BoundType::Inclusive,
                    max_term->value, irs::BoundType::Inclusive);
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{8};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -302,16 +304,17 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         MakeFilter(kSeqFieldId, min_term->value, irs::BoundType::Inclusive,
                    max_term->value, irs::BoundType::Inclusive);
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{2, 3, 4, 5, 6, 7, 8};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -328,16 +331,17 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
                    (irs::numeric_utils::numeric_traits<int32_t>::max)(),
                    irs::BoundType::Inclusive);
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{30, 31, 32};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -353,16 +357,17 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         kSeqFieldId, (irs::numeric_utils::numeric_traits<int32_t>::min)(),
         irs::BoundType::Inclusive, max_term->value, irs::BoundType::Inclusive);
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{1, 2, 3, 4, 5, 6};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -383,16 +388,17 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         MakeFilter(kValueFieldId, min_term->value, irs::BoundType::Inclusive,
                    max_term->value, irs::BoundType::Inclusive);
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{3, 8};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -413,16 +419,17 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         MakeFilter(kValueFieldId, min_term->value, irs::BoundType::Inclusive,
                    max_term->value, irs::BoundType::Exclusive);
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{1, 2, 5, 7, 9, 10, 12};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -438,16 +445,17 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         kValueFieldId, irs::numeric_utils::numeric_traits<float_t>::ninf(),
         irs::BoundType::Inclusive, max_term->value, irs::BoundType::Exclusive);
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{4, 11, 13, 14, 15, 16, 17};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -464,16 +472,17 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
                    irs::numeric_utils::numeric_traits<float_t>::inf(),
                    irs::BoundType::Inclusive);
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{1, 2, 3, 5, 6, 7, 8, 9, 10, 12};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -493,16 +502,17 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         MakeFilter(kValueFieldId, min_term->value, irs::BoundType::Inclusive,
                    max_term->value, irs::BoundType::Inclusive);
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{3, 8};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -522,16 +532,17 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         MakeFilter(kValueFieldId, min_term->value, irs::BoundType::Exclusive,
                    max_term->value, irs::BoundType::Inclusive);
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{4, 11, 13, 14, 15, 16, 17};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -547,16 +558,17 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         kValueFieldId, irs::numeric_utils::numeric_traits<double_t>::ninf(),
         irs::BoundType::Exclusive, max_term->value, irs::BoundType::Exclusive);
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{14, 15, 17};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -573,16 +585,17 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
                    irs::numeric_utils::numeric_traits<double_t>::inf(),
                    irs::BoundType::Inclusive);
 
-      auto prepared = query.prepare({.index = rdr});
+      tests::PreparedFilter prepared{query, rdr};
 
       std::vector<irs::doc_id_t> expected{1, 2, 3, 5, 6, 7, 8, 9, 10, 12, 13};
       std::vector<irs::doc_id_t> actual;
 
-      for (const auto& sub : rdr) {
-        auto docs = prepared->execute({.segment = sub});
-        for (; docs->next();) {
+      for (size_t i = 0; [[maybe_unused]] const auto& sub : rdr) {
+        auto docs = prepared.Execute(i);
+        for (; !irs::doc_limits::eof(docs->advance());) {
           actual.push_back(docs->value());
         }
+        ++i;
       }
       ASSERT_EQ(expected, actual);
     }
@@ -610,7 +623,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
       irs::ByRange filter;
       *filter.mutable_field_id() = kNameFieldId;
 
-      CheckQuery(filter, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(filter), docs, costs, rdr);
     }
 
     // invalid_name = (..;..)
@@ -618,7 +631,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
       irs::ByRange filter;
       *filter.mutable_field_id() = kInvalidNameFieldId;
 
-      CheckQuery(filter, Docs{}, rdr);
+      CheckQuery(*tests::Optimized(filter), Docs{}, rdr);
     }
 
     // name = ["";..)
@@ -631,7 +644,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
       *filter.mutable_field_id() = kNameFieldId;
       filter.mutable_options()->range.min_type = irs::BoundType::Inclusive;
 
-      CheckQuery(filter, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(filter), docs, costs, rdr);
     }
 
     // name = ("";..]
@@ -644,7 +657,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
       *filter.mutable_field_id() = kNameFieldId;
       filter.mutable_options()->range.min_type = irs::BoundType::Exclusive;
 
-      CheckQuery(filter, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(filter), docs, costs, rdr);
     }
 
     // name = ["";""]
@@ -657,7 +670,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
       filter.mutable_options()->range.min_type = irs::BoundType::Inclusive;
       filter.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      CheckQuery(filter, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(filter), docs, costs, rdr);
     }
 
     // name = [A;..)
@@ -673,7 +686,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         irs::ViewCast<irs::byte_type>(std::string_view("A"));
       filter.mutable_options()->range.min_type = irs::BoundType::Inclusive;
 
-      CheckQuery(filter, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(filter), docs, costs, rdr);
     }
 
     // name = (A;..)
@@ -689,7 +702,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         irs::ViewCast<irs::byte_type>(std::string_view("A"));
       filter.mutable_options()->range.min_type = irs::BoundType::Exclusive;
 
-      CheckQuery(filter, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(filter), docs, costs, rdr);
     }
 
     // name = (..;C)
@@ -704,7 +717,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         irs::ViewCast<irs::byte_type>(std::string_view("C"));
       filter.mutable_options()->range.max_type = irs::BoundType::Exclusive;
 
-      CheckQuery(filter, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(filter), docs, costs, rdr);
     }
 
     // name = (..;C]
@@ -719,7 +732,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         irs::ViewCast<irs::byte_type>(std::string_view("C"));
       filter.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      CheckQuery(filter, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(filter), docs, costs, rdr);
     }
 
     // name = [A;C]
@@ -737,7 +750,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         irs::ViewCast<irs::byte_type>(std::string_view("C"));
       filter.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      CheckQuery(filter, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(filter), docs, costs, rdr);
     }
 
     // name = [A;B]
@@ -755,7 +768,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         irs::ViewCast<irs::byte_type>(std::string_view("B"));
       filter.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      CheckQuery(filter, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(filter), docs, costs, rdr);
     }
 
     // name = [A;B)
@@ -773,7 +786,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         irs::ViewCast<irs::byte_type>(std::string_view("B"));
       filter.mutable_options()->range.max_type = irs::BoundType::Exclusive;
 
-      CheckQuery(filter, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(filter), docs, costs, rdr);
     }
 
     // name = (A;B]
@@ -791,7 +804,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         irs::ViewCast<irs::byte_type>(std::string_view("B"));
       filter.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      CheckQuery(filter, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(filter), docs, costs, rdr);
     }
 
     // name = (A;B)
@@ -806,7 +819,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         irs::ViewCast<irs::byte_type>(std::string_view("B"));
       filter.mutable_options()->range.max_type = irs::BoundType::Exclusive;
 
-      CheckQuery(filter, Docs{}, Costs{0}, rdr);
+      CheckQuery(*tests::Optimized(filter), Docs{}, Costs{0}, rdr);
     }
 
     // name = [A;C)
@@ -824,7 +837,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         irs::ViewCast<irs::byte_type>(std::string_view("C"));
       filter.mutable_options()->range.max_type = irs::BoundType::Exclusive;
 
-      CheckQuery(filter, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(filter), docs, costs, rdr);
     }
 
     // name = (A;C]
@@ -842,7 +855,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         irs::ViewCast<irs::byte_type>(std::string_view("C"));
       filter.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      CheckQuery(filter, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(filter), docs, costs, rdr);
     }
 
     // name = (A;C)
@@ -860,7 +873,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         irs::ViewCast<irs::byte_type>(std::string_view("C"));
       filter.mutable_options()->range.max_type = irs::BoundType::Exclusive;
 
-      CheckQuery(filter, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(filter), docs, costs, rdr);
     }
 
     // name = [C;A]
@@ -875,7 +888,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         irs::ViewCast<irs::byte_type>(std::string_view("A"));
       filter.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      CheckQuery(filter, Docs{}, Costs{0}, rdr);
+      CheckQuery(*tests::Optimized(filter), Docs{}, Costs{0}, rdr);
     }
 
     // name = [~;..]
@@ -893,7 +906,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         irs::ViewCast<irs::byte_type>(std::string_view("~"));
       filter.mutable_options()->range.max_type = irs::BoundType::Unbounded;
 
-      CheckQuery(filter, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(filter), docs, costs, rdr);
     }
 
     // name = (~;..]
@@ -905,7 +918,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         irs::ViewCast<irs::byte_type>(std::string_view("~"));
       filter.mutable_options()->range.min_type = irs::BoundType::Exclusive;
 
-      CheckQuery(filter, Docs{}, Costs{0}, rdr);
+      CheckQuery(*tests::Optimized(filter), Docs{}, Costs{0}, rdr);
     }
 
     // name = (a;..]
@@ -923,7 +936,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         irs::ViewCast<irs::byte_type>(std::string_view("a"));
       filter.mutable_options()->range.max_type = irs::BoundType::Unbounded;
 
-      CheckQuery(filter, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(filter), docs, costs, rdr);
     }
 
     // name = [..;a]
@@ -942,7 +955,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         irs::ViewCast<irs::byte_type>(std::string_view("a"));
       filter.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-      CheckQuery(filter, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(filter), docs, costs, rdr);
     }
 
     // name = [..;a)
@@ -958,7 +971,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         irs::ViewCast<irs::byte_type>(std::string_view("a"));
       filter.mutable_options()->range.max_type = irs::BoundType::Exclusive;
 
-      CheckQuery(filter, docs, costs, rdr);
+      CheckQuery(*tests::Optimized(filter), docs, costs, rdr);
     }
 
     // name = [DEL;..]
@@ -970,7 +983,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
         irs::ViewCast<irs::byte_type>(std::string_view("\x7f"));
       filter.mutable_options()->range.min_type = irs::BoundType::Exclusive;
 
-      CheckQuery(filter, Docs{}, Costs{0}, rdr);
+      CheckQuery(*tests::Optimized(filter), Docs{}, Costs{0}, rdr);
     }
   }
 
@@ -1034,7 +1047,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
 
       irs::Scorer::ptr sort{std::make_unique<tests::sort::FrequencySort>()};
 
-      CheckQuery(filter, std::span{&sort, 1}, docs, rdr);
+      CheckQuery(*tests::Optimized(filter), std::span{&sort, 1}, docs, rdr);
     }
 
     // value = (..;..) + scored_terms_limit
@@ -1054,7 +1067,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
 
       irs::Scorer::ptr sort{std::make_unique<tests::sort::FrequencySort>()};
 
-      CheckQuery(filter, std::span{&sort, 1}, docs, rdr);
+      CheckQuery(*tests::Optimized(filter), std::span{&sort, 1}, docs, rdr);
     }
 
     // value = (..;100)
@@ -1076,7 +1089,7 @@ class RangeFilterTestCase : public tests::FilterTestCaseBase {
       filter.mutable_options()->range.max_type = irs::BoundType::Exclusive;
 
       irs::Scorer::ptr sort{std::make_unique<tests::sort::FrequencySort>()};
-      CheckQuery(filter, std::span{&sort, 1}, docs, rdr);
+      CheckQuery(*tests::Optimized(filter), std::span{&sort, 1}, docs, rdr);
     }
   }
 };
@@ -1186,8 +1199,8 @@ TEST(by_range_test, boost) {
       irs::ViewCast<irs::byte_type>(std::string_view("max_term"));
     q.mutable_options()->range.max_type = irs::BoundType::Inclusive;
 
-    auto prepared = q.prepare({.index = irs::SubReader::empty()});
-    ASSERT_EQ(irs::kNoBoost, prepared->Boost());
+    tests::PreparedFilter prepared{q, irs::SubReader::empty()};
+    ASSERT_EQ(irs::kNoBoost, prepared.Query(0)->Boost());
   }
 
   // with boost
@@ -1204,8 +1217,8 @@ TEST(by_range_test, boost) {
     q.mutable_options()->range.max_type = irs::BoundType::Inclusive;
     q.boost(boost);
 
-    auto prepared = q.prepare({.index = irs::SubReader::empty()});
-    ASSERT_EQ(boost, prepared->Boost());
+    tests::PreparedFilter prepared{q, irs::SubReader::empty()};
+    ASSERT_EQ(boost, prepared.Query(0)->Boost());
   }
 }
 
@@ -1265,8 +1278,8 @@ TEST_P(RangeFilterTestCase, by_range_order_multi_segment_field_stats) {
     irs::numeric_utils::numeric_traits<double_t>::inf();
   filter.mutable_options()->range.max_type = irs::BoundType::Exclusive;
 
-  auto q = filter.prepare({.index = rdr, .scorer = sort.get()});
-  ASSERT_NE(nullptr, q);
+  tests::PreparedFilter q{filter, rdr, sort.get()};
+  ASSERT_NE(nullptr, q.Query(0));
 
   ASSERT_GT(finish_count, 1u);       // multiple scored terms
   ASSERT_NE(nullptr, shared_field);  // field stats were collected
@@ -1312,8 +1325,8 @@ TEST_P(RangeFilterTestCase, by_range_order_limit_field_stats) {
   filter.mutable_options()->range.max_type = irs::BoundType::Exclusive;
   filter.mutable_options()->scored_terms_limit = 2;
 
-  auto q = filter.prepare({.index = rdr, .scorer = sort.get()});
-  ASSERT_NE(nullptr, q);
+  tests::PreparedFilter q{filter, rdr, sort.get()};
+  ASSERT_NE(nullptr, q.Query(0));
 
   ASSERT_GT(finish_count, 0u);
   ASSERT_LE(finish_count, 2u);  // capped by scored_terms_limit
@@ -1352,8 +1365,8 @@ TEST_P(RangeFilterTestCase, by_range_order_no_match_field_stats) {
     irs::numeric_utils::numeric_traits<double_t>::inf();
   filter.mutable_options()->range.max_type = irs::BoundType::Exclusive;
 
-  auto q = filter.prepare({.index = rdr, .scorer = sort.get()});
-  ASSERT_NE(nullptr, q);
+  tests::PreparedFilter q{filter, rdr, sort.get()};
+  ASSERT_NE(nullptr, q.Query(0));
   ASSERT_EQ(0u, finish_count);  // nothing scored, no field stats collected
 }
 
@@ -1381,7 +1394,9 @@ TEST_P(RangeFilterTestCase, visit) {
   // get term dictionary for field
   const auto* reader = segment.field(field);
   ASSERT_NE(nullptr, reader);
-  irs::ByRange::visit(segment, *reader, range, visitor);
+  irs::ByRangeOptions options;
+  options.range = range;
+  irs::ByRange::visit(segment, *reader, options, visitor);
   ASSERT_EQ(1, visitor.prepare_calls_counter());
   ASSERT_EQ(2, visitor.visit_calls_counter());
   ASSERT_EQ((std::vector<std::pair<std::string_view, irs::score_t>>{

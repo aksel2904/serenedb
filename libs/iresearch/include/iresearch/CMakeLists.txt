@@ -80,6 +80,7 @@ set(IResearch_core_sources
     ./formats/column/col_writer.cpp
     ./formats/column/column_writer.cpp
     ./formats/column/column_reader.cpp
+    ./formats/column/variant_column_reader.cpp
     ./formats/column/norm_writer.cpp
     ./formats/column/norm_column_reader.cpp
     ./formats/column/merge.cpp
@@ -92,8 +93,11 @@ set(IResearch_core_sources
     ./formats/index/burst_trie.cpp
     ./formats/index/idx_reader.cpp
     ./formats/index/idx_writer.cpp
-    ./formats/hnsw/hnsw_reader.cpp
-    ./formats/hnsw/hnsw_writer.cpp
+    ./formats/ivf/centroids.cpp
+    ./formats/ivf/clustering.cpp
+    ./formats/ivf/ivf_writer.cpp
+    ./formats/ivf/ivf_reader.cpp
+    ./formats/ivf/quantizer.cpp
     ./index/directory_reader.cpp
     ./index/directory_reader_impl.cpp
     ./index/field_data.cpp
@@ -127,6 +131,7 @@ set(IResearch_core_sources
     ./search/phrase_query.cpp
     ./search/column_existence_filter.cpp
     ./search/same_position_filter.cpp
+    ./search/automaton_filter.cpp
     ./search/wildcard_filter.cpp
     ./search/regexp_filter.cpp
     ./search/wildcard_ngram_filter.cpp
@@ -135,9 +140,20 @@ set(IResearch_core_sources
     ./search/term_query.cpp
     ./search/boolean_filter.cpp
     ./search/boolean_query.cpp
+    ./search/filter_optimizer.cpp
+    ./search/optimizer/boolean_rules.cpp
+    ./search/optimizer/negation_rules.cpp
+    ./search/optimizer/terms_rules.cpp
+    ./search/optimizer/range_rules.cpp
+    ./search/optimizer/lowering_rules.cpp
+    ./search/optimizer/levenshtein_prefix_rules.cpp
     ./search/mixed_boolean_filter.cpp
     ./search/ngram_similarity_filter.cpp
     ./search/ngram_similarity_query.cpp
+    ./search/vector_similarity_filter.cpp
+    ./search/vector_similarity_query.cpp
+    ./search/vector_similarity_scorer.cpp
+    ./search/vector_radius_filter.cpp
     ./search/geo_filter.cpp
     ./search/proxy_filter.cpp
     ./search/tfidf.cpp
@@ -234,6 +250,8 @@ target_include_directories(
         $<TARGET_PROPERTY:${FASTTEXT_LIBRARY_STATIC},INTERFACE_INCLUDE_DIRECTORIES>
     PRIVATE $<TARGET_PROPERTY:${FASTTEXT_LIBRARY_STATIC},INCLUDE_DIRECTORIES>
     PRIVATE ${SNOWBALL_INCLUDE_DIR}
+    PRIVATE ${CMAKE_SOURCE_DIR}/third_party/duckdb/third_party/fastpforlib
+    PRIVATE ${CMAKE_SOURCE_DIR}/third_party/duckdb/third_party/utf8proc/include
 )
 
 # setup MSVC specific compiler flags

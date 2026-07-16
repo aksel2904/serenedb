@@ -33,6 +33,7 @@
 #include "connector/duckdb_client_state.h"
 #include "connector/duckdb_transaction.h"
 #include "connector/optimizer/iresearch_plan.h"
+#include "connector/optimizer/rbac.h"
 #include "connector/optimizer/wrap_unsupported_types.h"
 #include "pg/connection_context.h"
 #include "pg/errcodes.h"
@@ -52,17 +53,12 @@ duckdb::unique_ptr<duckdb::Catalog> AttachSereneDB(
     // CREATE DATABASE: create new database in SereneDB catalog
     auto state = context.registered_state->Get<SereneDBClientState>(
       kSereneDBClientStateKey);
-    const auto& exec_ctx =
-      state ? state->GetConnectionContext() : ExecContext::superuser();
-    auto r = catalog::CreateDatabase(exec_ctx, name);
-    if (r.is(ERROR_SERVER_DUPLICATE_NAME)) {
-      if (info.on_conflict == duckdb::OnCreateConflict::ERROR_ON_CONFLICT) {
-        THROW_SQL_ERROR(ERR_CODE(ERRCODE_DUPLICATE_DATABASE),
-                        ERR_MSG("database \"", name, "\" already exists"));
-      }
-    } else if (!r.ok()) {
-      SDB_THROW(std::move(r));
-    }
+    const auto ax =
+      state ? catalog::ActingAs(state->GetConnectionContext().GetRoleId())
+            : catalog::NoAccessCheck();
+    const bool if_not_exists =
+      info.on_conflict != duckdb::OnCreateConflict::ERROR_ON_CONFLICT;
+    catalog::CreateDatabase(ax, name, if_not_exists);
     // Re-fetch snapshot to see the new database
     auto snapshot = catalog::GetCatalog().GetCatalogSnapshot();
     auto database = snapshot->GetDatabase(name);
@@ -100,17 +96,18 @@ duckdb::unique_ptr<duckdb::TransactionManager> CreateTransactionManager(
 void SereneDBCatalog::OnDetach(duckdb::ClientContext& context) {
   auto state =
     context.registered_state->Get<SereneDBClientState>(kSereneDBClientStateKey);
-  const auto& exec_ctx =
-    state ? state->GetConnectionContext() : ExecContext::superuser();
+
+  auto ax = catalog::NoAccessCheck();
   if (state) {
-    state->GetConnectionContext().DropCatalogSnapshot();
+    auto& conn_ctx = state->GetConnectionContext();
+    ax = catalog::ActingAs(conn_ctx.GetRoleId());
+    conn_ctx.DropCatalogSnapshot();
   }
+
   duckdb::shared_ptr<void> keep_alive = GetAttached().shared_from_this();
-  auto r = catalog::DropDatabase(exec_ctx, GetName(), std::move(keep_alive));
+  catalog::DropDatabase(ax, GetName().GetIdentifierName(),
+                        std::move(keep_alive));
   SDB_IF_FAILURE("crash_on_drop") { SDB_IMMEDIATE_ABORT(); }
-  if (!r.ok()) {
-    SDB_THROW(std::move(r));
-  }
 }
 
 SereneDBStorageExtension::SereneDBStorageExtension() {
@@ -126,6 +123,7 @@ void RegisterSereneDBStorage(duckdb::DBConfig& config) {
 void RegisterSereneDBOptimizers(duckdb::DatabaseInstance& db) {
   optimizer::RegisterWrapUnsupportedTypesExtension(db);
   optimizer::RegisterIResearchPlanOptimizer(db);
+  optimizer::RegisterRbacAccessCheck(db);
 }
 
 }  // namespace sdb::connector

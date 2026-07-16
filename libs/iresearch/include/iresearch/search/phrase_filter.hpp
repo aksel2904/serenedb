@@ -26,6 +26,7 @@
 #include <variant>
 
 #include "iresearch/analysis/token_attributes.hpp"
+#include "iresearch/search/automaton_filter.hpp"
 #include "iresearch/search/levenshtein_filter.hpp"
 #include "iresearch/search/prefix_filter.hpp"
 #include "iresearch/search/range_filter.hpp"
@@ -45,7 +46,8 @@ class ByPhraseOptions {
   using phrase_part =
     std::variant<ByTermOptions, ByPrefixOptions, ByWildcardOptions,
                  ByEditDistanceOptions, ByTermsOptions, ByRangeOptions,
-                 ByRegexpOptions>;
+                 ByRegexpOptions, AutomatonOptions,
+                 LevenshteinAutomatonOptions>;
 
   struct PhrasePartInfo {
     phrase_part part;
@@ -91,6 +93,8 @@ class ByPhraseOptions {
     return _phrase == rhs._phrase && _slop == rhs._slop;
   }
 
+  bool LowerParts();
+
   // Clear phrase contents
   void clear() noexcept {
     _phrase.clear();
@@ -135,12 +139,10 @@ class ByPhraseOptions {
 
 class ByPhrase : public FilterWithField<ByPhraseOptions> {
  public:
-  static Query::ptr Prepare(const PrepareContext& ctx, irs::field_id id,
-                            const ByPhraseOptions& options);
+  QueryBuilder::ptr PrepareSegment(const SubReader& segment,
+                                   const PrepareContext& ctx) const final;
 
-  Query::ptr prepare(const PrepareContext& ctx) const final {
-    return Prepare(ctx.Boost(Boost()), field_id(), options());
-  }
+  PrepareCollector::ptr MakeCollector(const Scorer* scorer) const final;
 };
 
 }  // namespace irs

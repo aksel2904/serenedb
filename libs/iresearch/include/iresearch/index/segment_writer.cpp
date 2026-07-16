@@ -31,8 +31,10 @@
 #include "iresearch/formats/column/col_reader.hpp"
 #include "iresearch/formats/column/col_writer.hpp"
 #include "iresearch/formats/column/norm_writer.hpp"
+#include "iresearch/formats/column/read_context.hpp"
 #include "iresearch/formats/index/idx_reader.hpp"
 #include "iresearch/formats/index/idx_writer.hpp"
+#include "iresearch/formats/ivf/ivf_writer.hpp"
 #include "iresearch/store/store_utils.hpp"
 #include "iresearch/utils/index_utils.hpp"
 #include "iresearch/utils/type_limits.hpp"
@@ -106,8 +108,7 @@ SegmentWriter::SegmentWriter(ConstructToken, Directory& dir,
     _docs_context{{options.resource_manager}},
     _fields{options.resource_manager, options.scorers_features},
     _db{DerefDb(options.db)},
-    _column_options{options.column_options},
-    _norm_column_options{options.norm_column_options} {
+    _fallback_field_options{options.field_options} {
   _docs_mask.set = decltype(_docs_mask.set){{options.resource_manager}};
 }
 
@@ -134,11 +135,12 @@ void SegmentWriter::finish() {
   }
 }
 
-void SegmentWriter::FlushFields(FlushState& state) {
+void SegmentWriter::FlushFields(FlushState& state,
+                                std::span<const BasicTermReader* const> extra) {
   SDB_ASSERT(_field_writer);
 
   try {
-    _fields.flush(*_field_writer, state);
+    _fields.flush(*_field_writer, state, extra);
   } catch (...) {
     _field_writer.reset();
     throw;
@@ -159,15 +161,14 @@ void SegmentWriter::FlushFields(FlushState& state) {
 
   IdxWriter idx{_dir, _seg_name, _db};
 
+  std::vector<std::unique_ptr<IvfWriter>> ivf_writers;
   if (_col_writer) {
     _col_writer->Commit(buffered_docs());
-    auto built = _col_writer->TakeBuiltHnsw();
+    ivf_writers = _col_writer->TakeIvfWriters();
     _col_writer.reset();
-    if (!built.empty()) {
-      _built_hnsw_graphs.reserve(built.size());
-      for (auto& b : built) {
-        _built_hnsw_graphs.emplace(b.column_id, b.graph);
-        idx.AddHNSW(b.column_id, b.info, std::move(b.graph));
+    for (const auto& w : ivf_writers) {
+      if (auto built = w->Built()) {
+        idx.AddIvf(w->ColumnId(), w->Metric(), std::move(built));
       }
     }
   }
@@ -178,7 +179,10 @@ void SegmentWriter::FlushFields(FlushState& state) {
 
   if (state.doc_count != 0) {
     _field_writer->SetIdxWriter(idx);
-    FlushFields(state);
+    std::optional<ReadContext> ivf_ctx;
+    const auto cluster_readers =
+      PrepareIvfClusterReaders(ivf_writers, _col_reader.get(), ivf_ctx);
+    FlushFields(state, cluster_readers);
   }
 
   _col_reader.reset();
@@ -197,7 +201,24 @@ void SegmentWriter::FlushFields(FlushState& state) {
   return DocMap{};
 }
 
-void SegmentWriter::reset() noexcept {
+void SegmentWriter::SetFieldOptions(
+  std::shared_ptr<const IndexFieldOptions> options) noexcept {
+  if (!options) {
+    return;
+  }
+  // On resume the col/field writers hold a raw view of the previous (equal)
+  // options; re-point them before the assignment drops its last owner.
+  const auto* next = options.get();
+  if (_initialized) {
+    if (_col_writer) {
+      _col_writer->SetFieldOptions(next);
+    }
+    _fields.SetFieldOptions(next);
+  }
+  _field_options = std::move(options);
+}
+
+void SegmentWriter::ResetState() noexcept {
   _initialized = false;
   _dir.ClearTracked();
   _docs_context.clear();
@@ -210,11 +231,20 @@ void SegmentWriter::reset() noexcept {
     _col_writer->Rollback();
     _col_writer.reset();
   }
-  _built_hnsw_graphs.clear();
+}
+
+void SegmentWriter::reset() noexcept {
+  ResetState();
+  // Release the override so a pooled writer never pins a snapshot's index past
+  // the operation. (A drop waits on the storage refcount, so a still-pinned
+  // index only defers the drop to the next recycle, never dangles.)
+  _field_options.reset();
 }
 
 void SegmentWriter::reset(const SegmentMeta& meta) {
-  reset();
+  // Keep _field_options: the caller set it for this segment; the col/field
+  // writers below open against ActiveFieldOptions().
+  ResetState();
 
   _seg_name = meta.name;
 
@@ -225,9 +255,11 @@ void SegmentWriter::reset(const SegmentMeta& meta) {
       /*compaction=*/false, rm);
   }
 
-  _col_writer = std::make_unique<ColWriter>(
-    _dir, meta.name, _db, _column_options, _norm_column_options);
-  _fields.SetColWriter(_col_writer.get(), _norm_column_options);
+  const auto* active = ActiveFieldOptions();
+  _col_writer = std::make_unique<ColWriter>(_dir, meta.name, _db);
+  _col_writer->SetFieldOptions(active);
+  _fields.SetColWriter(_col_writer.get());
+  _fields.SetFieldOptions(active);
 
   _initialized = true;
 }

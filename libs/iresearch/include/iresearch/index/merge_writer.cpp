@@ -23,9 +23,12 @@
 
 #include "merge_writer.hpp"
 
+#include <absl/algorithm/container.h>
 #include <absl/container/flat_hash_map.h>
 #include <absl/strings/internal/resize_uninitialized.h>
 
+#include <optional>
+#include <span>
 #include <vector>
 
 #include "basics/assert.h"
@@ -37,10 +40,11 @@
 #include "iresearch/formats/column/merge.hpp"
 #include "iresearch/formats/column/norm_column_reader.hpp"
 #include "iresearch/formats/column/norm_writer.hpp"
-#include "iresearch/formats/hnsw/hnsw_reader.hpp"
+#include "iresearch/formats/column/read_context.hpp"
 #include "iresearch/formats/index/burst_trie.hpp"
 #include "iresearch/formats/index/idx_reader.hpp"
 #include "iresearch/formats/index/idx_writer.hpp"
+#include "iresearch/formats/ivf/ivf_writer.hpp"
 #include "iresearch/formats/norm_reader_impl.hpp"
 #include "iresearch/index/field_meta.hpp"
 #include "iresearch/index/index_features.hpp"
@@ -114,6 +118,8 @@ class CompoundDocIterator : public DocIterator {
   }
 
   doc_id_t advance() final;
+
+  IRS_DOC_ITERATOR_DEFAULTS
 
   doc_id_t seek(doc_id_t /*target*/) final {
     SDB_ASSERT(false);
@@ -472,7 +478,8 @@ doc_id_t ComputeDocIds(DocIdMapT& doc_id_map, const SubReader& reader,
       reader.docs_count() + doc_limits::min());
     return doc_limits::invalid();
   }
-  for (auto docs_itr = reader.docs_iterator(); docs_itr->next(); ++next_id) {
+  for (auto docs_itr = reader.docs_iterator();
+       !doc_limits::eof(docs_itr->advance()); ++next_id) {
     auto src_doc_id = docs_itr->value();
     SDB_ASSERT(src_doc_id >= doc_limits::min());
     SDB_ASSERT(src_doc_id < reader.docs_count() + doc_limits::min());
@@ -483,9 +490,9 @@ doc_id_t ComputeDocIds(DocIdMapT& doc_id_map, const SubReader& reader,
 
 const MergeWriter::FlushProgress kProgressNoop = [] { return true; };
 
-field_id MergeNormColumnFromSources(
-  ColWriter& col_writer, field_id id, std::span<const MergeSource> sources,
-  const NormColumnOptionsProvider* norm_column_options) {
+field_id MergeNormColumnFromSources(ColWriter& col_writer, field_id id,
+                                    std::span<const MergeSource> sources,
+                                    const IndexFieldOptions* field_options) {
   bool any_source_has_norm = false;
   for (const auto& src : sources) {
     if (!src.col_reader) {
@@ -499,8 +506,8 @@ field_id MergeNormColumnFromSources(
     }
   }
   NormColumnOptions opts{};
-  if (any_source_has_norm && norm_column_options && *norm_column_options) {
-    opts = (*norm_column_options)(id);
+  if (any_source_has_norm && field_options) {
+    opts = field_options->GetNormColumnOptions(id);
   }
   field_id out_id = field_limits::invalid();
   NormColumnWriter* norm_writer = nullptr;
@@ -523,8 +530,8 @@ field_id MergeNormColumnFromSources(
     }
 
     if (!norm_writer) {
-      SDB_ENSURE(field_limits::valid(opts.id), sdb::ERROR_INTERNAL,
-                 "MergeNormColumnFromSources: norm_column_options did not "
+      SDB_ENSURE(field_limits::valid(opts.id),
+                 "MergeNormColumnFromSources: GetNormColumnOptions did not "
                  "mint a valid id for field ",
                  id);
       out_id = opts.id;
@@ -570,17 +577,17 @@ field_id MergeNormColumnFromSources(
 
 using MergedNormIdMap = absl::flat_hash_map<field_id, field_id>;
 
-MergedNormIdMap MergeNorms(
-  ColWriter& col_writer, std::span<const MergeSource> sources,
-  const FieldMetaMapT& field_meta_map,
-  const NormColumnOptionsProvider* norm_column_options) {
+MergedNormIdMap MergeNorms(ColWriter& col_writer,
+                           std::span<const MergeSource> sources,
+                           const FieldMetaMapT& field_meta_map,
+                           const IndexFieldOptions* field_options) {
   MergedNormIdMap out;
   for (const auto& [id, features] : field_meta_map) {
     if (!IsSubsetOf(IndexFeatures::Norm, features)) {
       continue;
     }
     const auto new_norm_id =
-      MergeNormColumnFromSources(col_writer, id, sources, norm_column_options);
+      MergeNormColumnFromSources(col_writer, id, sources, field_options);
     if (field_limits::valid(new_norm_id)) {
       out.emplace(id, new_norm_id);
     }
@@ -607,14 +614,35 @@ bool WriteFields(const irs::FlushState& flush_state, const SegmentMeta& meta,
                  CompoundFieldIterator& field_itr,
                  const MergedNormIdMap& merged_norm_ids,
                  const MergeWriter::FlushProgress& progress,
-                 IResourceManager& rm, IdxWriter& idx) {
+                 IResourceManager& rm, IdxWriter& idx,
+                 std::span<const BasicTermReader* const> extra) {
   auto field_writer = std::make_unique<burst_trie::FieldWriter>(
     meta.codec->get_postings_writer(/*compaction=*/true, rm),
     /*compaction=*/true, rm);
   field_writer->SetIdxWriter(idx);
   field_writer->prepare(flush_state);
 
+  std::vector<const BasicTermReader*> sorted_extra(extra.begin(), extra.end());
+  absl::c_sort(sorted_extra,
+               [](const BasicTermReader* lhs, const BasicTermReader* rhs) {
+                 return lhs->id() < rhs->id();
+               });
+  size_t ei = 0;
+  const size_t en = sorted_extra.size();
+
   while (field_itr.Next()) {
+    const auto fid = field_itr.Meta().id;
+    while (ei < en && sorted_extra[ei]->id() < fid) {
+      field_writer->write(*sorted_extra[ei]);
+      ++ei;
+    }
+
+    if (ei < en && sorted_extra[ei]->id() == fid) {
+      field_writer->write(*sorted_extra[ei]);
+      ++ei;
+      continue;
+    }
+
     FieldProperties props;
     props.index_features = field_itr.Meta().index_features;
 
@@ -627,6 +655,11 @@ bool WriteFields(const irs::FlushState& flush_state, const SegmentMeta& meta,
 
     field_itr.SetProperties(props);
     field_writer->write(field_itr);
+  }
+
+  while (ei < en) {
+    field_writer->write(*sorted_extra[ei]);
+    ++ei;
   }
 
   field_writer->end();
@@ -671,8 +704,7 @@ void OpenColWriter(duckdb::DatabaseInstance& db, TrackingDirectory& dir,
                    ManagedVector<MergeWriter::ReaderCtx>& readers,
                    std::vector<MergeSource>& sources,
                    std::unique_ptr<ColWriter>& col_writer,
-                   const ColumnOptionsProvider* column_options,
-                   const NormColumnOptionsProvider* norm_column_options) {
+                   const IndexFieldOptions* field_options) {
   sources.reserve(readers.size());
   for (auto& ctx : readers) {
     sources.push_back(MergeSource{
@@ -682,8 +714,8 @@ void OpenColWriter(duckdb::DatabaseInstance& db, TrackingDirectory& dir,
       .alive_count = static_cast<uint64_t>(ctx.reader->live_docs_count()),
     });
   }
-  col_writer = std::make_unique<ColWriter>(dir, segment_name, db,
-                                           column_options, norm_column_options);
+  col_writer = std::make_unique<ColWriter>(dir, segment_name, db);
+  col_writer->SetFieldOptions(field_options);
 }
 
 }  // namespace
@@ -724,19 +756,19 @@ bool MergeWriter::Flush(SegmentMeta& segment,
   std::vector<MergeSource> sources;
   std::unique_ptr<ColWriter> col_writer;
   OpenColWriter(_db, track_dir, segment.name, _readers, sources, col_writer,
-                _column_options, _norm_column_options);
+                _field_options);
   SDB_ASSERT(col_writer);
 
   const auto merged_norm_ids =
-    MergeNorms(*col_writer, sources, field_meta_map, _norm_column_options);
+    MergeNorms(*col_writer, sources, field_meta_map, _field_options);
 
   if (!progress_callback()) {
     return false;
   }
 
-  if (!sources.empty()) {
-    // TODO(mbkkt) Use progress_callback?
-    MergeInto(sources, *col_writer, _column_options);
+  if (!sources.empty() &&
+      !MergeInto(sources, *col_writer, _field_options, progress_callback)) {
+    return false;
   }
 
   if (!progress_callback()) {
@@ -746,18 +778,23 @@ bool MergeWriter::Flush(SegmentMeta& segment,
   std::unique_ptr<ColReader> col_reader;
   MergedNormProvider norm_provider;
   IdxWriter idx{track_dir, segment.name, _db};
+
   col_writer->Commit(segment.docs_count);
-  auto built = col_writer->TakeBuiltHnsw();
-  if (!built.empty()) {
-    _built_hnsw_graphs.reserve(built.size());
-    for (auto& b : built) {
-      _built_hnsw_graphs.emplace(b.column_id, b.graph);
-      idx.AddHNSW(b.column_id, b.info, std::move(b.graph));
+  auto ivf_writers = col_writer->TakeIvfWriters();
+  for (const auto& w : ivf_writers) {
+    if (auto built = w->Built()) {
+      idx.AddIvf(w->ColumnId(), w->Metric(), std::move(built));
     }
   }
   if (segment.docs_count != 0) {
     col_reader = std::make_unique<ColReader>(track_dir, segment.name, _db);
     norm_provider.reader = col_reader.get();
+  }
+  std::optional<ReadContext> ivf_ctx;
+  const auto cluster_readers =
+    PrepareIvfClusterReaders(ivf_writers, col_reader.get(), ivf_ctx);
+  for (const auto* reader : cluster_readers) {
+    index_features |= reader->properties().index_features;
   }
 
   if (!progress_callback()) {
@@ -772,11 +809,10 @@ bool MergeWriter::Flush(SegmentMeta& segment,
     .doc_count = segment.docs_count,
     .index_features = index_features,
   };
-
   if (segment.docs_count != 0 &&
       !WriteFields(state, segment, fields_itr, merged_norm_ids,
-                   progress_callback, _readers.get_allocator().Manager(),
-                   idx)) {
+                   progress_callback, _readers.get_allocator().Manager(), idx,
+                   cluster_readers)) {
     return false;
   }
   idx.Commit();

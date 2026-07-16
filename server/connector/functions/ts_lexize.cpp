@@ -41,6 +41,7 @@
 #include "pg/connection_context.h"
 #include "pg/errcodes.h"
 #include "pg/sql_exception_macro.h"
+#include "pg/sql_utils.h"
 
 namespace sdb::connector {
 namespace {
@@ -49,7 +50,8 @@ std::shared_ptr<catalog::Tokenizer> LookupTokenizerDict(
   const catalog::Snapshot& snapshot, sdb::ObjectId db_id,
   std::string_view current_schema, std::string_view dict_name) {
   auto name = pg::ParseObjectName(dict_name, current_schema);
-  auto dict = snapshot.GetTokenizer(db_id, name.schema, name.relation);
+  auto dict = snapshot.GetTokenizer(catalog::NoAccessCheck(), db_id,
+                                    name.schema, name.relation);
   if (!dict) {
     THROW_SQL_ERROR(
       ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -60,13 +62,7 @@ std::shared_ptr<catalog::Tokenizer> LookupTokenizerDict(
 
 catalog::Tokenizer::TokenizerWrapper AcquireTokenizer(
   catalog::Tokenizer& dict) {
-  auto result = dict.GetTokenizer();
-  if (!result) {
-    THROW_SQL_ERROR(
-      ERR_CODE(ERRCODE_INTERNAL_ERROR),
-      ERR_MSG("failed to get tokenizer: ", result.error().errorMessage()));
-  }
-  return std::move(*result);
+  return dict.GetTokenizer();
 }
 
 struct DynamicCtx {
@@ -151,7 +147,8 @@ class ListTokenSink {
 
 const TsLexizeBindData& GetBindData(duckdb::ExpressionState& state) {
   return state.expr.Cast<duckdb::BoundFunctionExpression>()
-    .bind_info->Cast<TsLexizeBindData>();
+    .BindInfo()
+    ->Cast<TsLexizeBindData>();
 }
 
 void TsLexizeFunctionConstant(duckdb::DataChunk& args,
@@ -337,7 +334,7 @@ duckdb::unique_ptr<duckdb::FunctionData> TsLexizeBind(
   auto& context = input.GetClientContext();
   auto& conn_ctx = GetSereneDBContext(context);
   DynamicCtx ctx{
-    .snapshot = conn_ctx.EnsureCatalogSnapshot(),
+    .snapshot = conn_ctx.CatalogSnapshot(),
     .db_id = conn_ctx.GetDatabaseId(),
     .current_schema = conn_ctx.GetCurrentSchema(),
   };

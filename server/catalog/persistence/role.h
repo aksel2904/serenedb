@@ -20,23 +20,26 @@
 
 #pragma once
 
-#include <absl/container/node_hash_map.h>
-
+#include <cstdint>
 #include <string>
+#include <vector>
 
-#include "auth/common.h"
 #include "catalog/identifiers/object_id.h"
+#include "catalog/role.h"
 
 namespace sdb::catalog::persistence {
 
 struct RoleData {
   ObjectId id;
   std::string name;
-  bool active = true;
-  std::string password_method;
-  std::string password_salt;
-  std::string password_hash;
-  absl::node_hash_map<std::string, auth::Level> db_access;
+  uint32_t options;
+  std::vector<Membership> member_of;
+  int32_t conn_limit;
+  int64_t valid_until;
+  // SET VAR=... params that set for every session of this role
+  std::vector<std::string> config;
+  std::vector<DefaultAcl> default_acls;
+  std::string password_verifier;
 };
 
 }  // namespace sdb::catalog::persistence

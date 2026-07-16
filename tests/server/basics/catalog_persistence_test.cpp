@@ -110,34 +110,67 @@ void CheckFixture(std::string_view name, const T& sample) {
 }
 
 TEST(CatalogPersistence, secondary_index) {
+  // columns slot 2 is an expression sentinel (Column::kInvalidId); the
+  // interleaving (column, expr, column) is the ART key order and must
+  // round-trip.
   CheckFixture("secondary_index.bin",
                SecondaryIndexData{
                  .name = "idx_demo",
-                 .column_ids = {ObjectId{1}, ObjectId{2}, ObjectId{3}},
                  .unique = true,
+                 .columns = {ObjectId{1}, Column::kInvalidId, ObjectId{3}},
+                 .expressions =
+                   {
+                     ExpressionData{
+                       .serialized_expr = "expr-bytes",
+                       .dependent_columns = {ObjectId{2}},
+                       .return_type = duckdb::LogicalType::DOUBLE,
+                       .pretty_printed = "a + b",
+                     },
+                   },
                });
 }
 
 TEST(CatalogPersistence, table) {
-  CheckFixture("table.bin", TableData{
-                              .name = "t",
-                              .columns = {Column{ObjectId{}, ObjectId{1}, "a",
-                                                 duckdb::LogicalType::INTEGER},
-                                          Column{ObjectId{}, ObjectId{2}, "b",
-                                                 duckdb::LogicalType::VARCHAR}},
-                              .pk_columns = {ObjectId{1}},
-                              .check_constraints = {},
-                              .generated_pk_seq_id = ObjectId{9},
-                            });
+  // Column "a" carries a per-column ACL (pg_attribute.attacl), so the golden
+  // bytes exercise column-level GRANT persistence; column "b" stays default.
+  Column col_a{ObjectId{}, ObjectId{1}, "a", duckdb::LogicalType::INTEGER};
+  col_a.SetPermissions(Permissions{ObjectId{},
+                                   {AclItem{.grantee = ObjectId{7},
+                                            .grantor = ObjectId{42},
+                                            .privs = AclMode::Select}}});
+  CheckFixture(
+    "table.bin",
+    TableData{
+      .name = "t",
+      .columns = {std::move(col_a), Column{ObjectId{}, ObjectId{2}, "b",
+                                           duckdb::LogicalType::VARCHAR}},
+      .pk_columns = {ObjectId{1}},
+      .check_constraints = {},
+      .generated_pk_seq_id = ObjectId{9},
+      // RBAC: a non-default owner + an acl item, so the golden bytes
+      // actually exercise creator-owns persistence (not just defaults).
+      .perm = Permissions{ObjectId{42},
+                          {AclItem{.grantee = ObjectId{7},
+                                   .grantor = ObjectId{42},
+                                   .privs = AclMode::Select}}},
+      .search_options = {.refresh_interval_ms = 500,
+                         .compaction_interval_ms = 7000,
+                         .cleanup_interval_step = 3},
+    });
 }
 
 TEST(CatalogPersistence, tokenizer) {
-  CheckFixture("tokenizer.bin", TokenizerData{
-                                  .name = "tok",
-                                  .config = {},
-                                  .features = search::Features{},
-                                  .norm_row_group_size = 7,
-                                });
+  CheckFixture("tokenizer.bin",
+               TokenizerData{
+                 .name = "tok",
+                 .config = {},
+                 .features = search::Features{},
+                 .norm_row_group_size = 7,
+                 .perm = Permissions{ObjectId{42},
+                                     {AclItem{.grantee = ObjectId{7},
+                                              .grantor = ObjectId{42},
+                                              .privs = AclMode::Usage}}},
+               });
 }
 
 // Every TokenizerConfig variant arm must serialize and re-serialize stably,
@@ -166,84 +199,138 @@ TEST(CatalogPersistence, tokenizer_configs) {
     std::make_index_sequence<std::variant_size_v<ConfigVariant>>{});
 }
 
-TEST(CatalogPersistence, column_serialized) {
+TEST(CatalogPersistence, entry_config_serialized) {
   CheckFixture(
-    "column_serialized.bin",
-    ColumnSerialized{
+    "entry_config_serialized.bin",
+    EntryConfigSerialized{
       .text_dictionary = ObjectId{5},
       .store_values = true,
       .compression = duckdb::CompressionType::COMPRESSION_UNCOMPRESSED,
       .features = search::Features{},
-      .hnsw_config = std::nullopt,
+      .ivf_config = std::nullopt,
       .synthetic_column = irs::field_limits::invalid(),
       .row_group_size = 100,
       .norm_row_group_size = 50,
     });
 }
 
-TEST(CatalogPersistence, expression_serialized) {
-  CheckFixture("expression_serialized.bin",
-               ExpressionSerialized{
-                 .serialized_expr = "expr-bytes",
-                 .pretty_printed = "a + b",
-                 .dependent_columns = {ObjectId{1}, ObjectId{2}},
-                 .return_type = duckdb::LogicalType::DOUBLE,
-                 .synthetic_column = irs::field_limits::invalid(),
-                 .text_dictionary = ObjectId{3},
-                 .field_id = 7,
-                 .norm_row_group_size = 9,
-                 .features = search::Features{},
-               });
+TEST(CatalogPersistence, entry_config_serialized_ivf) {
+  CheckFixture(
+    "entry_config_serialized_ivf.bin",
+    EntryConfigSerialized{
+      .text_dictionary = ObjectId{5},
+      .store_values = true,
+      .compression = duckdb::CompressionType::COMPRESSION_UNCOMPRESSED,
+      .features = search::Features{},
+      .ivf_config =
+        IVFColumnConfig{
+          .d = 128,
+          .metric = irs::VectorMetric::InnerProduct,
+          .quant = irs::VectorQuantization::SQ8,
+          .nlist = 0,
+          .train_sample = 4096,
+          .cluster_iters = 25,
+          .pq_m = 0,
+          .rabitq_bits = 0,
+          .nlist_factor = 2.5f,
+        },
+      .synthetic_column = irs::field_limits::invalid(),
+      .row_group_size = 100,
+      .norm_row_group_size = 50,
+    });
 }
 
 TEST(CatalogPersistence, inverted_index) {
+  // One column key (field_id == column id 1) and one expression key (allocated
+  // field_id 7). `entries` is kept to a single element so the unordered map
+  // serializes to stable bytes.
   CheckFixture(
     "inverted_index.bin",
     InvertedIndexData{
       .name = "idx",
-      .column_ids = {ObjectId{1}},
-      .columns = {{ObjectId{1}, ColumnSerialized{.text_dictionary = ObjectId{5},
-                                                 .row_group_size = 100}}},
-      .expressions = {ExpressionSerialized{.serialized_expr = "e",
-                                           .field_id = 7}},
+      .columns = {ObjectId{1}},
+      .expression_keys = {ExpressionKey{
+        .data = ExpressionData{.serialized_expr = "e",
+                               .return_type = duckdb::LogicalType::DOUBLE,
+                               .pretty_printed = "x + 1"},
+        .field_id = 7}},
+      .entries = {{1, EntryConfigSerialized{.text_dictionary = ObjectId{5},
+                                            .row_group_size = 100}}},
       .options = InvertedIndexOptions{.row_group_size = 1024},
     });
 }
 
 TEST(CatalogPersistence, database_options) {
-  CheckFixture("database_options.bin", DatabaseOptions{.name = "db"});
+  CheckFixture("database_options.bin",
+               DatabaseOptions{
+                 .name = "db",
+                 .perm = Permissions{ObjectId{42},
+                                     {AclItem{.grantee = ObjectId{7},
+                                              .grantor = ObjectId{42},
+                                              .privs = AclMode::Connect}}},
+               });
 }
 
 TEST(CatalogPersistence, schema_options) {
   CheckFixture("schema_options.bin",
-               SchemaOptions{.id = ObjectId{4}, .name = "public"});
+               SchemaOptions{
+                 .name = "public",
+                 .perm = Permissions{ObjectId{42},
+                                     {AclItem{.grantee = ObjectId{7},
+                                              .grantor = ObjectId{42},
+                                              .privs = AclMode::Usage}}},
+               });
 }
 
 TEST(CatalogPersistence, sequence_options) {
-  CheckFixture("sequence_options.bin", SequenceOptions{
-                                         .name = "seq",
-                                         .start_value = 10,
-                                         .increment = 2,
-                                         .min_value = 1,
-                                         .max_value = 1000,
-                                         .cache = 5,
-                                         .owner_table_id = 3,
-                                         .cycle = true,
-                                       });
+  CheckFixture("sequence_options.bin",
+               SequenceOptions{
+                 .name = "seq",
+                 .start_value = 10,
+                 .increment = 2,
+                 .min_value = 1,
+                 .max_value = 1000,
+                 .cache = 5,
+                 .owner_table_id = 3,
+                 .cycle = true,
+                 .perm = Permissions{ObjectId{42},
+                                     {AclItem{.grantee = ObjectId{7},
+                                              .grantor = ObjectId{42},
+                                              .privs = AclMode::Usage}}},
+               });
 }
 
 TEST(CatalogPersistence, role_data) {
   // Single-entry db_access: the map is unordered, so >1 entry would not
   // serialize to stable bytes.
-  CheckFixture("role_data.bin", RoleData{
-                                  .id = ObjectId{2},
-                                  .name = "alice",
-                                  .active = true,
-                                  .password_method = "scram",
-                                  .password_salt = "salt",
-                                  .password_hash = "hash",
-                                  .db_access = {{"db1", auth::Level::RW}},
-                                });
+  CheckFixture(
+    "role_data.bin",
+    RoleData{
+      .id = ObjectId{2},
+      .name = "alice",
+      // RBAC: attribute bitmask + a membership edge with non-default per-edge
+      // options, so the golden bytes exercise Membership round-trip.
+      .options = 0b0110,  // Login | Inherit
+      .member_of = {Membership{.role = ObjectId{5},
+                               .admin_option = true,
+                               .inherit_option = false,
+                               .set_option = true}},
+      // RBAC attrs surfaced via pg_authid / pg_roles, plus per-role GUC config
+      // and ALTER DEFAULT PRIVILEGES targets. valid_until is opaque micros.
+      .conn_limit = 5,
+      .valid_until = 946771200000000,  // 2030-01-01 00:00:00+00
+      .config = {"search_path=clickclack"},
+      .default_acls = {DefaultAcl{.schema = ObjectId{7},
+                                  .objtype = 'r',
+                                  .acl = {AclItem{.grantee = ObjectId{5},
+                                                  .grantor = ObjectId{2},
+                                                  .privs = AclMode::Select}}}},
+      // rolpassword: a stored SCRAM verifier, so the golden bytes exercise the
+      // password round-trip.
+      .password_verifier = "SCRAM-SHA-256$4096:c2FsdHNhbHQ=$"
+                           "c3RvcmVka2V5c3RvcmVka2V5c3RvcmVka2V5c3Q=:"
+                           "c2VydmVya2V5c2VydmVya2V5c2VydmVya2V5c2U=",
+    });
 }
 
 TEST(CatalogPersistence, inverted_index_options) {
@@ -265,15 +352,6 @@ TEST(CatalogPersistence, expression_data) {
                  .return_type = duckdb::LogicalType::BIGINT,
                  .pretty_printed = "x",
                });
-}
-
-TEST(CatalogPersistence, hnsw_column_config) {
-  CheckFixture("hnsw_column_config.bin", HNSWColumnConfig{
-                                           .d = 128,
-                                           .m = 16,
-                                           .ef_construction = 200,
-                                           .metric = irs::HNSWMetric::L2Sqr,
-                                         });
 }
 
 TEST(CatalogPersistence, scorer_options) {

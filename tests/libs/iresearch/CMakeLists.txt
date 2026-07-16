@@ -20,12 +20,14 @@ set(iresearch-tests_sources
     ./analysis/token_attributes_test.cpp
     ./analysis/tokenizer_tests.cpp
     ./analysis/pattern_tokenizer_tests.cpp
-    ./formats/column/columnstore_test.cpp
-    ./formats/column/variant_shredding_test.cpp
+    ./formats/column/column_reader_test.cpp
     ./formats/column/test_cs_helpers.cpp
     ./formats/columnstore2_test.cpp
+    ./formats/ivf/centroids_test.cpp
+    ./formats/ivf/clustering_test.cpp
+    ./formats/ivf/quantizer_test.cpp
+    ./formats/ivf/ivf_writer_test.cpp
     ./formats/sparse_bitmap_test.cpp
-    ./formats/formats_tests.cpp
     ./formats/formats_test_case_base.cpp
     ./formats/skip_list_test.cpp
     ./store/directory_test_case.cpp
@@ -74,6 +76,7 @@ set(iresearch-tests_sources
     ./search/all_filter_tests.cpp
     ./search/term_filter_tests.cpp
     ./search/terms_filter_test.cpp
+    ./search/term_predicate_test.cpp
     ./search/prefix_filter_test.cpp
     ./search/range_filter_test.cpp
     ./search/phrase_filter_tests.cpp
@@ -82,12 +85,13 @@ set(iresearch-tests_sources
     ./search/column_existence_filter_test.cpp
     ./search/same_position_filter_tests.cpp
     ./search/ngram_similarity_filter_tests.cpp
-    ./search/top_terms_collector_test.cpp
+    ./search/top_terms_selector_test.cpp
     ./search/proxy_filter_test.cpp
     ./search/geo_filter_test.cpp
     ./search/geo_distance_filter_test.cpp
     ./search/geo_analyzer_test.cpp
     ./search/doc_collector_test.cpp
+    ./search/merge_consistency_test.cpp
     ./search/block_scoring_test.cpp
     ./search/boost_query_test.cpp
     ./search/wand_scoring_test.cpp
@@ -102,7 +106,6 @@ set(iresearch-tests_sources
     ./utils/object_pool_tests.cpp
     ./utils/numeric_utils_test.cpp
     ./utils/simd_utils_test.cpp
-    ./utils/attributes_tests.cpp
     ./utils/directory_utils_tests.cpp
     ./utils/bit_packing_tests.cpp
     ./utils/bit_utils_tests.cpp
@@ -118,7 +121,6 @@ set(iresearch-tests_sources
     ./utils/misc_test.cpp
     ./utils/std_test.cpp
     ./utils/thread_pool_test.cpp
-    ./utils/type_utils_tests.cpp
     ./utils/utf8_utils_test.cpp
     ./utils/utf8_path_tests.cpp
     ./utils/fst_builder_test.cpp
@@ -203,6 +205,7 @@ target_include_directories(
 add_executable(
     iresearch-load-tests
     ./search/load_test.cpp
+    ./search/filter_test_case_base.cpp
     ./formats/column/test_cs_helpers.cpp
     ./tests_param.cpp
     ./tests_main.cpp

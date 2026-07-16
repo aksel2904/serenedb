@@ -24,13 +24,17 @@
 #include <absl/flags/flag.h>
 #include <absl/strings/ascii.h>
 
+#include <duckdb/common/case_insensitive_map.hpp>
+#include <duckdb/common/types/value.hpp>
 #include <duckdb/logging/log_manager.hpp>
 #include <duckdb/logging/logger.hpp>
+#include <duckdb/logging/logging.hpp>
 
 #include "basics/assert.h"
 #include "basics/log.h"
 
 ABSL_DECLARE_FLAG(std::string, log_storage);
+ABSL_DECLARE_FLAG(std::string, log_path);
 ABSL_DECLARE_FLAG(std::string, log_level);
 
 namespace sdb {
@@ -72,17 +76,28 @@ void DuckDBEngine::Initialize(DBConfigMutator mutator) {
   config.SetOptionByName("preserve_identifier_case", duckdb::Value{false});
   config.SetOptionByName("disable_database_invalidation", duckdb::Value{true});
   config.SetOptionByName("lambda_syntax", duckdb::Value{"ENABLE_SINGLE_ARROW"});
+  config.SetOptionByName("explain_output_format", duckdb::Value{"PG"});
+  config.SetOptionByName("table_function_identifier_conversion",
+                         duckdb::Value{"DISABLE_IMPLICIT_STRING"});
 
   mutator(config);
 
   _db = std::make_unique<duckdb::DuckDB>(nullptr, &config);
 
   auto& manager = _db->instance->GetLogManager();
+
   duckdb::LogConfig cfg;
   cfg.enabled = true;
-  cfg.storage = absl::GetFlag(FLAGS_log_storage);
+  cfg.storage = absl::AsciiStrToLower(absl::GetFlag(FLAGS_log_storage));
   cfg.level = ParseLogLevel(absl::GetFlag(FLAGS_log_level));
   manager.SetConfig(*_db->instance, cfg);
+
+  if (cfg.storage == duckdb::LogConfig::FILE_STORAGE_NAME) {
+    duckdb::case_insensitive_map_t<duckdb::Value> storage_config;
+    storage_config["path"] = duckdb::Value(absl::GetFlag(FLAGS_log_path));
+    manager.UpdateLogStorageConfig(*_db->instance, storage_config);
+  }
+
   log::SetLogger(&manager.GlobalLogger());
 }
 

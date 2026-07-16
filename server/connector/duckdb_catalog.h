@@ -24,7 +24,6 @@
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/parser/parsed_data/create_schema_info.hpp>
 
-#include "catalog/database.h"
 #include "catalog/identifiers/object_id.h"
 
 namespace sdb::connector {
@@ -39,6 +38,7 @@ class SereneDBCatalog final : public duckdb::Catalog {
 
   std::string GetCatalogType() final { return "serenedb"; }
   std::string GetDefaultSchema() const final { return "public"; }
+  duckdb::optional_idx GetCatalogVersion(duckdb::ClientContext& context) final;
   void Initialize(bool load_builtin) final;
 
   duckdb::ErrorData SupportsCreateTable(
@@ -88,6 +88,12 @@ class SereneDBCatalog final : public duckdb::Catalog {
     duckdb::Binder& binder, duckdb::CreateStatement& stmt,
     duckdb::CatalogEntry& table,
     duckdb::unique_ptr<duckdb::LogicalOperator> plan) final;
+
+  duckdb::unique_ptr<duckdb::LogicalOperator> BindAlterAddIndex(
+    duckdb::Binder& binder, duckdb::TableCatalogEntry& table_entry,
+    duckdb::unique_ptr<duckdb::LogicalOperator> plan,
+    duckdb::unique_ptr<duckdb::CreateIndexInfo> create_info,
+    duckdb::unique_ptr<duckdb::AlterTableInfo> alter_info) final;
 
   duckdb::DatabaseSize GetDatabaseSize(duckdb::ClientContext& context) final;
 

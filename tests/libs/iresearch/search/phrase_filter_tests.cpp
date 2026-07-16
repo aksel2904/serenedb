@@ -28,6 +28,7 @@
 #include "iresearch/index/iterators.hpp"
 #include "iresearch/search/bm25.hpp"
 #include "iresearch/search/boolean_filter.hpp"
+#include "iresearch/search/filter_optimizer.hpp"
 #include "iresearch/search/multiterm_query.hpp"
 #include "iresearch/search/phrase_filter.hpp"
 #include "iresearch/search/phrase_query.hpp"
@@ -48,6 +49,13 @@ auto StoreName() {
       irs::tests::StoreFieldAt(*doc.GetColWriter(), kName, doc.DocId(), *name);
     }
   };
+}
+
+irs::Filter::ptr Lower(std::unique_ptr<irs::ByPhrase> q,
+                       const irs::Scorer* scorer = nullptr) {
+  irs::Filter::ptr f = std::move(q);
+  irs::Optimize(f, {.scored = scorer != nullptr});
+  return f;
 }
 
 }  // namespace
@@ -98,10 +106,9 @@ TEST_P(PhraseFilterTestCase, sequential_one_term) {
   {
     irs::ByPhrase q;
 
-    auto prepared = q.prepare({.index = rdr});
-    auto sub = rdr.begin();
+    tests::PreparedFilter prepared{q, rdr};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
@@ -112,10 +119,9 @@ TEST_P(PhraseFilterTestCase, sequential_one_term) {
     irs::ByPhrase q;
     *q.mutable_field_id() = kPhraseAnl;
 
-    auto prepared = q.prepare({.index = rdr});
-    auto sub = rdr.begin();
+    tests::PreparedFilter prepared{q, rdr};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
@@ -128,65 +134,65 @@ TEST_P(PhraseFilterTestCase, sequential_one_term) {
     q.mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "V", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -197,685 +203,685 @@ TEST_P(PhraseFilterTestCase, sequential_one_term) {
     q.mutable_options()->push_back<irs::ByPrefixOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("fo"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "D", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "H", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "U", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "V", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "W", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "Y", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // wildcard_filter "fo%"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByWildcardOptions>() =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByWildcardOptions>() =
       irs::ByWildcardOptions{
         irs::ViewCast<irs::byte_type>(std::string_view("fo%"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "D", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "H", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "U", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "V", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "W", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "Y", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // wildcard_filter "%ox"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByWildcardOptions>() =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByWildcardOptions>() =
       irs::ByWildcardOptions{
         irs::ViewCast<irs::byte_type>(std::string_view("%ox"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "V", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // wildcard_filter "f%x"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByWildcardOptions>() =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByWildcardOptions>() =
       irs::ByWildcardOptions{
         irs::ViewCast<irs::byte_type>(std::string_view("_ox"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "V", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // wildcard_filter "f_x"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByWildcardOptions>() =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByWildcardOptions>() =
       irs::ByWildcardOptions{
         irs::ViewCast<irs::byte_type>(std::string_view("f_x"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "V", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // wildcard_filter "fo_"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByWildcardOptions>() =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByWildcardOptions>() =
       irs::ByWildcardOptions{
         irs::ViewCast<irs::byte_type>(std::string_view("fo_"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "V", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // wildcard_filter "fox"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByWildcardOptions>() =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByWildcardOptions>() =
       irs::ByWildcardOptions{
         irs::ViewCast<irs::byte_type>(std::string_view("fox"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "V", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // levenshtein_filter "fox" max_distance = 0
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& lt = q.mutable_options()->push_back<irs::ByEditDistanceOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& lt = q->mutable_options()->push_back<irs::ByEditDistanceOptions>();
     lt.max_distance = 0;
     lt.term = irs::ViewCast<irs::byte_type>(std::string_view("fox"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "V", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // levenshtein_filter "fol"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& lt = q.mutable_options()->push_back<irs::ByEditDistanceOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& lt = q->mutable_options()->push_back<irs::ByEditDistanceOptions>();
     lt.max_distance = 1;
     lt.term = irs::ViewCast<irs::byte_type>(std::string_view("fol"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "V", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -886,65 +892,65 @@ TEST_P(PhraseFilterTestCase, sequential_one_term) {
     auto& st = q.mutable_options()->push_back<irs::ByTermsOptions>();
     st.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view("fox")));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "V", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -956,75 +962,75 @@ TEST_P(PhraseFilterTestCase, sequential_one_term) {
     st.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view("fox")));
     st.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view("that")));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "B", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "D", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "V", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -1038,30 +1044,30 @@ TEST_P(PhraseFilterTestCase, sequential_one_term) {
     rt.range.min_type = irs::BoundType::Inclusive;
     rt.range.max_type = irs::BoundType::Inclusive;
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X0", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X4", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -1075,20 +1081,20 @@ TEST_P(PhraseFilterTestCase, sequential_one_term) {
     rt.range.min_type = irs::BoundType::Exclusive;
     rt.range.max_type = irs::BoundType::Inclusive;
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -1102,20 +1108,20 @@ TEST_P(PhraseFilterTestCase, sequential_one_term) {
     rt.range.min_type = irs::BoundType::Inclusive;
     rt.range.max_type = irs::BoundType::Exclusive;
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -1129,20 +1135,20 @@ TEST_P(PhraseFilterTestCase, sequential_one_term) {
     rt.range.min_type = irs::BoundType::Exclusive;
     rt.range.max_type = irs::BoundType::Exclusive;
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -1156,50 +1162,50 @@ TEST_P(PhraseFilterTestCase, sequential_one_term) {
     rt.range.min_type = irs::BoundType::Inclusive;
     rt.range.max_type = irs::BoundType::Inclusive;
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X0", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X1", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X2", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X3", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X4", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X5", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -1213,45 +1219,45 @@ TEST_P(PhraseFilterTestCase, sequential_one_term) {
     rt.range.min_type = irs::BoundType::Exclusive;
     rt.range.max_type = irs::BoundType::Inclusive;
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X1", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X2", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X3", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X4", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X5", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -1265,40 +1271,40 @@ TEST_P(PhraseFilterTestCase, sequential_one_term) {
     rt.range.min_type = irs::BoundType::Inclusive;
     rt.range.max_type = irs::BoundType::Exclusive;
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X0", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X1", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X3", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X4", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -1312,35 +1318,35 @@ TEST_P(PhraseFilterTestCase, sequential_one_term) {
     rt.range.min_type = irs::BoundType::Exclusive;
     rt.range.max_type = irs::BoundType::Exclusive;
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X1", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X3", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X4", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -1352,27 +1358,27 @@ TEST_P(PhraseFilterTestCase, sequential_one_term) {
     q.mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     // check single word phrase optimization
-    ASSERT_NE(nullptr, dynamic_cast<const irs::TermQuery*>(prepared.get()));
+    ASSERT_NE(nullptr, dynamic_cast<const irs::TermQuery*>(prepared.Query(0)));
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -1384,161 +1390,161 @@ TEST_P(PhraseFilterTestCase, sequential_one_term) {
     auto& pt = q.mutable_options()->push_back<irs::ByPrefixOptions>();
     pt.term = irs::ViewCast<irs::byte_type>(std::string_view("fo"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     // check single word phrase optimization
     ASSERT_NE(nullptr,
-              dynamic_cast<const irs::MultiTermQuery*>(prepared.get()));
+              dynamic_cast<const irs::MultiTermQuery*>(prepared.Query(0)));
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // search "fo%" on field without positions
   // which is ok for first word in phrase
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhrase;
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhrase;
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("fo%"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     // check single word phrase optimization
     ASSERT_NE(nullptr,
-              dynamic_cast<const irs::MultiTermQuery*>(prepared.get()));
+              dynamic_cast<const irs::MultiTermQuery*>(prepared.Query(0)));
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // search "f_x%" on field without positions
   // which is ok for first word in phrase
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhrase;
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhrase;
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("f_x%"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     // check single word phrase optimization
     ASSERT_NE(nullptr,
-              dynamic_cast<const irs::MultiTermQuery*>(prepared.get()));
+              dynamic_cast<const irs::MultiTermQuery*>(prepared.Query(0)));
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // search "fxo" on field without positions
   // which is ok for single word phrases
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhrase;
-    auto& lt = q.mutable_options()->push_back<irs::ByEditDistanceOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhrase;
+    auto& lt = q->mutable_options()->push_back<irs::ByEditDistanceOptions>();
     lt.max_distance = 1;
     lt.with_transpositions = true;
     lt.term = irs::ViewCast<irs::byte_type>(std::string_view("fxo"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     // check single word phrase optimization
     ASSERT_NE(nullptr,
-              dynamic_cast<const irs::MultiTermQuery*>(prepared.get()));
+              dynamic_cast<const irs::MultiTermQuery*>(prepared.Query(0)));
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -1553,33 +1559,33 @@ TEST_P(PhraseFilterTestCase, sequential_one_term) {
     rt.range.min_type = irs::BoundType::Inclusive;
     rt.range.max_type = irs::BoundType::Inclusive;
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     // check single word phrase optimization
     ASSERT_NE(nullptr,
-              dynamic_cast<const irs::MultiTermQuery*>(prepared.get()));
+              dynamic_cast<const irs::MultiTermQuery*>(prepared.Query(0)));
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X0", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X1", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -1592,67 +1598,67 @@ TEST_P(PhraseFilterTestCase, sequential_one_term) {
       ->push_back<irs::ByTermOptions>(std::numeric_limits<size_t>::max())
       .term = irs::ViewCast<irs::byte_type>(std::string_view("fox"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     // check single word phrase optimization
-    ASSERT_NE(nullptr, dynamic_cast<const irs::TermQuery*>(prepared.get()));
+    ASSERT_NE(nullptr, dynamic_cast<const irs::TermQuery*>(prepared.Query(0)));
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "V", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -1665,353 +1671,353 @@ TEST_P(PhraseFilterTestCase, sequential_one_term) {
       std::numeric_limits<size_t>::max());
     pt.term = irs::ViewCast<irs::byte_type>(std::string_view("fo"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     // check single word phrase optimization
     ASSERT_NE(nullptr,
-              dynamic_cast<const irs::MultiTermQuery*>(prepared.get()));
+              dynamic_cast<const irs::MultiTermQuery*>(prepared.Query(0)));
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "D", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "H", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "U", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "V", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "W", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "Y", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // wildcard_filter "fo%" with phrase offset
   // which does not matter
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>(
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>(
       std::numeric_limits<size_t>::max());
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("fo%"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     // check single word phrase optimization
     ASSERT_NE(nullptr,
-              dynamic_cast<const irs::MultiTermQuery*>(prepared.get()));
+              dynamic_cast<const irs::MultiTermQuery*>(prepared.Query(0)));
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "D", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "H", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "U", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "V", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "W", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "Y", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // wildcard_filter "f%x" with phrase offset
   // which does not matter
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>(
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>(
       std::numeric_limits<size_t>::max());
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("f%x"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     // check single word phrase optimization
     ASSERT_NE(nullptr,
-              dynamic_cast<const irs::MultiTermQuery*>(prepared.get()));
+              dynamic_cast<const irs::MultiTermQuery*>(prepared.Query(0)));
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "V", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // wildcard_filter "f%x" with phrase offset
   // which does not matter
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& lt = q.mutable_options()->push_back<irs::ByEditDistanceOptions>(
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& lt = q->mutable_options()->push_back<irs::ByEditDistanceOptions>(
       std::numeric_limits<size_t>::max());
     lt.max_distance = 1;
     lt.term = irs::ViewCast<irs::byte_type>(std::string_view("fkx"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     // check single word phrase optimization
     ASSERT_NE(nullptr,
-              dynamic_cast<const irs::MultiTermQuery*>(prepared.get()));
+              dynamic_cast<const irs::MultiTermQuery*>(prepared.Query(0)));
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "V", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -2027,43 +2033,43 @@ TEST_P(PhraseFilterTestCase, sequential_one_term) {
     rt.range.min_type = irs::BoundType::Inclusive;
     rt.range.max_type = irs::BoundType::Inclusive;
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     // check single word phrase optimization
     ASSERT_NE(nullptr,
-              dynamic_cast<const irs::MultiTermQuery*>(prepared.get()));
+              dynamic_cast<const irs::MultiTermQuery*>(prepared.Query(0)));
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X0", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X1", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X3", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X4", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 }
@@ -2091,35 +2097,35 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     q.mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -2135,221 +2141,221 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     q.mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "qui% brown fox"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("qui%"))};
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("brown"));
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "q%ck brown fox"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("q%ck"))};
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("brown"));
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "quick brown fox" simple term max_distance = 0
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& lt = q.mutable_options()->push_back<irs::ByEditDistanceOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& lt = q->mutable_options()->push_back<irs::ByEditDistanceOptions>();
     lt.max_distance = 0;
     lt.term = irs::ViewCast<irs::byte_type>(std::string_view("quick"));
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("brown"));
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "quck brown fox"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& lt = q.mutable_options()->push_back<irs::ByEditDistanceOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& lt = q->mutable_options()->push_back<irs::ByEditDistanceOptions>();
     lt.max_distance = 1;
     lt.term = irs::ViewCast<irs::byte_type>(std::string_view("quck"));
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("brown"));
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -2368,25 +2374,25 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     q.mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("x2"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X4", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -2401,176 +2407,176 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     q.mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "quick bro% fox"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("bro%"))};
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "quick b%w_ fox"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("b%w_"))};
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "quick brkln fox"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
-    auto& lt = q.mutable_options()->push_back<irs::ByEditDistanceOptions>();
+    auto& lt = q->mutable_options()->push_back<irs::ByEditDistanceOptions>();
     lt.max_distance = 2;
     lt.term = irs::ViewCast<irs::byte_type>(std::string_view("brkln"));
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -2589,25 +2595,25 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     q.mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("x2"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X4", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -2622,179 +2628,179 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     auto& pt = q.mutable_options()->push_back<irs::ByPrefixOptions>();
     pt.term = irs::ViewCast<irs::byte_type>(std::string_view("fo"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "U", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "quick brown fo%"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("brown"));
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("fo%"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "U", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "quick brown f_x"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("brown"));
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("f_x"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "quick brown fxo"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("brown"));
-    auto& lt = q.mutable_options()->push_back<irs::ByEditDistanceOptions>();
+    auto& lt = q->mutable_options()->push_back<irs::ByEditDistanceOptions>();
     lt.max_distance = 1;
     lt.with_transpositions = true;
     lt.term = irs::ViewCast<irs::byte_type>(std::string_view("fxo"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -2813,25 +2819,25 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     rt.range.min_type = irs::BoundType::Inclusive;
     rt.range.max_type = irs::BoundType::Inclusive;
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X4", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -2846,209 +2852,209 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     q.mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "V", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "qui% bro% fox"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& wt1 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& wt1 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt1 = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("qui%"))};
-    auto& wt2 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt2 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt2 = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("bro%"))};
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "V", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "qui% b%o__ fox"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& wt1 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& wt1 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt1 = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("qui%"))};
-    auto& wt2 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt2 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt2 = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("b%o__"))};
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "qui bro fox"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& lt1 = q.mutable_options()->push_back<irs::ByEditDistanceOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& lt1 = q->mutable_options()->push_back<irs::ByEditDistanceOptions>();
     lt1.max_distance = 2;
     lt1.term = irs::ViewCast<irs::byte_type>(std::string_view("qui"));
-    auto& lt2 = q.mutable_options()->push_back<irs::ByEditDistanceOptions>();
+    auto& lt2 = q->mutable_options()->push_back<irs::ByEditDistanceOptions>();
     lt2.max_distance = 1;
     lt2.term = irs::ViewCast<irs::byte_type>(std::string_view("brow"));
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -3070,23 +3076,23 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     q.mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("x2"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X4", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -3101,160 +3107,160 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     auto& pt2 = q.mutable_options()->push_back<irs::ByPrefixOptions>();
     pt2.term = irs::ViewCast<irs::byte_type>(std::string_view("fo"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "U", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "W", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "qui% brown fo%"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& wt1 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& wt1 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt1 = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("qui%"))};
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("brown"));
-    auto& wt2 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt2 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt2 = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("fo%"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "U", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "W", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "q_i% brown f%x"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& wt1 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& wt1 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt1 = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("q_i%"))};
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("brown"));
-    auto& wt2 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt2 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt2 = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("f%x"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -3276,69 +3282,69 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     rt2.range.min_type = irs::BoundType::Inclusive;
     rt2.range.max_type = irs::BoundType::Inclusive;
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X4", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // "qoick br__nn fix"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& lt1 = q.mutable_options()->push_back<irs::ByEditDistanceOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& lt1 = q->mutable_options()->push_back<irs::ByEditDistanceOptions>();
     lt1.max_distance = 1;
     lt1.term = irs::ViewCast<irs::byte_type>(std::string_view("qoick"));
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("br__n"))};
-    auto& lt2 = q.mutable_options()->push_back<irs::ByEditDistanceOptions>();
+    auto& lt2 = q->mutable_options()->push_back<irs::ByEditDistanceOptions>();
     lt2.max_distance = 1;
     lt2.term = irs::ViewCast<irs::byte_type>(std::string_view("fix"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -3354,166 +3360,166 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     auto& pt2 = q.mutable_options()->push_back<irs::ByPrefixOptions>();
     pt2.term = irs::ViewCast<irs::byte_type>(std::string_view("fo"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "U", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "quick bro% fo%"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
-    auto& wt1 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt1 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt1 = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("bro%"))};
-    auto& wt2 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt2 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt2 = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("fo%"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "U", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "quick b_o% f_%"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
-    auto& wt1 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt1 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt1 = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("b_o%"))};
-    auto& wt2 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt2 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt2 = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("f_%"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "U", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -3535,23 +3541,23 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     rt2.range.min_type = irs::BoundType::Inclusive;
     rt2.range.max_type = irs::BoundType::Inclusive;
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X4", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -3566,85 +3572,88 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     pt2.term = irs::ViewCast<irs::byte_type>(std::string_view("bro"));
     pt3.term = irs::ViewCast<irs::byte_type>(std::string_view("fo"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "U", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "V", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "W", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "Y", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "qui% bro% fo%"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& wt1 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
-    auto& wt2 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
-    auto& wt3 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
-    wt1 = irs::ByWildcardOptions{
-      irs::ViewCast<irs::byte_type>(std::string_view("qui%"))};
-    wt2 = irs::ByWildcardOptions{
-      irs::ViewCast<irs::byte_type>(std::string_view("bro%"))};
-    wt3 = irs::ByWildcardOptions{
-      irs::ViewCast<irs::byte_type>(std::string_view("fo%"))};
+    auto make_q = [] {
+      auto q = std::make_unique<irs::ByPhrase>();
+      *q->mutable_field_id() = kPhraseAnl;
+      auto& wt1 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
+      auto& wt2 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
+      auto& wt3 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
+      wt1 = irs::ByWildcardOptions{
+        irs::ViewCast<irs::byte_type>(std::string_view("qui%"))};
+      wt2 = irs::ByWildcardOptions{
+        irs::ViewCast<irs::byte_type>(std::string_view("bro%"))};
+      wt3 = irs::ByWildcardOptions{
+        irs::ViewCast<irs::byte_type>(std::string_view("fo%"))};
+      return q;
+    };
     size_t finish_count = 0;
     uint64_t finish_docs_with_field = 0;
     uint64_t finish_docs_with_term = 0;
@@ -3668,10 +3677,7 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
       *score = it->value();
     };
 
-    auto prepared = q.prepare({
-      .index = rdr,
-      .scorer = &sort,
-    });
+    tests::PreparedFilter prepared{*Lower(make_q(), &sort), rdr, &sort};
     ASSERT_EQ(6, finish_count);
     ASSERT_GT(finish_docs_with_field, 0u);  // scorer collected field stats
     ASSERT_GT(finish_docs_with_term, 0u);   // scorer collected term stats
@@ -3683,27 +3689,22 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
 
     // no order passed - no frequency
     {
-      auto docs = prepared->execute({.segment = *sub});
+      tests::PreparedFilter unscored{*Lower(make_q()), rdr};
+      auto docs = unscored.Execute(0);
       ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
       ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     }
 
-    auto docs = prepared->execute({
-      .segment = *sub,
-      .scorer = &sort,
-    });
+    auto docs = prepared.Execute(0);
     it = docs.get();
     auto* freq = irs::get<irs::FreqBlockAttr>(*docs);
     ASSERT_TRUE(freq);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({
-      .segment = *sub,
-      .scorer = &sort,
-    });
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -3713,7 +3714,7 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -3723,7 +3724,7 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -3733,7 +3734,7 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -3743,7 +3744,7 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -3753,7 +3754,7 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -3763,7 +3764,7 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -3773,7 +3774,7 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -3783,7 +3784,7 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -3793,7 +3794,7 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -3803,18 +3804,18 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "q%ic_ br_wn _%x"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& wt1 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
-    auto& wt2 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
-    auto& wt3 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& wt1 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt2 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt3 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt1 = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("q%ic_"))};
     wt2 = irs::ByWildcardOptions{
@@ -3822,34 +3823,34 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     wt3 = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("_%x"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -3869,48 +3870,48 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     auto& st3 = q.mutable_options()->push_back<irs::ByTermsOptions>();
     st3.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view("fox")));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "V", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -3935,23 +3936,23 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     rt3.range.min_type = irs::BoundType::Inclusive;
     rt3.range.max_type = irs::BoundType::Inclusive;
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X4", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -3987,10 +3988,7 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
       *score = it->value();
     };
 
-    auto prepared = q.prepare({
-      .index = rdr,
-      .scorer = &sort,
-    });
+    tests::PreparedFilter prepared{q, rdr, &sort};
     ASSERT_EQ(3, finish_count);
     ASSERT_GT(finish_docs_with_field, 0u);  // scorer collected field stats
     ASSERT_GT(finish_docs_with_term, 0u);   // scorer collected term stats
@@ -3998,7 +3996,8 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
 
     // no order passed - no frequency
     {
-      auto docs = prepared->execute({.segment = *sub});
+      tests::PreparedFilter unscored{q, rdr};
+      auto docs = unscored.Execute(0);
       ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
       ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     }
@@ -4006,22 +4005,16 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({
-      .segment = *sub,
-      .scorer = &sort,
-    });
+    auto docs = prepared.Execute(0);
     auto* freq = irs::get<irs::FreqBlockAttr>(*docs);
     ASSERT_TRUE(freq);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({
-      .segment = *sub,
-      .scorer = &sort,
-    });
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
     it = docs.get();
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -4031,7 +4024,7 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -4041,7 +4034,7 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -4051,7 +4044,7 @@ TEST_P(PhraseFilterTestCase, sequential_three_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -4078,28 +4071,28 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     q.mutable_options()->push_back<irs::ByTermOptions>(1).term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -4113,102 +4106,102 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     q.mutable_options()->push_back<irs::ByTermOptions>(1).term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "f_x ... quick"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("f_x"))};
-    q.mutable_options()->push_back<irs::ByTermOptions>(1).term =
+    q->mutable_options()->push_back<irs::ByTermOptions>(1).term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "fpx ... quick"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& lt = q.mutable_options()->push_back<irs::ByEditDistanceOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& lt = q->mutable_options()->push_back<irs::ByEditDistanceOptions>();
     lt.max_distance = 1;
     lt.term = irs::ViewCast<irs::byte_type>(std::string_view("fpx"));
-    q.mutable_options()->push_back<irs::ByTermOptions>(1).term =
+    q->mutable_options()->push_back<irs::ByTermOptions>(1).term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -4222,64 +4215,64 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     auto& pt = q.mutable_options()->push_back<irs::ByPrefixOptions>(1);
     pt.term = irs::ViewCast<irs::byte_type>(std::string_view("qui"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "fox ... qui%ck"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>(1);
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>(1);
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("qui%ck"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -4293,114 +4286,114 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     pt1.term = irs::ViewCast<irs::byte_type>(std::string_view("fo"));
     pt2.term = irs::ViewCast<irs::byte_type>(std::string_view("qui"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "f%x ... qui%ck"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& wt1 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
-    auto& wt2 = q.mutable_options()->push_back<irs::ByWildcardOptions>(1);
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& wt1 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt2 = q->mutable_options()->push_back<irs::ByWildcardOptions>(1);
     wt1 = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("f%x"))};
     wt2 = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("qui%ck"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "fx ... quik"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& lt1 = q.mutable_options()->push_back<irs::ByEditDistanceOptions>();
-    auto& lt2 = q.mutable_options()->push_back<irs::ByEditDistanceOptions>(1);
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& lt1 = q->mutable_options()->push_back<irs::ByEditDistanceOptions>();
+    auto& lt2 = q->mutable_options()->push_back<irs::ByEditDistanceOptions>(1);
     lt1.max_distance = 1;
     lt1.term = irs::ViewCast<irs::byte_type>(std::string_view("fx"));
     lt2.max_distance = 1;
     lt2.term = irs::ViewCast<irs::byte_type>(std::string_view("quik"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::get<irs::FreqBlockAttr>(*docs));
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "fx ... quik"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& lt1 = q.mutable_options()->push_back<irs::ByEditDistanceOptions>();
-    auto& lt2 = q.mutable_options()->push_back<irs::ByEditDistanceOptions>(1);
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& lt1 = q->mutable_options()->push_back<irs::ByEditDistanceOptions>();
+    auto& lt2 = q->mutable_options()->push_back<irs::ByEditDistanceOptions>(1);
     lt1.max_distance = 1;
     lt1.term = irs::ViewCast<irs::byte_type>(std::string_view("fx"));
     lt2.max_distance = 1;
@@ -4408,30 +4401,23 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
 
     auto scorer = irs::BM25::Make(irs::BM25::Options{.b = 0.0f});
 
-    auto prepared = q.prepare({.index = rdr, .scorer = scorer.get()});
+    tests::PreparedFilter prepared{*Lower(std::move(q), scorer.get()), rdr,
+                                   scorer.get()};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({
-      .segment = *sub,
-      .scorer = scorer.get(),
-
-    });
+    auto docs = prepared.Execute(0);
     auto* freq = irs::get<irs::FreqBlockAttr>(*docs);
     ASSERT_TRUE(freq);
     auto* boost = irs::get<irs::BoostBlockAttr>(*docs);
     ASSERT_TRUE(boost);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({
-      .segment = *sub,
-      .scorer = scorer.get(),
-
-    });
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_FLOAT_EQ((0.5f + 0.75f) / 2, boost->value[0]);
@@ -4444,7 +4430,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_FLOAT_EQ(boost->value[0],
                     irs::get<irs::BoostBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(2, freq->value[0]);
     ASSERT_FLOAT_EQ((0.5f + 0.75f) / 2, boost->value[0]);
@@ -4457,7 +4443,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_FLOAT_EQ(boost->value[0],
                     irs::get<irs::BoostBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -4474,29 +4460,21 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
 
     auto scorer = irs::BM25::Make(irs::BM25::Options{.b = 0.0f});
 
-    auto prepared = q.prepare({.index = rdr, .scorer = scorer.get()});
+    tests::PreparedFilter prepared{q, rdr, scorer.get()};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({
-      .segment = *sub,
-      .scorer = scorer.get(),
-
-    });
+    auto docs = prepared.Execute(0);
     auto* freq = irs::get<irs::FreqBlockAttr>(*docs);
     ASSERT_TRUE(freq);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({
-      .segment = *sub,
-      .scorer = scorer.get(),
-
-    });
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -4506,7 +4484,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(2, freq->value[0]);
     ASSERT_EQ(
@@ -4516,7 +4494,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -4539,30 +4517,22 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
 
     auto scorer = irs::BM25::Make(irs::BM25::Options{.b = 0.0f});
 
-    auto prepared = q.prepare({.index = rdr, .scorer = scorer.get()});
+    tests::PreparedFilter prepared{q, rdr, scorer.get()};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({
-      .segment = *sub,
-      .scorer = scorer.get(),
-
-    });
+    auto docs = prepared.Execute(0);
     auto* freq = irs::get<irs::FreqBlockAttr>(*docs);
     ASSERT_TRUE(freq);
     auto* boost = irs::get<irs::BoostBlockAttr>(*docs);
     ASSERT_TRUE(boost);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({
-      .segment = *sub,
-      .scorer = scorer.get(),
-
-    });
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_FLOAT_EQ((1.f + 0.75f) / 2, boost->value[0]);
@@ -4575,7 +4545,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(boost->value[0],
               irs::get<irs::BoostBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(2, freq->value[0]);
     ASSERT_FLOAT_EQ(((1.f + 0.25f) / 2 + (1.f + 0.5f) / 2) / 2,
@@ -4589,7 +4559,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(boost->value[0],
               irs::get<irs::BoostBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(4, freq->value[0]);
     ASSERT_FLOAT_EQ((1.f + 0.25f) / 2, boost->value[0]);
@@ -4602,7 +4572,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(boost->value[0],
               irs::get<irs::BoostBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(3, freq->value[0]);
     ASSERT_FLOAT_EQ((1.f + 0.25f) / 2, boost->value[0]);
@@ -4615,7 +4585,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(boost->value[0],
               irs::get<irs::BoostBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(2, freq->value[0]);
     ASSERT_FLOAT_EQ((1.f + 0.25f) / 2, boost->value[0]);
@@ -4628,7 +4598,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(boost->value[0],
               irs::get<irs::BoostBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -4643,29 +4613,21 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
 
     auto scorer = irs::BM25::Make(irs::BM25::Options{.b = 0.0f});
 
-    auto prepared = q.prepare({.index = rdr, .scorer = scorer.get()});
+    tests::PreparedFilter prepared{q, rdr, scorer.get()};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({
-      .segment = *sub,
-      .scorer = scorer.get(),
-
-    });
+    auto docs = prepared.Execute(0);
     auto* freq = irs::get<irs::FreqBlockAttr>(*docs);
     ASSERT_TRUE(freq);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({
-      .segment = *sub,
-      .scorer = scorer.get(),
-
-    });
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -4675,7 +4637,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -4685,7 +4647,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -4695,7 +4657,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -4705,7 +4667,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -4715,7 +4677,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -4725,7 +4687,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -4735,7 +4697,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(4, freq->value[0]);
     ASSERT_EQ(
@@ -4745,7 +4707,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -4755,7 +4717,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -4765,7 +4727,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -4775,7 +4737,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -4790,30 +4752,22 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
 
     auto scorer = irs::BM25::Make(irs::BM25::Options{.b = 0.0f});
 
-    auto prepared = q.prepare({.index = rdr, .scorer = scorer.get()});
+    tests::PreparedFilter prepared{q, rdr, scorer.get()};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({
-      .segment = *sub,
-      .scorer = scorer.get(),
-
-    });
+    auto docs = prepared.Execute(0);
     auto* freq = irs::get<irs::FreqBlockAttr>(*docs);
     ASSERT_TRUE(freq);
     auto* boost = irs::get<irs::BoostBlockAttr>(*docs);
     ASSERT_TRUE(boost);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({
-      .segment = *sub,
-      .scorer = scorer.get(),
-
-    });
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(0.5f, boost->value[0]);
@@ -4826,7 +4780,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(boost->value[0],
               irs::get<irs::BoostBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -4838,7 +4792,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(boost->value[0],
               irs::get<irs::BoostBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(irs::kNoBoost, boost->value[0]);
@@ -4851,7 +4805,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(boost->value[0],
               irs::get<irs::BoostBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(0.5f, boost->value[0]);
@@ -4864,7 +4818,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(boost->value[0],
               irs::get<irs::BoostBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(0.5f, boost->value[0]);
@@ -4877,7 +4831,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(boost->value[0],
               irs::get<irs::BoostBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(0.5f, boost->value[0]);
@@ -4890,7 +4844,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(boost->value[0],
               irs::get<irs::BoostBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -4902,7 +4856,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(boost->value[0],
               irs::get<irs::BoostBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(4, freq->value[0]);
     ASSERT_EQ(0.5f, boost->value[0]);
@@ -4915,7 +4869,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(boost->value[0],
               irs::get<irs::BoostBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(0.5f, boost->value[0]);
@@ -4928,7 +4882,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(boost->value[0],
               irs::get<irs::BoostBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(0.5f, boost->value[0]);
@@ -4941,7 +4895,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(boost->value[0],
               irs::get<irs::BoostBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(0.5f, boost->value[0]);
@@ -4954,18 +4908,18 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(boost->value[0],
               irs::get<irs::BoostBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // test disjunctions (unary, basic, small, disjunction)
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& wt1 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
-    auto& wt2 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
-    auto& pt1 = q.mutable_options()->push_back<irs::ByPrefixOptions>();
-    auto& pt2 = q.mutable_options()->push_back<irs::ByPrefixOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& wt1 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt2 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& pt1 = q->mutable_options()->push_back<irs::ByPrefixOptions>();
+    auto& pt2 = q->mutable_options()->push_back<irs::ByPrefixOptions>();
     wt1 = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("%las"))};
     wt2 = irs::ByWildcardOptions{
@@ -4975,29 +4929,22 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
 
     auto scorer = irs::BM25::Make(irs::BM25::Options{.b = 0.0f});
 
-    auto prepared = q.prepare({.index = rdr, .scorer = scorer.get()});
+    tests::PreparedFilter prepared{*Lower(std::move(q), scorer.get()), rdr,
+                                   scorer.get()};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({
-      .segment = *sub,
-      .scorer = scorer.get(),
-
-    });
+    auto docs = prepared.Execute(0);
     auto* freq = irs::get<irs::FreqBlockAttr>(*docs);
     ASSERT_TRUE(freq);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({
-      .segment = *sub,
-      .scorer = scorer.get(),
-
-    });
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -5007,7 +4954,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -5024,28 +4971,28 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     q.mutable_options()->push_back<irs::ByTermOptions>(1).term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -5061,23 +5008,23 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     q.mutable_options()->push_back<irs::ByTermOptions>(0).term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -5093,23 +5040,23 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     pt1.term = irs::ViewCast<irs::byte_type>(std::string_view("fox"));
     pt2.term = irs::ViewCast<irs::byte_type>(std::string_view("quick"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -5125,28 +5072,28 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     q.mutable_options()->push_back<irs::ByTermOptions>(1).term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -5154,37 +5101,37 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
   // "f_x ... quick" with phrase offset
   // which is does not matter
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>(
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>(
       std::numeric_limits<size_t>::max());
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("f_x"))};
-    q.mutable_options()->push_back<irs::ByTermOptions>(1).term =
+    q->mutable_options()->push_back<irs::ByTermOptions>(1).term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -5200,28 +5147,28 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     auto& pt = q.mutable_options()->push_back<irs::ByPrefixOptions>(1);
     pt.term = irs::ViewCast<irs::byte_type>(std::string_view("qui"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -5229,37 +5176,37 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
   // "fox ... qui%k" with phrase offset
   // which is does not matter
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()
       ->push_back<irs::ByTermOptions>(std::numeric_limits<size_t>::max())
       .term = irs::ViewCast<irs::byte_type>(std::string_view("fox"));
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>(1);
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>(1);
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("qui%k"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -5275,28 +5222,28 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     pt1.term = irs::ViewCast<irs::byte_type>(std::string_view("fo"));
     pt2.term = irs::ViewCast<irs::byte_type>(std::string_view("qui"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -5304,38 +5251,38 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
   // "fo% ... qui%" with phrase offset
   // which is does not matter
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& wt1 = q.mutable_options()->push_back<irs::ByWildcardOptions>(
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& wt1 = q->mutable_options()->push_back<irs::ByWildcardOptions>(
       std::numeric_limits<size_t>::max());
-    auto& wt2 = q.mutable_options()->push_back<irs::ByWildcardOptions>(1);
+    auto& wt2 = q->mutable_options()->push_back<irs::ByWildcardOptions>(1);
     wt1 = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("fo%"))};
     wt2 = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("qui%"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -5343,38 +5290,38 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
   // "fo% ... quik" with phrase offset
   // which is does not matter
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>(
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>(
       std::numeric_limits<size_t>::max());
-    auto& lt = q.mutable_options()->push_back<irs::ByEditDistanceOptions>(1);
+    auto& lt = q->mutable_options()->push_back<irs::ByEditDistanceOptions>(1);
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("fo%"))};
     lt.max_distance = 1;
     lt.term = irs::ViewCast<irs::byte_type>(std::string_view("quik"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -5388,12 +5335,11 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     q.mutable_options()->push_back<irs::ByTermOptions>(10).term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
 
-    auto sub = rdr.begin();
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -5406,50 +5352,47 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     auto& pt = q.mutable_options()->push_back<irs::ByPrefixOptions>(10);
     pt.term = irs::ViewCast<irs::byte_type>(std::string_view("qui"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
 
-    auto sub = rdr.begin();
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // "fox ... ... ... ... ... ... ... ... ... ... qu_ck"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>(10);
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>(10);
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("qu_ck"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
 
-    auto sub = rdr.begin();
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // "fox ... ... ... ... ... ... ... ... ... ... quc"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
-    auto& lt = q.mutable_options()->push_back<irs::ByEditDistanceOptions>(10);
+    auto& lt = q->mutable_options()->push_back<irs::ByEditDistanceOptions>(10);
     lt.max_distance = 2;
     lt.term = irs::ViewCast<irs::byte_type>(std::string_view("quc"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
 
-    auto sub = rdr.begin();
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -5462,23 +5405,23 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     q.mutable_options()->push_back<irs::ByTermOptions>(1).term =
       irs::ViewCast<irs::byte_type>(std::string_view("eye"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "C", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -5504,69 +5447,69 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     q.mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("forward"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "H", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "as in % past we ___ looking forward"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& lt = q.mutable_options()->push_back<irs::ByEditDistanceOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& lt = q->mutable_options()->push_back<irs::ByEditDistanceOptions>();
     lt.max_distance = 2;
     lt.term = irs::ViewCast<irs::byte_type>(std::string_view("ass"));
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("in"));
-    auto& wt1 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt1 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt1 = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("%"))};
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("past"));
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("we"));
-    auto& wt2 = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt2 = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt2 = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("___"))};
-    auto& st = q.mutable_options()->push_back<irs::ByTermsOptions>();
+    auto& st = q->mutable_options()->push_back<irs::ByTermsOptions>();
     st.terms.emplace(
       irs::ViewCast<irs::byte_type>(std::string_view("looking")));
     st.terms.emplace(
       irs::ViewCast<irs::byte_type>(std::string_view("searching")));
-    auto& pt = q.mutable_options()->push_back<irs::ByPrefixOptions>();
+    auto& pt = q->mutable_options()->push_back<irs::ByPrefixOptions>();
     pt.term = irs::ViewCast<irs::byte_type>(std::string_view("fo"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "H", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -5600,34 +5543,25 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
       *score = it->value();
     };
 
-    auto prepared = q.prepare({
-      .index = rdr,
-      .scorer = &sort,
-    });
+    tests::PreparedFilter prepared{q, rdr, &sort};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({
-      .segment = *sub,
-      .scorer = &sort,
-    });
+    auto docs = prepared.Execute(0);
     it = docs.get();
     auto* freq = irs::get<irs::FreqBlockAttr>(*docs);
     ASSERT_TRUE(freq);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({
-      .segment = *sub,
-      .scorer = &sort,
-    });
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
     auto score = it->PrepareScore({
       .scorer = &sort,
       .segment = &*sub,
     });
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     irs::score_t score_value{};
     score.Score(&score_value, 1);
@@ -5640,31 +5574,31 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // "as in the p_st we are look* forward" with order
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("as"));
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("in"));
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("the"));
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("p_st"))};
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("we"));
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("are"));
-    auto& pt = q.mutable_options()->push_back<irs::ByPrefixOptions>();
+    auto& pt = q->mutable_options()->push_back<irs::ByPrefixOptions>();
     pt.term = irs::ViewCast<irs::byte_type>(std::string_view("look"));
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("forward"));
 
     tests::sort::CustomSort sort;
@@ -5675,34 +5609,25 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
       *score = it->value();
     };
 
-    auto prepared = q.prepare({
-      .index = rdr,
-      .scorer = &sort,
-    });
+    tests::PreparedFilter prepared{*Lower(std::move(q), &sort), rdr, &sort};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({
-      .segment = *sub,
-      .scorer = &sort,
-    });
+    auto docs = prepared.Execute(0);
     it = docs.get();
     auto* freq = irs::get<irs::FreqBlockAttr>(*docs);
     ASSERT_TRUE(freq);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({
-      .segment = *sub,
-      .scorer = &sort,
-    });
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
     auto score = docs->PrepareScore({
       .scorer = &sort,
       .segment = &*sub,
     });
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     irs::score_t score_value{};
     score.Score(&score_value, 1);
@@ -5715,7 +5640,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -5729,18 +5654,18 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     q.mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     // Check repeatable seek to the same document given frequency of the phrase
@@ -5749,7 +5674,7 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(v, docs->seek(docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -5771,31 +5696,22 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
       *score = it->value();
     };
 
-    auto prepared = q.prepare({
-      .index = rdr,
-      .scorer = &sort,
-    });
+    tests::PreparedFilter prepared{q, rdr, &sort};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({
-      .segment = *sub,
-      .scorer = &sort,
-    });
+    auto docs = prepared.Execute(0);
     it = docs.get();
     auto* freq = irs::get<irs::FreqBlockAttr>(*docs);
     ASSERT_TRUE(freq);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({
-      .segment = *sub,
-      .scorer = &sort,
-    });
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(2, freq->value[0]);
     ASSERT_EQ(
@@ -5805,182 +5721,182 @@ TEST_P(PhraseFilterTestCase, sequential_several_terms) {
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
 
   // wildcard_filter "zo\\_%"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("zo\\_%"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ("PHW0", irs::tests::ReadStoredStr<std::string_view>(
                         values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // wildcard_filter "\\_oo"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("\\_oo"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ("PHW1", irs::tests::ReadStoredStr<std::string_view>(
                         values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // wildcard_filter "z\\_o"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("z\\_o"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ("PHW2", irs::tests::ReadStoredStr<std::string_view>(
                         values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // wildcard_filter "elephant giraff\\_%"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("elephant"));
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("giraff\\_%"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ("PHW3", irs::tests::ReadStoredStr<std::string_view>(
                         values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // wildcard_filter "elephant \\_iraffe"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("elephant"));
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("\\_iraffe"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ("PHW4", irs::tests::ReadStoredStr<std::string_view>(
                         values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // wildcard_filter "elephant gira\\_fe"
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("elephant"));
-    auto& wt = q.mutable_options()->push_back<irs::ByWildcardOptions>();
+    auto& wt = q->mutable_options()->push_back<irs::ByWildcardOptions>();
     wt = irs::ByWildcardOptions{
       irs::ViewCast<irs::byte_type>(std::string_view("gira\\_fe"))};
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ("PHW5", irs::tests::ReadStoredStr<std::string_view>(
                         values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 }
@@ -6006,43 +5922,43 @@ TEST_P(PhraseFilterTestCase, interval_several_terms) {
     q.mutable_options()->push_back<irs::ByTermOptions>(2, 3).term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "B", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "C", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "F", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "H", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -6058,38 +5974,38 @@ TEST_P(PhraseFilterTestCase, interval_several_terms) {
     q.mutable_options()->push_back<irs::ByTermOptions>(2, 3).term =
       irs::ViewCast<irs::byte_type>(std::string_view("brown"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "E", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "F", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "H", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -6106,13 +6022,12 @@ TEST_P(PhraseFilterTestCase, interval_several_terms) {
     q.mutable_options()->push_back<irs::ByTermOptions>(1, 3).term =
       irs::ViewCast<irs::byte_type>(std::string_view("brown"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
 
-    auto sub = rdr.begin();
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
   }
 
   // mix interval and single
@@ -6130,23 +6045,23 @@ TEST_P(PhraseFilterTestCase, interval_several_terms) {
     q.mutable_options()->push_back<irs::ByTermOptions>(2, 3).term =
       irs::ViewCast<irs::byte_type>(std::string_view("dog"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "H", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -6180,47 +6095,31 @@ TEST_P(PhraseFilterTestCase, interval_several_terms) {
       *score = it->value();
     };
     auto sub = rdr.begin();
-    auto prepared = q.prepare({
-      .index = rdr,
-      .scorer = &sort,
-    });
+    tests::PreparedFilter prepared{q, rdr, &sort};
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
     tests::sort::FrequencyScore freq_score;
-    auto disj_prepared = disjunction.prepare({
-      .index = rdr,
-      .scorer = &freq_score,
-    });
-    auto disj_docs = disj_prepared->execute({
-      .segment = *sub,
-      .scorer = &freq_score,
-
-    });
+    tests::PreparedFilter disj_prepared{disjunction, rdr, &freq_score};
+    auto disj_docs = disj_prepared.Execute(0);
     auto disj_score = disj_docs->PrepareScore({
       .scorer = &freq_score,
       .segment = &*sub,
     });
     irs::score_t score_val;
 
-    auto docs = prepared->execute({
-      .segment = *sub,
-      .scorer = &sort,
-    });
+    auto docs = prepared.Execute(0);
     it = docs.get();
 
     auto* freq = irs::get<irs::FreqBlockAttr>(*docs);
     ASSERT_TRUE(freq);
     ASSERT_FALSE(irs::get<irs::BoostBlockAttr>(*docs));
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({
-      .segment = *sub,
-      .scorer = &sort,
-    });
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -6229,13 +6128,13 @@ TEST_P(PhraseFilterTestCase, interval_several_terms) {
     docs_seek->FetchScoreArgs(0);
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
-    ASSERT_TRUE(disj_docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(disj_docs->advance()));
     ASSERT_EQ(docs->value(), disj_docs->value());
     disj_docs->FetchScoreArgs(0);
     disj_score.Score(&score_val, 1);
     ASSERT_DOUBLE_EQ(score_val, freq->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(2, freq->value[0]);
     ASSERT_EQ(
@@ -6244,13 +6143,13 @@ TEST_P(PhraseFilterTestCase, interval_several_terms) {
     docs_seek->FetchScoreArgs(0);
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
-    ASSERT_TRUE(disj_docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(disj_docs->advance()));
     ASSERT_EQ(docs->value(), disj_docs->value());
     disj_docs->FetchScoreArgs(0);
     disj_score.Score(&score_val, 1);
     ASSERT_DOUBLE_EQ(score_val, freq->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(2, freq->value[0]);
     ASSERT_EQ(
@@ -6259,13 +6158,13 @@ TEST_P(PhraseFilterTestCase, interval_several_terms) {
     docs_seek->FetchScoreArgs(0);
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
-    ASSERT_TRUE(disj_docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(disj_docs->advance()));
     ASSERT_EQ(docs->value(), disj_docs->value());
     disj_docs->FetchScoreArgs(0);
     disj_score.Score(&score_val, 1);
     ASSERT_DOUBLE_EQ(score_val, freq->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
     ASSERT_EQ(
@@ -6274,13 +6173,13 @@ TEST_P(PhraseFilterTestCase, interval_several_terms) {
     docs_seek->FetchScoreArgs(0);
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
-    ASSERT_TRUE(disj_docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(disj_docs->advance()));
     ASSERT_EQ(docs->value(), disj_docs->value());
     disj_docs->FetchScoreArgs(0);
     disj_score.Score(&score_val, 1);
     ASSERT_DOUBLE_EQ(score_val, freq->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(4, freq->value[0]);
     ASSERT_EQ(
@@ -6289,16 +6188,16 @@ TEST_P(PhraseFilterTestCase, interval_several_terms) {
     docs_seek->FetchScoreArgs(0);
     ASSERT_EQ(freq->value[0],
               irs::get<irs::FreqBlockAttr>(*docs_seek)->value[0]);
-    ASSERT_TRUE(disj_docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(disj_docs->advance()));
     ASSERT_EQ(docs->value(), disj_docs->value());
     disj_docs->FetchScoreArgs(0);
     disj_score.Score(&score_val, 1);
     ASSERT_DOUBLE_EQ(score_val, freq->value[0]);
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
-    ASSERT_FALSE(disj_docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(disj_docs->advance()));
   }
 
   // mix interval and single
@@ -6318,23 +6217,23 @@ TEST_P(PhraseFilterTestCase, interval_several_terms) {
     q.mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("to"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
 
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
   }
@@ -6347,48 +6246,48 @@ TEST_P(PhraseFilterTestCase, interval_several_terms) {
     auto& wt = q.mutable_options()->push_back<irs::ByPrefixOptions>(3, 4);
     wt.term = irs::ViewCast<irs::byte_type>(std::string_view("fo"));
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "B", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "E", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "F", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "H", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -6432,93 +6331,80 @@ TEST_P(PhraseFilterTestCase, interval_several_terms) {
       *score = it->value();
     };
 
-    auto prepared = q.prepare({
-      .index = rdr,
-      .scorer = &sort,
-    });
+    tests::PreparedFilter prepared{q, rdr, &sort};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     it = docs.get();
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({
-      .segment = *sub,
-      .scorer = &sort,
-    });
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
     auto* freq_seek = irs::get<irs::FreqBlockAttr>(*docs_seek);
     ASSERT_TRUE(freq_seek);
 
     tests::sort::FrequencyScore freq_score;
-    auto disj_prepared = disjunction.prepare({
-      .index = rdr,
-      .scorer = &freq_score,
-    });
-    auto disj_docs = disj_prepared->execute({
-      .segment = *sub,
-      .scorer = &freq_score,
-
-    });
+    tests::PreparedFilter disj_prepared{disjunction, rdr, &freq_score};
+    auto disj_docs = disj_prepared.Execute(0);
     auto disj_score = disj_docs->PrepareScore({
       .scorer = &freq_score,
       .segment = &*sub,
     });
     irs::score_t score_val;
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "E", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
     docs_seek->FetchScoreArgs(0);
     ASSERT_EQ(1, freq_seek->value[0]);
-    ASSERT_TRUE(disj_docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(disj_docs->advance()));
     ASSERT_EQ(docs->value(), disj_docs->value());
     disj_docs->FetchScoreArgs(0);
     disj_score.Score(&score_val, 1);
     ASSERT_DOUBLE_EQ(score_val, freq_seek->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "F", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
     docs_seek->FetchScoreArgs(0);
     ASSERT_EQ(6, freq_seek->value[0]);
-    ASSERT_TRUE(disj_docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(disj_docs->advance()));
     ASSERT_EQ(docs->value(), disj_docs->value());
     disj_docs->FetchScoreArgs(0);
     disj_score.Score(&score_val, 1);
     ASSERT_DOUBLE_EQ(score_val, freq_seek->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
     docs_seek->FetchScoreArgs(0);
     ASSERT_EQ(11, freq_seek->value[0]);
-    ASSERT_TRUE(disj_docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(disj_docs->advance()));
     ASSERT_EQ(docs->value(), disj_docs->value());
     disj_docs->FetchScoreArgs(0);
     disj_score.Score(&score_val, 1);
     ASSERT_DOUBLE_EQ(score_val, freq_seek->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "H", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
     docs_seek->FetchScoreArgs(0);
     ASSERT_EQ(2, freq_seek->value[0]);
-    ASSERT_TRUE(disj_docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(disj_docs->advance()));
     ASSERT_EQ(docs->value(), disj_docs->value());
     disj_docs->FetchScoreArgs(0);
     disj_score.Score(&score_val, 1);
     ASSERT_DOUBLE_EQ(score_val, freq_seek->value[0]);
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
-    ASSERT_FALSE(disj_docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(disj_docs->advance()));
   }
 
   // variadic interval ordered
@@ -6556,93 +6442,80 @@ TEST_P(PhraseFilterTestCase, interval_several_terms) {
       *score = it->value();
     };
 
-    auto prepared = q.prepare({
-      .index = rdr,
-      .scorer = &sort,
-    });
+    tests::PreparedFilter prepared{q, rdr, &sort};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     it = docs.get();
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({
-      .segment = *sub,
-      .scorer = &sort,
-    });
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
     auto* freq_seek = irs::get<irs::FreqBlockAttr>(*docs_seek);
     ASSERT_TRUE(freq_seek);
 
     tests::sort::FrequencyScore freq_score;
-    auto disj_prepared = disjunction.prepare({
-      .index = rdr,
-      .scorer = &freq_score,
-    });
-    auto disj_docs = disj_prepared->execute({
-      .segment = *sub,
-      .scorer = &freq_score,
-
-    });
+    tests::PreparedFilter disj_prepared{disjunction, rdr, &freq_score};
+    auto disj_docs = disj_prepared.Execute(0);
     auto disj_score = disj_docs->PrepareScore({
       .scorer = &freq_score,
       .segment = &*sub,
     });
     irs::score_t score_val;
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "E", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
     docs_seek->FetchScoreArgs(0);
     ASSERT_EQ(1, freq_seek->value[0]);
-    ASSERT_TRUE(disj_docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(disj_docs->advance()));
     ASSERT_EQ(docs->value(), disj_docs->value());
     disj_docs->FetchScoreArgs(0);
     disj_score.Score(&score_val, 1);
     ASSERT_DOUBLE_EQ(score_val, freq_seek->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "F", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
     docs_seek->FetchScoreArgs(0);
     ASSERT_EQ(3, freq_seek->value[0]);
-    ASSERT_TRUE(disj_docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(disj_docs->advance()));
     ASSERT_EQ(docs->value(), disj_docs->value());
     disj_docs->FetchScoreArgs(0);
     disj_score.Score(&score_val, 1);
     ASSERT_DOUBLE_EQ(score_val, freq_seek->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
     docs_seek->FetchScoreArgs(0);
     ASSERT_EQ(5, freq_seek->value[0]);
-    ASSERT_TRUE(disj_docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(disj_docs->advance()));
     ASSERT_EQ(docs->value(), disj_docs->value());
     disj_docs->FetchScoreArgs(0);
     disj_score.Score(&score_val, 1);
     ASSERT_DOUBLE_EQ(score_val, freq_seek->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "H", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
     docs_seek->FetchScoreArgs(0);
     ASSERT_EQ(3, freq_seek->value[0]);
-    ASSERT_TRUE(disj_docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(disj_docs->advance()));
     ASSERT_EQ(docs->value(), disj_docs->value());
     disj_docs->FetchScoreArgs(0);
     disj_score.Score(&score_val, 1);
     ASSERT_DOUBLE_EQ(score_val, freq_seek->value[0]);
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
-    ASSERT_FALSE(disj_docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(disj_docs->advance()));
   }
 
   // fixed interval ordered last only repeated
@@ -6680,55 +6553,42 @@ TEST_P(PhraseFilterTestCase, interval_several_terms) {
       *score = it->value();
     };
 
-    auto prepared = q.prepare({
-      .index = rdr,
-      .scorer = &sort,
-    });
+    tests::PreparedFilter prepared{q, rdr, &sort};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     it = docs.get();
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
-    auto docs_seek = prepared->execute({
-      .segment = *sub,
-      .scorer = &sort,
-    });
+    auto docs_seek = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs_seek->value()));
     auto* freq_seek = irs::get<irs::FreqBlockAttr>(*docs_seek);
     ASSERT_TRUE(freq_seek);
 
     tests::sort::FrequencyScore freq_score;
-    auto disj_prepared = disjunction.prepare({
-      .index = rdr,
-      .scorer = &freq_score,
-    });
-    auto disj_docs = disj_prepared->execute({
-      .segment = *sub,
-      .scorer = &freq_score,
-
-    });
+    tests::PreparedFilter disj_prepared{disjunction, rdr, &freq_score};
+    auto disj_docs = disj_prepared.Execute(0);
     auto disj_score = disj_docs->PrepareScore({
       .scorer = &freq_score,
       .segment = &*sub,
     });
     irs::score_t score_val;
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "K", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(docs->value(), docs_seek->seek(docs->value()));
     docs_seek->FetchScoreArgs(0);
     ASSERT_EQ(3, freq_seek->value[0]);
-    ASSERT_TRUE(disj_docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(disj_docs->advance()));
     ASSERT_EQ(docs->value(), disj_docs->value());
     disj_docs->FetchScoreArgs(0);
     disj_score.Score(&score_val, 1);
     ASSERT_DOUBLE_EQ(score_val, freq_seek->value[0]);
 
-    ASSERT_FALSE(docs->next());
-    ASSERT_FALSE(disj_docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
+    ASSERT_FALSE(!irs::doc_limits::eof(disj_docs->advance()));
   }
 }
 
@@ -6781,8 +6641,8 @@ TEST(by_phrase_test, boost) {
     irs::ByPhrase q;
     *q.mutable_field_id() = 1;
 
-    auto prepared = q.prepare({.index = irs::SubReader::empty()});
-    ASSERT_EQ(irs::kNoBoost, prepared->Boost());
+    tests::PreparedFilter prepared{q, irs::SubReader::empty()};
+    ASSERT_EQ(irs::kNoBoost, prepared.Query(0)->Boost());
   }
 
   // single term
@@ -6792,8 +6652,8 @@ TEST(by_phrase_test, boost) {
     q.mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
 
-    auto prepared = q.prepare({.index = irs::SubReader::empty()});
-    ASSERT_EQ(irs::kNoBoost, prepared->Boost());
+    tests::PreparedFilter prepared{q, irs::SubReader::empty()};
+    ASSERT_EQ(irs::kNoBoost, prepared.Query(0)->Boost());
   }
 
   // multiple terms
@@ -6805,8 +6665,8 @@ TEST(by_phrase_test, boost) {
     q.mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("brown"));
 
-    auto prepared = q.prepare({.index = irs::SubReader::empty()});
-    ASSERT_EQ(irs::kNoBoost, prepared->Boost());
+    tests::PreparedFilter prepared{q, irs::SubReader::empty()};
+    ASSERT_EQ(irs::kNoBoost, prepared.Query(0)->Boost());
   }
 
   // with boost
@@ -6820,8 +6680,8 @@ TEST(by_phrase_test, boost) {
       *q.mutable_field_id() = 1;
       q.boost(boost);
 
-      auto prepared = q.prepare({.index = irs::SubReader::empty()});
-      ASSERT_EQ(irs::kNoBoost, prepared->Boost());
+      tests::PreparedFilter prepared{q, irs::SubReader::empty()};
+      ASSERT_EQ(irs::kNoBoost, prepared.Query(0)->Boost());
     }
 
     // single term
@@ -6832,11 +6692,9 @@ TEST(by_phrase_test, boost) {
         irs::ViewCast<irs::byte_type>(std::string_view("quick"));
       q.boost(boost);
 
-      auto prepared = q.prepare({
-        .index = irs::SubReader::empty(),
-        .memory = counter,
-      });
-      ASSERT_EQ(boost, prepared->Boost());
+      tests::PreparedFilter prepared{q, irs::SubReader::empty(), nullptr,
+                                     counter};
+      ASSERT_EQ(boost, prepared.Query(0)->Boost());
     }
     EXPECT_EQ(counter.current, 0);
     EXPECT_GT(counter.max, 0);
@@ -6852,8 +6710,8 @@ TEST(by_phrase_test, boost) {
         irs::ViewCast<irs::byte_type>(std::string_view("brown"));
       q.boost(boost);
 
-      auto prepared = q.prepare({.index = irs::SubReader::empty()});
-      ASSERT_EQ(boost, prepared->Boost());
+      tests::PreparedFilter prepared{q, irs::SubReader::empty()};
+      ASSERT_EQ(irs::kNoBoost, prepared.Query(0)->Boost());
     }
 
     // prefix, wildcard, levenshtein, set, range
@@ -6878,8 +6736,8 @@ TEST(by_phrase_test, boost) {
       rt.range.min_type = irs::BoundType::Inclusive;
       rt.range.max_type = irs::BoundType::Inclusive;
 
-      auto prepared = q.prepare({.index = irs::SubReader::empty()});
-      ASSERT_EQ(boost, prepared->Boost());
+      tests::PreparedFilter prepared{q, irs::SubReader::empty()};
+      ASSERT_EQ(irs::kNoBoost, prepared.Query(0)->Boost());
     }
   }
 }
@@ -7203,12 +7061,12 @@ TEST_P(PhraseFilterTestCase, regexp_part_syntax) {
   }
   auto rdr = open_reader();
 
-  auto execute = [&](const irs::ByPhrase& q) {
+  auto execute = [&](std::unique_ptr<irs::ByPhrase> q) {
     std::vector<irs::doc_id_t> out;
-    auto prepared = q.prepare({.index = rdr});
-    for (auto& sub : rdr) {
-      auto docs = prepared->execute({.segment = sub});
-      while (docs->next()) {
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
+    for (size_t i = 0, end = prepared.size(); i < end; ++i) {
+      auto docs = prepared.Execute(i);
+      while (!irs::doc_limits::eof(docs->advance())) {
         out.push_back(docs->value());
       }
     }
@@ -7217,50 +7075,50 @@ TEST_P(PhraseFilterTestCase, regexp_part_syntax) {
 
   // "quick [br]+own" in Perl equals plain phrase "quick brown"
   {
-    irs::ByPhrase ref;
-    *ref.mutable_field_id() = kPhraseAnl;
-    ref.mutable_options()->push_back<irs::ByTermOptions>().term =
+    auto ref = std::make_unique<irs::ByPhrase>();
+    *ref->mutable_field_id() = kPhraseAnl;
+    ref->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
-    ref.mutable_options()->push_back<irs::ByTermOptions>().term =
+    ref->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("brown"));
-    auto expected = execute(ref);
+    auto expected = execute(std::move(ref));
     ASSERT_FALSE(expected.empty());
 
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
-    q.mutable_options()->push_back<irs::ByRegexpOptions>() =
+    q->mutable_options()->push_back<irs::ByRegexpOptions>() =
       irs::ByRegexpOptions{
         irs::ViewCast<irs::byte_type>(std::string_view("[br]+own"))};
-    ASSERT_EQ(expected, execute(q));
+    ASSERT_EQ(expected, execute(std::move(q)));
   }
 
   // "quick \w+" in POSIX matches nothing - \w+ is a parse error
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
-    q.mutable_options()->push_back<irs::ByRegexpOptions>() =
+    q->mutable_options()->push_back<irs::ByRegexpOptions>() =
       irs::ByRegexpOptions{
         irs::ViewCast<irs::byte_type>(std::string_view("\\w+")),
         irs::RegexpSyntax::PosixEre};
 
-    ASSERT_TRUE(execute(q).empty());
+    ASSERT_TRUE(execute(std::move(q)).empty());
   }
 
   // sanity: same "quick \w+" in Perl matches something
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
-    q.mutable_options()->push_back<irs::ByRegexpOptions>() =
+    q->mutable_options()->push_back<irs::ByRegexpOptions>() =
       irs::ByRegexpOptions{
         irs::ViewCast<irs::byte_type>(std::string_view("\\w+"))};
 
-    ASSERT_FALSE(execute(q).empty());
+    ASSERT_FALSE(execute(std::move(q)).empty());
   }
 }
 
@@ -7280,31 +7138,40 @@ TEST_P(PhraseFilterTestCase, sequential_negation_regression) {
   }
   auto rdr = open_reader();
 
-  irs::ByPhrase phrase;
-  *phrase.mutable_field_id() = kPhraseAnl;
-  phrase.mutable_options()->push_back<irs::ByTermOptions>().term =
-    irs::ViewCast<irs::byte_type>(std::string_view("quick"));
-  phrase.mutable_options()->push_back<irs::ByTermOptions>().term =
-    irs::ViewCast<irs::byte_type>(std::string_view("brown"));
+  auto make_phrase = [] {
+    auto phrase = std::make_unique<irs::ByPhrase>();
+    *phrase->mutable_field_id() = kPhraseAnl;
+    phrase->mutable_options()->push_back<irs::ByTermOptions>().term =
+      irs::ViewCast<irs::byte_type>(std::string_view("quick"));
+    phrase->mutable_options()->push_back<irs::ByTermOptions>().term =
+      irs::ViewCast<irs::byte_type>(std::string_view("brown"));
+    return phrase;
+  };
+
+  auto make_not_phrase = [&] {
+    auto not_phrase = std::make_unique<irs::Exclusion>();
+    not_phrase->exclude(make_phrase());
+    irs::Filter::ptr f = std::move(not_phrase);
+    irs::Optimize(f, {});
+    return f;
+  };
 
   auto collect = [&](const irs::Filter& filter) {
     std::vector<irs::doc_id_t> out;
-    auto prepared = filter.prepare({.index = rdr});
-    for (const auto& sub : rdr) {
-      auto docs = prepared->execute({.segment = sub});
-      while (docs->next()) {
+    tests::PreparedFilter prepared{filter, rdr};
+    for (size_t i = 0, end = prepared.size(); i < end; ++i) {
+      auto docs = prepared.Execute(i);
+      while (!irs::doc_limits::eof(docs->advance())) {
         out.push_back(docs->value());
       }
     }
     return out;
   };
 
-  const auto phrase_hits = collect(phrase);
+  const auto phrase_hits = collect(*Lower(make_phrase()));
   ASSERT_FALSE(phrase_hits.empty());
 
-  irs::Not not_phrase;
-  not_phrase.filter<irs::ByPhrase>() = phrase;
-  const auto not_hits = collect(not_phrase);
+  const auto not_hits = collect(*make_not_phrase());
 
   // Complement must be non-empty and disjoint from the positive hits.
   ASSERT_FALSE(not_hits.empty());
@@ -7314,9 +7181,9 @@ TEST_P(PhraseFilterTestCase, sequential_negation_regression) {
 
   // Drive seek() across positive hits too -- that's the path that
   // surfaced the crash from the SQL side via Exclusion::converge.
-  auto prepared = not_phrase.prepare({.index = rdr});
-  for (const auto& sub : rdr) {
-    auto docs = prepared->execute({.segment = sub});
+  tests::PreparedFilter prepared{*make_not_phrase(), rdr};
+  for (size_t i = 0, end = prepared.size(); i < end; ++i) {
+    auto docs = prepared.Execute(i);
     for (auto doc : phrase_hits) {
       const auto target = doc + 1;
       const auto landed = docs->seek(target);
@@ -7373,36 +7240,36 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_two_terms) {
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
     q.mutable_options()->set_slop(1);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -7416,19 +7283,19 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_two_terms) {
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
     q.mutable_options()->set_slop(100);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
     for (auto expected : {"A", "G", "I", "L", "N", "S", "T"}) {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       ASSERT_EQ(expected, irs::tests::ReadStoredStr<std::string_view>(
                             values, docs->value()));
     }
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -7442,19 +7309,19 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_two_terms) {
       irs::ViewCast<irs::byte_type>(std::string_view("moved"));
     q.mutable_options()->set_slop(3);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
     for (auto expected : {"I", "S", "T", "U", "W", "X"}) {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       ASSERT_EQ(expected, irs::tests::ReadStoredStr<std::string_view>(
                             values, docs->value()));
     }
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -7468,22 +7335,22 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_two_terms) {
       irs::ViewCast<irs::byte_type>(std::string_view("moved"));
     q.mutable_options()->set_slop(2);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "W", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -7497,10 +7364,9 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_two_terms) {
       irs::ViewCast<irs::byte_type>(std::string_view("dog"));
     q.mutable_options()->set_slop(1);
 
-    auto prepared = q.prepare({.index = rdr});
-    auto sub = rdr.begin();
-    auto docs = prepared->execute({.segment = *sub});
-    ASSERT_FALSE(docs->next());
+    tests::PreparedFilter prepared{q, rdr};
+    auto docs = prepared.Execute(0);
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -7514,18 +7380,18 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_two_terms) {
       irs::ViewCast<irs::byte_type>(std::string_view("dog"));
     q.mutable_options()->set_slop(5);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -7539,10 +7405,9 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_two_terms) {
       irs::ViewCast<irs::byte_type>(std::string_view("dog"));
     q.mutable_options()->set_slop(4);
 
-    auto prepared = q.prepare({.index = rdr});
-    auto sub = rdr.begin();
-    auto docs = prepared->execute({.segment = *sub});
-    ASSERT_FALSE(docs->next());
+    tests::PreparedFilter prepared{q, rdr};
+    auto docs = prepared.Execute(0);
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -7556,18 +7421,18 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_two_terms) {
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
     q.mutable_options()->set_slop(0);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -7581,18 +7446,18 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_two_terms) {
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
     q.mutable_options()->set_slop(4);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -7606,18 +7471,18 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_two_terms) {
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
     q.mutable_options()->set_slop(0);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 }
@@ -7642,19 +7507,19 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_reversal) {
       irs::ViewCast<irs::byte_type>(std::string_view("brown"));
     q.mutable_options()->set_slop(2);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
     for (auto expected : {"A", "G", "I", "L", "S", "T"}) {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       ASSERT_EQ(expected, irs::tests::ReadStoredStr<std::string_view>(
                             values, docs->value()));
     }
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -7668,22 +7533,22 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_reversal) {
       irs::ViewCast<irs::byte_type>(std::string_view("brown"));
     q.mutable_options()->set_slop(1);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -7697,22 +7562,22 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_reversal) {
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
     q.mutable_options()->set_slop(2);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "L", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 }
@@ -7739,19 +7604,19 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_three_terms) {
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
     q.mutable_options()->set_slop(1);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
     for (auto expected : {"A", "G", "I", "S"}) {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       ASSERT_EQ(expected, irs::tests::ReadStoredStr<std::string_view>(
                             values, docs->value()));
     }
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -7767,18 +7632,18 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_three_terms) {
       irs::ViewCast<irs::byte_type>(std::string_view("moved"));
     q.mutable_options()->set_slop(1);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -7794,19 +7659,19 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_three_terms) {
       irs::ViewCast<irs::byte_type>(std::string_view("moved"));
     q.mutable_options()->set_slop(2);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
     for (auto expected : {"I", "S", "T"}) {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       ASSERT_EQ(expected, irs::tests::ReadStoredStr<std::string_view>(
                             values, docs->value()));
     }
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -7822,10 +7687,9 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_three_terms) {
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
     q.mutable_options()->set_slop(2);
 
-    auto prepared = q.prepare({.index = rdr});
-    auto sub = rdr.begin();
-    auto docs = prepared->execute({.segment = *sub});
-    ASSERT_FALSE(docs->next());
+    tests::PreparedFilter prepared{q, rdr};
+    auto docs = prepared.Execute(0);
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -7841,19 +7705,19 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_three_terms) {
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
     q.mutable_options()->set_slop(4);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
     for (auto expected : {"A", "G", "I", "L"}) {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       ASSERT_EQ(expected, irs::tests::ReadStoredStr<std::string_view>(
                             values, docs->value()));
     }
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -7869,19 +7733,19 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_three_terms) {
       irs::ViewCast<irs::byte_type>(std::string_view("quick"));
     q.mutable_options()->set_slop(4);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
     for (auto expected : {"A", "G", "I", "L", "T"}) {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       ASSERT_EQ(expected, irs::tests::ReadStoredStr<std::string_view>(
                             values, docs->value()));
     }
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 }
@@ -7910,18 +7774,18 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_four_terms) {
       irs::ViewCast<irs::byte_type>(std::string_view("jumps"));
     q.mutable_options()->set_slop(0);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -7939,22 +7803,22 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_four_terms) {
       irs::ViewCast<irs::byte_type>(std::string_view("moved"));
     q.mutable_options()->set_slop(1);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 }
@@ -7980,48 +7844,48 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_prefix_and_wildcard) {
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
     q.mutable_options()->set_slop(1);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
     for (auto expected : {"A", "G", "I", "N", "S", "T", "V"}) {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       ASSERT_EQ(expected, irs::tests::ReadStoredStr<std::string_view>(
                             values, docs->value()));
     }
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // "fo% bro%" slop=2: fo% -> fox/forward, bro% -> brown/brother.
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByWildcardOptions>() =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByWildcardOptions>() =
       irs::ByWildcardOptions{
         irs::ViewCast<irs::byte_type>(std::string_view("fo%"))};
-    q.mutable_options()->push_back<irs::ByWildcardOptions>() =
+    q->mutable_options()->push_back<irs::ByWildcardOptions>() =
       irs::ByWildcardOptions{
         irs::ViewCast<irs::byte_type>(std::string_view("bro%"))};
-    q.mutable_options()->set_slop(2);
+    q->mutable_options()->set_slop(2);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
     for (auto expected :
          {"A", "G", "I", "L", "S", "T", "U", "V", "W", "X", "Y"}) {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       ASSERT_EQ(expected, irs::tests::ReadStoredStr<std::string_view>(
                             values, docs->value()));
     }
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 }
@@ -8039,73 +7903,72 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_variadic) {
   // levenshtein("qoick",1) + "fox" slop=1: matches quick.
   // A,G,I,T: d=1. N: d=0.
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& lt = q.mutable_options()->push_back<irs::ByEditDistanceOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& lt = q->mutable_options()->push_back<irs::ByEditDistanceOptions>();
     lt.max_distance = 1;
     lt.term = irs::ViewCast<irs::byte_type>(std::string_view("qoick"));
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
-    q.mutable_options()->set_slop(1);
+    q->mutable_options()->set_slop(1);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
     for (auto expected : {"A", "G", "I", "N", "T"}) {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       ASSERT_EQ(expected, irs::tests::ReadStoredStr<std::string_view>(
                             values, docs->value()));
     }
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // prefix("qui") + wildcard("f%x") slop=1.
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    auto& pt = q.mutable_options()->push_back<irs::ByPrefixOptions>();
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    auto& pt = q->mutable_options()->push_back<irs::ByPrefixOptions>();
     pt.term = irs::ViewCast<irs::byte_type>(std::string_view("qui"));
-    q.mutable_options()->push_back<irs::ByWildcardOptions>() =
+    q->mutable_options()->push_back<irs::ByWildcardOptions>() =
       irs::ByWildcardOptions{
         irs::ViewCast<irs::byte_type>(std::string_view("f%x"))};
-    q.mutable_options()->set_slop(1);
+    q->mutable_options()->set_slop(1);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
     for (auto expected : {"A", "G", "I", "N", "S", "T", "V"}) {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       ASSERT_EQ(expected, irs::tests::ReadStoredStr<std::string_view>(
                             values, docs->value()));
     }
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
   // "bro% dog" slop=1: only A has dog, d=5. No match.
   {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kPhraseAnl;
-    q.mutable_options()->push_back<irs::ByWildcardOptions>() =
+    auto q = std::make_unique<irs::ByPhrase>();
+    *q->mutable_field_id() = kPhraseAnl;
+    q->mutable_options()->push_back<irs::ByWildcardOptions>() =
       irs::ByWildcardOptions{
         irs::ViewCast<irs::byte_type>(std::string_view("bro%"))};
-    q.mutable_options()->push_back<irs::ByTermOptions>().term =
+    q->mutable_options()->push_back<irs::ByTermOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("dog"));
-    q.mutable_options()->set_slop(1);
+    q->mutable_options()->set_slop(1);
 
-    auto prepared = q.prepare({.index = rdr});
-    auto sub = rdr.begin();
-    auto docs = prepared->execute({.segment = *sub});
-    ASSERT_FALSE(docs->next());
+    tests::PreparedFilter prepared{*Lower(std::move(q)), rdr};
+    auto docs = prepared.Execute(0);
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -8122,22 +7985,22 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_variadic) {
       irs::ViewCast<irs::byte_type>(std::string_view("x2"));
     q.mutable_options()->set_slop(1);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X3", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "X4", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 }
@@ -8162,19 +8025,19 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_edge_cases) {
       irs::ViewCast<irs::byte_type>(std::string_view("brown"));
     q.mutable_options()->set_slop(0);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
     for (auto expected : {"A", "G", "I", "U"}) {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       ASSERT_EQ(expected, irs::tests::ReadStoredStr<std::string_view>(
                             values, docs->value()));
     }
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -8187,19 +8050,19 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_edge_cases) {
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
     q.mutable_options()->set_slop(5);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
     for (auto expected : {"A", "G", "I", "K", "L", "N", "S", "T", "V"}) {
-      ASSERT_TRUE(docs->next());
+      ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
       ASSERT_EQ(expected, irs::tests::ReadStoredStr<std::string_view>(
                             values, docs->value()));
     }
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -8210,9 +8073,8 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_edge_cases) {
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
     q.mutable_options()->set_slop(5);
 
-    auto prepared = q.prepare({.index = rdr});
-    auto sub = rdr.begin();
-    auto docs = prepared->execute({.segment = *sub});
+    tests::PreparedFilter prepared{q, rdr};
+    auto docs = prepared.Execute(0);
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -8222,9 +8084,8 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_edge_cases) {
     *q.mutable_field_id() = kPhraseAnl;
     q.mutable_options()->set_slop(5);
 
-    auto prepared = q.prepare({.index = rdr});
-    auto sub = rdr.begin();
-    auto docs = prepared->execute({.segment = *sub});
+    tests::PreparedFilter prepared{q, rdr};
+    auto docs = prepared.Execute(0);
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -8238,9 +8099,8 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_edge_cases) {
       irs::ViewCast<irs::byte_type>(std::string_view("zzzznotexist"));
     q.mutable_options()->set_slop(100);
 
-    auto prepared = q.prepare({.index = rdr});
-    auto sub = rdr.begin();
-    auto docs = prepared->execute({.segment = *sub});
+    tests::PreparedFilter prepared{q, rdr};
+    auto docs = prepared.Execute(0);
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 }
@@ -8267,20 +8127,20 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_explicit_gap) {
       irs::ViewCast<irs::byte_type>(std::string_view("moved"));
     q.mutable_options()->set_slop(0);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "W", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
@@ -8294,22 +8154,22 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_explicit_gap) {
       irs::ViewCast<irs::byte_type>(std::string_view("moved"));
     q.mutable_options()->set_slop(1);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "W", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 }
@@ -8340,53 +8200,46 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_scoring) {
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
     q.mutable_options()->set_slop(3);
 
-    auto prepared = q.prepare({
-      .index = rdr,
-      .scorer = &sort,
-    });
-    auto sub = rdr.begin();
+    tests::PreparedFilter prepared{q, rdr, &sort};
 
-    auto docs = prepared->execute({
-      .segment = *sub,
-      .scorer = &sort,
-    });
+    auto docs = prepared.Execute(0);
     auto* freq = irs::get<irs::FreqBlockAttr>(*docs);
     ASSERT_TRUE(freq);
     auto* boost_attr = irs::get<irs::BoostBlockAttr>(*docs);
     ASSERT_TRUE(boost_attr);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
 
     // L: reversal, freq=1
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
 
     // N: freq=8, best_distance=0, boost=1.0
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(8, freq->value[0]);
     ASSERT_FLOAT_EQ(1.f, boost_attr->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(1, freq->value[0]);
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 }
@@ -8411,43 +8264,43 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_seek_interleave) {
       irs::ViewCast<irs::byte_type>(std::string_view("brown"));
     q.mutable_options()->set_slop(1);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto sub = rdr.begin();
     const auto* column = sub->Column(kName);
     ASSERT_NE(nullptr, column);
     irs::tests::BlobPointReader values{*sub, *column};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_FALSE(irs::doc_limits::valid(docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    auto docs_seek = prepared->execute({.segment = *sub});
+    auto docs_seek = prepared.Execute(0);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
     auto sought = docs_seek->seek(docs->value());
     ASSERT_EQ(docs->value(), sought);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "U", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
 
     ASSERT_TRUE(irs::doc_limits::eof(docs_seek->seek(irs::doc_limits::eof())));
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 }
@@ -8472,10 +8325,9 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_count) {
       irs::ViewCast<irs::byte_type>(std::string_view("brown"));
     q.mutable_options()->set_slop(1);
 
-    auto prepared = q.prepare({.index = rdr});
-    auto sub = rdr.begin();
+    tests::PreparedFilter prepared{q, rdr};
 
-    auto docs = prepared->execute({.segment = *sub});
+    auto docs = prepared.Execute(0);
     ASSERT_EQ(5, docs->count());
   }
 }
@@ -8508,7 +8360,7 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_two_segments) {
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
     q.mutable_options()->set_slop(1);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
 
     uint32_t total = 0;
     for (auto sub = rdr.begin(); sub != rdr.end(); ++sub) {
@@ -8516,9 +8368,9 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_two_segments) {
       ASSERT_NE(nullptr, column);
       irs::tests::BlobPointReader values{*sub, *column};
 
-      auto docs = prepared->execute({.segment = *sub});
+      auto docs = prepared.Execute(0);
 
-      while (docs->next()) {
+      while (!irs::doc_limits::eof(docs->advance())) {
         auto name =
           irs::tests::ReadStoredStr<std::string_view>(values, docs->value());
         ASSERT_TRUE(name == "A" || name == "G" || name == "I" || name == "S")
@@ -8555,16 +8407,10 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_variadic_scoring) {
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
     q.mutable_options()->set_slop(1);
 
-    auto prepared = q.prepare({
-      .index = rdr,
-      .scorer = &sort,
-    });
+    tests::PreparedFilter prepared{q, rdr, &sort};
     auto sub = rdr.begin();
 
-    auto docs = prepared->execute({
-      .segment = *sub,
-      .scorer = &sort,
-    });
+    auto docs = prepared.Execute(0);
     auto* freq = irs::get<irs::FreqBlockAttr>(*docs);
     ASSERT_TRUE(freq);
     auto* boost_attr = irs::get<irs::BoostBlockAttr>(*docs);
@@ -8575,28 +8421,28 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_variadic_scoring) {
     irs::tests::BlobPointReader values{*sub, *column};
 
     // A: qui*=1(quick), fox=3, d=1, freq=1
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(1, freq->value[0]);
 
     // G: qui*=5(quick), fox=7, d=1, freq=1
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(1, freq->value[0]);
 
     // I: qui*=1(quick), fox=3, d=1, freq=1
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(
       "I", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(1, freq->value[0]);
 
     // N: multiple combos, best d=0, boost=1.0
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
@@ -8605,27 +8451,27 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_variadic_scoring) {
 
     // S: qui*=[1,2](quick,quilt), fox=[4].
     // quilt=2,fox=4 d=1. quick=1,fox=4 d=2>1. freq=1.
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(
       "S", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(1, freq->value[0]);
 
     // T: qui*=1(quick), fox=3, d=1, freq=1
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(
       "T", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(1, freq->value[0]);
 
     // V: qui*=1(quilt), fox=3, d=1, freq=1
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     docs->FetchScoreArgs(0);
     ASSERT_EQ(
       "V", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_EQ(1, freq->value[0]);
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 }
@@ -8651,9 +8497,9 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_execute_with_offsets) {
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
     q.mutable_options()->set_slop(1);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto* phrase_query =
-      dynamic_cast<const irs::FixedPhraseQuery*>(prepared.get());
+      dynamic_cast<const irs::FixedPhraseQuery*>(prepared.Query(0));
     ASSERT_NE(nullptr, phrase_query);
 
     auto sub = rdr.begin();
@@ -8670,7 +8516,7 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_execute_with_offsets) {
     irs::tests::BlobPointReader values{*sub, *column};
 
     // A
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_TRUE(pos->next());
@@ -8679,7 +8525,7 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_execute_with_offsets) {
     ASSERT_FALSE(pos->next());  // exhaust, resets for next doc
 
     // G
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_TRUE(pos->next());
@@ -8687,14 +8533,14 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_execute_with_offsets) {
     ASSERT_FALSE(pos->next());
 
     // I
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(pos->next());
     ASSERT_GT(offs->end, offs->start);
     ASSERT_FALSE(pos->next());
 
     // N: freq=2. Tuples: (6,8) cost=1 leftmost=6, (7,8) cost=0 leftmost=7.
     // Sorted by leftmost ascending: (6,8) first, (7,8) second.
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "N", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_TRUE(pos->next());  // first match
@@ -8704,12 +8550,12 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_execute_with_offsets) {
     ASSERT_FALSE(pos->next());  // exhausted
 
     // T
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(pos->next());
     ASSERT_GT(offs->end, offs->start);
     ASSERT_FALSE(pos->next());
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 }
@@ -8735,9 +8581,9 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_variadic_execute_with_offsets) {
       irs::ViewCast<irs::byte_type>(std::string_view("fox"));
     q.mutable_options()->set_slop(1);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto* phrase_query =
-      dynamic_cast<const irs::VariadicPhraseQuery*>(prepared.get());
+      dynamic_cast<const irs::VariadicPhraseQuery*>(prepared.Query(0));
     ASSERT_NE(nullptr, phrase_query);
 
     auto sub = rdr.begin();
@@ -8754,7 +8600,7 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_variadic_execute_with_offsets) {
     irs::tests::BlobPointReader values{*sub, *column};
 
     // A: "quick brown fox ..." -> start=0 (quick), end=15 (fox)
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "A", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_TRUE(pos->next());
@@ -8763,7 +8609,7 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_variadic_execute_with_offsets) {
     ASSERT_FALSE(pos->next());
 
     // G
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_EQ(
       "G", irs::tests::ReadStoredStr<std::string_view>(values, docs->value()));
     ASSERT_TRUE(pos->next());
@@ -8771,13 +8617,13 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_variadic_execute_with_offsets) {
     ASSERT_FALSE(pos->next());
 
     // I
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(pos->next());
     ASSERT_GT(offs->end, offs->start);
     ASSERT_FALSE(pos->next());
 
     // N: freq=2 (tuples (6,8) cost=1, (7,8) cost=0; sorted by leftmost)
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(pos->next());  // first match
     ASSERT_GT(offs->end, offs->start);
     ASSERT_TRUE(pos->next());  // second match
@@ -8785,24 +8631,24 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_variadic_execute_with_offsets) {
     ASSERT_FALSE(pos->next());  // exhausted
 
     // S
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(pos->next());
     ASSERT_GT(offs->end, offs->start);
     ASSERT_FALSE(pos->next());
 
     // T
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(pos->next());
     ASSERT_GT(offs->end, offs->start);
     ASSERT_FALSE(pos->next());
 
     // V
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(pos->next());
     ASSERT_GT(offs->end, offs->start);
     ASSERT_FALSE(pos->next());
 
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 }
@@ -8912,11 +8758,11 @@ size_t MatchCount(const irs::IndexReader& rdr, irs::field_id field,
     irs::ViewCast<irs::byte_type>(t1);
   q.mutable_options()->set_slop(slop);
 
-  auto prepared = q.prepare({.index = rdr});
+  tests::PreparedFilter prepared{q, rdr};
   size_t count = 0;
   for (auto sub = rdr.begin(); sub != rdr.end(); ++sub) {
-    auto docs = prepared->execute({.segment = *sub});
-    while (docs->next()) {
+    auto docs = prepared.Execute(0);
+    while (!irs::doc_limits::eof(docs->advance())) {
       ++count;
     }
   }
@@ -8969,9 +8815,9 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_overlap_same_position_with_offsets) {
     irs::ViewCast<irs::byte_type>(std::string_view("bar"));
   q.mutable_options()->set_slop(1);
 
-  auto prepared = q.prepare({.index = rdr});
+  tests::PreparedFilter prepared{q, rdr};
   auto* phrase_query =
-    dynamic_cast<const irs::FixedPhraseQuery*>(prepared.get());
+    dynamic_cast<const irs::FixedPhraseQuery*>(prepared.Query(0));
   ASSERT_NE(nullptr, phrase_query);
 
   auto sub = rdr.begin();
@@ -8982,14 +8828,14 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_overlap_same_position_with_offsets) {
   auto* offs = irs::get<irs::OffsAttr>(*pos);
   ASSERT_NE(nullptr, offs);
 
-  ASSERT_TRUE(docs->next());
+  ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
   ASSERT_TRUE(pos->next())
     << "matcher freq says a match exists, offsets enumeration dropped it";
   // foo@P and bar@P both originate from the single source token "foo",
   // so the single match spans exactly that token.
   EXPECT_LT(offs->start, offs->end);
   EXPECT_FALSE(pos->next());
-  ASSERT_FALSE(docs->next());
+  ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
 }
 
 namespace tests {
@@ -9147,11 +8993,11 @@ size_t MatchCount3(const irs::IndexReader& rdr, irs::field_id field,
     irs::ViewCast<irs::byte_type>(t2);
   q.mutable_options()->set_slop(slop);
 
-  auto prepared = q.prepare({.index = rdr});
+  tests::PreparedFilter prepared{q, rdr};
   size_t count = 0;
   for (auto sub = rdr.begin(); sub != rdr.end(); ++sub) {
-    auto docs = prepared->execute({.segment = *sub});
-    while (docs->next()) {
+    auto docs = prepared.Execute(0);
+    while (!irs::doc_limits::eof(docs->advance())) {
       ++count;
     }
   }
@@ -9206,9 +9052,9 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_repeat_same_position_with_offsets) {
       irs::ViewCast<irs::byte_type>(std::string_view("foo"));
     q.mutable_options()->set_slop(slop);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto* phrase_query =
-      dynamic_cast<const irs::FixedPhraseQuery*>(prepared.get());
+      dynamic_cast<const irs::FixedPhraseQuery*>(prepared.Query(0));
     ASSERT_NE(nullptr, phrase_query);
 
     auto sub = rdr.begin();
@@ -9219,7 +9065,7 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_repeat_same_position_with_offsets) {
     auto* offs = irs::get<irs::OffsAttr>(*pos);
     ASSERT_NE(nullptr, offs);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     size_t matches = 0;
     while (pos->next()) {
       EXPECT_EQ(0u, offs->start);
@@ -9227,7 +9073,7 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_repeat_same_position_with_offsets) {
       ++matches;
     }
     EXPECT_EQ(want_matches, matches);
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
   };
 
   run(1, 1);
@@ -9302,11 +9148,11 @@ size_t PrefixPhraseMatchCount(const irs::IndexReader& rdr, irs::field_id field,
     irs::ViewCast<irs::byte_type>(p1);
   q.mutable_options()->set_slop(slop);
 
-  auto prepared = q.prepare({.index = rdr});
+  tests::PreparedFilter prepared{q, rdr};
   size_t count = 0;
   for (auto sub = rdr.begin(); sub != rdr.end(); ++sub) {
-    auto docs = prepared->execute({.segment = *sub});
-    while (docs->next()) {
+    auto docs = prepared.Execute(0);
+    while (!irs::doc_limits::eof(docs->advance())) {
       ++count;
     }
   }
@@ -9329,10 +9175,10 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_variadic_overlap_same_position) {
     *q.mutable_field_id() = kPhraseAnl;
     q.mutable_options()->push_back<irs::ByPrefixOptions>().term =
       irs::ViewCast<irs::byte_type>(std::string_view("fo"));
-    auto prepared = q.prepare({.index = rdr});
-    auto sub = rdr.begin();
-    auto docs = prepared->execute({.segment = *sub});
-    EXPECT_TRUE(docs->next()) << "single fo* slot should match foo/fooa";
+    tests::PreparedFilter prepared{q, rdr};
+    auto docs = prepared.Execute(0);
+    EXPECT_TRUE(!irs::doc_limits::eof(docs->advance()))
+      << "single fo* slot should match foo/fooa";
   }
 
   for (const irs::PosAttr::value_t slop : {0u, 1u, 2u, 5u}) {
@@ -9415,11 +9261,11 @@ size_t TermsPhraseMatchCount(
   }
   q.mutable_options()->set_slop(slop);
 
-  auto prepared = q.prepare({.index = rdr});
+  tests::PreparedFilter prepared{q, rdr};
   size_t count = 0;
   for (auto sub = rdr.begin(); sub != rdr.end(); ++sub) {
-    auto docs = prepared->execute({.segment = *sub});
-    while (docs->next()) {
+    auto docs = prepared.Execute(0);
+    while (!irs::doc_limits::eof(docs->advance())) {
       ++count;
     }
   }
@@ -9507,9 +9353,9 @@ TEST_P(PhraseFilterTestCase,
     }
     q.mutable_options()->set_slop(slop);
 
-    auto prepared = q.prepare({.index = rdr});
+    tests::PreparedFilter prepared{q, rdr};
     auto* phrase_query =
-      dynamic_cast<const irs::VariadicPhraseQuery*>(prepared.get());
+      dynamic_cast<const irs::VariadicPhraseQuery*>(prepared.Query(0));
     ASSERT_NE(nullptr, phrase_query);
 
     auto sub = rdr.begin();
@@ -9520,7 +9366,7 @@ TEST_P(PhraseFilterTestCase,
     auto* offs = irs::get<irs::OffsAttr>(*pos);
     ASSERT_NE(nullptr, offs);
 
-    ASSERT_TRUE(docs->next());
+    ASSERT_TRUE(!irs::doc_limits::eof(docs->advance()));
     size_t matches = 0;
     while (pos->next()) {
       EXPECT_EQ(want_start, offs->start);
@@ -9528,7 +9374,7 @@ TEST_P(PhraseFilterTestCase,
       ++matches;
     }
     EXPECT_EQ(want_matches, matches);
-    ASSERT_FALSE(docs->next());
+    ASSERT_FALSE(!irs::doc_limits::eof(docs->advance()));
   };
 
   // n == 2 join path: single (aa@1, cc@1) pair; positions tie, phrase

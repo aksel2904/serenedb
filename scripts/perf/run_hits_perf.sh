@@ -69,7 +69,7 @@ rm -f "${NATIVE_DB}" "${NATIVE_DB}.wal"
 
 echo "starting ${SERENED_BIN} on port ${PORT} with data dir ${SERENED_DATA_DIR}"
 "${SERENED_BIN}" "${SERENED_DATA_DIR}" \
-	--server_endpoints "pgsql+tcp://0.0.0.0:${PORT}" \
+	--listen "postgres://0.0.0.0:${PORT}" \
 	>"${LOG}" 2>&1 &
 SERENED_PID=$!
 trap "kill -9 ${SERENED_PID} >/dev/null 2>&1 || true" EXIT
@@ -172,7 +172,7 @@ NDB_SQL_PATH=$(printf '%s' "${NATIVE_DB}" | sed "s/'/''/g")
 # table (in `native_db.main`). search_path puts `public` first so unqualified
 # CREATE/INSERT keeps landing in serened's catalog; native_db is second so
 # bare references like `hits_native` still resolve. Native CREATE TABLE is
-# explicitly qualified (matches the iceberg.test_slow convention).
+# explicitly qualified (matches the catalog_iceberg.test_slow convention).
 run_setup "attach_native_db" "${BUILD_THREADS}" "
 ATTACH '${NDB_SQL_PATH}' AS native_db (TYPE duckdb, STORAGE_VERSION latest);
 SET search_path TO public, native_db.main;
@@ -252,14 +252,14 @@ run_sql "create_text_search_dict (${PERF_DICT_TEMPLATE})" "${BUILD_THREADS}" "${
 
 # Every column (including Title itself) goes into INCLUDE so the .cs storage
 # and the create_index timing are directly comparable to native_db.hits_native
-# (which always materializes every column). Pull the list from DuckDB's
-# duckdb_columns() table function -- information_schema.columns is empty for
-# read_parquet-backed views in serened today. quote each name so quoted
-# CamelCase identifiers match the case-insensitive column resolver.
+# (which always materializes every column). Derive the list from `DESCRIBE`:
+# both information_schema.columns and duckdb_columns() are empty for a
+# read_parquet-backed view in serened today, but DESCRIBE enumerates them.
+# quote each name so quoted CamelCase identifiers match the case-insensitive
+# column resolver.
 INCLUDE_LIST=$(psql "${PSQL_CONN}" -At -v ON_ERROR_STOP=1 -X -c "
-SELECT string_agg('\"' || column_name || '\"', ', ' ORDER BY column_index)
-FROM duckdb_columns()
-WHERE table_name = 'hits_view';
+SELECT string_agg('\"' || column_name || '\"', ', ')
+FROM (DESCRIBE hits_view);
 ")
 if [[ -z "${INCLUDE_LIST}" ]]; then
 	echo "failed to derive INCLUDE column list from hits_view" >&2

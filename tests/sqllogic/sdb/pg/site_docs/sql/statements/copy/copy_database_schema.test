@@ -1,0 +1,35 @@
+control substitution on
+
+# DOCS_TEST: example_038
+
+statement ok
+USE $__DATABASE__;
+
+statement ok
+DETACH IF EXISTS db31;
+
+statement ok
+DETACH IF EXISTS db32;
+
+statement ok
+ATTACH ':memory:' AS db31;
+
+statement ok
+ATTACH ':memory:' AS db32;
+
+statement ok
+CREATE TABLE db31.tbl AS SELECT 42 AS x, 3 AS y;
+
+statement ok
+CREATE MACRO db31.two_x_plus_y(x, y) AS 2 * x + y;
+
+# DOCS_TEST_BODY
+
+statement ok
+COPY FROM DATABASE db31 TO db32 (SCHEMA);
+
+statement ok
+DETACH IF EXISTS db31;
+
+statement ok
+DETACH IF EXISTS db32;

@@ -28,12 +28,18 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 
 cd "$SCRIPT_DIR"
 
-export RETRY_ATTEMPTS=10
-export BACKOFF_DURATION=500ms
+export RETRY_ATTEMPTS="${RETRY_ATTEMPTS:-10}"
+export BACKOFF_DURATION="${BACKOFF_DURATION:-500ms}"
+
+# Per-worker listen-port ranges: [BASE + id*PER, BASE + (id+1)*PER). With the
+# defaults, 256 workers stay below the ephemeral range (32768+).
+: "${RECOVERY_PORT_BASE:=16000}"
+: "${RECOVERY_PORTS_PER_WORKER:=64}"
 
 # --- Parse arguments ---
 
 RUNNER_ARGS=()
+EXPLICIT_TESTS=()
 FAST=${SKIP_SLOW_TESTS:-false}
 
 while [[ $# -gt 0 ]]; do
@@ -50,9 +56,15 @@ while [[ $# -gt 0 ]]; do
 		FAST=true
 		shift
 		;;
+	*.test | *.test_slow)
+		EXPLICIT_TESTS+=("$1")
+		shift
+		;;
 	*)
-		echo "Unknown option: $1" >&2
-		exit 1
+		# Anything else is forwarded to run.sh (e.g. --override to regenerate
+		# expected output in place).
+		RUNNER_ARGS+=("$1")
+		shift
 		;;
 	esac
 done
@@ -64,9 +76,13 @@ declare -a find_args=(recovery/ -type f \( -name "*.test" -o -name "*.test_slow"
 if [[ "$FAST" == "true" ]]; then
 	find_args=(recovery/ -type f -name "*.test")
 fi
-while IFS= read -r -d '' file; do
-	test_files+=("${file#./}")
-done < <(find "${find_args[@]}" -print0 | sort -z)
+if [[ ${#EXPLICIT_TESTS[@]} -gt 0 ]]; then
+	test_files=("${EXPLICIT_TESTS[@]}")
+else
+	while IFS= read -r -d '' file; do
+		test_files+=("${file#./}")
+	done < <(find "${find_args[@]}" -print0 | sort -z)
+fi
 
 if [[ ${#test_files[@]} -eq 0 ]]; then
 	echo "No test files found in recovery/ directory"
@@ -145,11 +161,25 @@ SQLLOGIC_RUNNER="${RUNNER_ARGS[1]:-$(realpath "$SCRIPT_DIR/../../third_party/sql
 SQLLOGIC_TARGET="${CARGO_TARGET_DIR:-$(realpath "$SCRIPT_DIR/../../.cache/cargo-target")}"
 mkdir -p "$SQLLOGIC_TARGET"
 echo "Pre-building sqllogictest..."
-cargo build --manifest-path "$SQLLOGIC_RUNNER/sqllogictest-bin/Cargo.toml" \
-	--target-dir "$SQLLOGIC_TARGET" --release --quiet || {
-	echo "ERROR: failed to pre-build sqllogictest"
-	exit 1
-}
+# cargo's crates.io fetch flakes intermittently on the CI runners (HTTP/2
+# framing errors, "unable to update registry"). It's transient, so retry a
+# few times before giving up instead of failing the whole suite.
+build_exit_code=0
+build_attempts="${SDB_SQLLOGIC_BUILD_ATTEMPTS:-3}"
+for attempt in $(seq 1 "$build_attempts"); do
+	cargo build --manifest-path "$SQLLOGIC_RUNNER/sqllogictest-bin/Cargo.toml" \
+		--target-dir "$SQLLOGIC_TARGET" --release --quiet
+	build_exit_code=$?
+	[[ $build_exit_code == 0 ]] && break
+	if [[ $attempt -lt $build_attempts ]]; then
+		echo "sqllogictest build failed (exit $build_exit_code); attempt $attempt/$build_attempts, retrying in 10s..." >&2
+		sleep 10
+	fi
+done
+if [[ $build_exit_code != 0 ]]; then
+	echo "ERROR: failed to pre-build sqllogictest after $build_attempts attempt(s)" >&2
+	exit $build_exit_code
+fi
 export SDB_SKIP_SQLLOGIC_BUILD=1
 
 # Start a fresh serened instance (restart loop + empty datadir) and wait for
@@ -174,6 +204,16 @@ start_fresh_serened() {
 		if ! kill -0 "$pid" 2>/dev/null; then
 			echo "  ERROR: worker $worker_id loop (pid $pid) died before port was up"
 			return 1
+		fi
+		# The kernel-assigned port can be grabbed by another worker between our
+		# probe and serened's bind (the probe socket is closed before serened
+		# reopens it). serened then loops on "Address already in use"; abandon
+		# this port and let the caller retry on a fresh one. The datadir is
+		# still empty, so nothing is lost. Checked before the connect() probe so
+		# we don't latch onto the colliding worker's serened by mistake.
+		if grep -q "Address already in use" "$log_file" 2>/dev/null; then
+			echo "  worker $worker_id port $port already in use, retrying on a fresh port"
+			return 2
 		fi
 		if python3 -c "import socket,sys; s=socket.socket(); s.settimeout(1); s.connect(('localhost',$port)); s.close()" 2>/dev/null; then
 			echo "  worker $worker_id serened ready in $(awk "BEGIN{printf \"%.1f\", $(date +%s.%N) - $start_ts}")s"
@@ -247,42 +287,63 @@ run_worker() {
 	local failures_file="$SERENED_LOG_DIR/failures-w${worker_id}.txt"
 	: >"$failures_file"
 
+	local port_seq=0
 	local test_idx=0
 	local test_file
 	while test_file=$(pop_test); do
 		[[ -z "$test_file" ]] && continue
 
-		# One serened per test: fresh datadir, fresh port, fresh process.
-		# Ask the kernel for a free port each time. Fixed port schemes collide
-		# with other developers' docker containers, IDE servers, etc.
-		local test_port
-		test_port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("",0)); print(s.getsockname()[1]); s.close()')
 		local serened_log="$SERENED_LOG_DIR/worker-${worker_id}-test-${test_idx}.log"
 		echo "$test_file" >"$serened_log.test"
-		local pid="" datadir=""
+		local pid="" datadir="" test_port="" run_port=""
 
 		echo
 		echo "========================================================================"
-		echo "[worker $worker_id] RUN  $test_file  (port $test_port, log $serened_log)"
+		echo "[worker $worker_id] RUN  $test_file  (log $serened_log)"
 		echo "========================================================================"
 
-		local run_port=$test_port
 		if [[ "$EXTERNAL_MODE" == "true" ]]; then
 			run_port=$port
 		else
-			if ! start_fresh_serened "$worker_id" "$test_port" "$serened_log" pid datadir; then
+			# One serened per test: fresh datadir, fresh port, fresh process.
+			# Ports come from a per-worker range below the ephemeral range
+			# (net.ipv4.ip_local_port_range starts at 32768). Kernel-assigned
+			# ports are ephemeral, so during a recovery test's crash-restart
+			# gap the port could be handed to another process as an outbound
+			# source port (or re-picked by another worker), leaving the
+			# restarted serened unable to bind for minutes with the test's
+			# database served by nobody. Disjoint ranges make that impossible
+			# within a run; anything squatting a port locally (IDE servers,
+			# other containers) is skipped by the in-use retry below.
+			local started=false start_attempt
+			for ((start_attempt = 0; start_attempt < 10; start_attempt++)); do
+				test_port=$((RECOVERY_PORT_BASE + worker_id * RECOVERY_PORTS_PER_WORKER + port_seq))
+				port_seq=$(((port_seq + 1) % RECOVERY_PORTS_PER_WORKER))
+				start_fresh_serened "$worker_id" "$test_port" "$serened_log" pid datadir
+				local rc=$?
+				if [[ $rc -eq 0 ]]; then
+					started=true
+					break
+				fi
+				# Reap the failed loop + datadir before retrying or giving up.
+				stop_serened "$pid"
+				[[ -n "$datadir" ]] && rm -rf "$datadir"
+				pid="" datadir=""
+				# rc 2 == port collision: retry with a new port. Anything else
+				# is a real startup failure -- stop retrying.
+				[[ $rc -ne 2 ]] && break
+			done
+			if [[ "$started" != "true" ]]; then
 				echo "[worker $worker_id] FAIL $test_file (serened did not start)"
 				echo "--- serened log ---"
 				sed "s/^/[srvd] /" "$serened_log"
 				echo "--- end serened log ---"
 				echo "$test_file" >>"$failures_file"
-				# A partial start still created a loop process + datadir; reap both.
-				stop_serened "$pid"
-				[[ -n "$datadir" ]] && rm -rf "$datadir"
 				worker_exit=1
 				test_idx=$((test_idx + 1))
 				continue
 			fi
+			run_port=$test_port
 		fi
 
 		SDB_SQLLOGIC_QUIET=1 ./run.sh \

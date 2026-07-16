@@ -16,13 +16,14 @@ fi
 
 echo "=== Deb RTA: $(basename "$DEB_PACKAGE") ==="
 mkdir -p "${WORKSPACE}/out/logs"
-mkdir -p "${WORKSPACE}/out/test-tmp"
 
 # Export all env vars ONCE so compose sees consistent config across all calls
 export DEB_PACKAGE="$(basename "$DEB_PACKAGE")"
 export DOCKER_UID="$(id -u)"
 export DOCKER_GID="$(id -g)"
 export CARGO_TARGET_CACHE="${CARGO_TARGET_CACHE:-${HOME}/.cache/serenedb-cargo-target}"
+export CARGO_HOME_CACHE="${CARGO_HOME_CACHE:-${HOME}/.cache/serenedb-cargo-home}"
+mkdir -p "$CARGO_TARGET_CACHE" "$CARGO_HOME_CACHE"
 
 PREFIX="deb-rta-$$"
 COMPOSE_FILE="${CI_DIR}/docker-compose.deb-rta.yml"
@@ -51,6 +52,18 @@ docker compose -p "$PREFIX" -f "$COMPOSE_FILE" up \
 if [[ $test_rc -ne 0 ]]; then
 	echo "DEB_RTA=FAILED (sqllogic tests)"
 	exit $test_rc
+fi
+
+# HBA network tests: the mask test launches its own serened and source-binds
+# 127.x addresses, so it runs inside the systemd container against the
+# deb-installed binary (must precede the apt remove below).
+echo "=== HBA network tests ==="
+network_rc=0
+$EXEC env SERENED=/usr/bin/serened /workspace/tests/network/run.sh \
+	2>&1 | tee "${WORKSPACE}/out/logs/deb-rta-network.log" || network_rc=$?
+if [[ $network_rc -ne 0 ]]; then
+	echo "DEB_RTA=FAILED (network tests)"
+	exit $network_rc
 fi
 
 # Optional drivers RTA (python+java only). Gated on RTA_DRIVERS to keep

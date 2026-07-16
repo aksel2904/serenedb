@@ -26,7 +26,9 @@
 #include <iresearch/parser/parser.hpp>
 #include <iresearch/search/bm25.hpp>
 #include <iresearch/search/boolean_filter.hpp>
+#include <iresearch/search/filter_optimizer.hpp>
 #include <iresearch/store/store_utils.hpp>
+#include <vector>
 
 #include "basics/duckdb_engine.h"
 #include "index_builder.h"
@@ -76,13 +78,21 @@ size_t Executor::ExecuteCount(std::string_view query) {
   if (!filter) {
     return 0;
   }
-  auto prepared = filter->prepare({.index = _reader});
-  if (!prepared) {
-    return 0;
-  }
-  size_t count = 0;
+  auto collector = filter->MakeCollector(nullptr);
+  std::vector<irs::QueryBuilder::ptr> queries;
+  queries.reserve(_reader.size());
   for (auto& segment : _reader) {
-    auto docs = prepared->execute({.segment = segment});
+    queries.emplace_back(
+      filter->PrepareSegment(segment, {.collector = collector.get()}));
+  }
+  const auto stats = collector->Finish(irs::IResourceManager::gNoop);
+
+  size_t count = 0;
+  for (auto& query : queries) {
+    if (!query) {
+      continue;
+    }
+    auto docs = query->Execute({}, stats);
     count += docs->count();
   }
   return count;
@@ -91,19 +101,15 @@ size_t Executor::ExecuteCount(std::string_view query) {
 irs::Filter::ptr Executor::ParseFilter(std::string_view str) {
   auto root = std::make_unique<irs::MixedBooleanFilter>();
   sdb::ParserContext context{*root, kTextFieldId, *_tokenizer};
-  auto r = sdb::ParseQuery(context, str);
-  if (!r.ok()) {
+  if (!sdb::ParseQuery(context, str)) {
     return {};
   }
-  auto& opt = root->GetOptional();
-  auto& req = root->GetRequired();
-  if (opt.size() == 1 && req.empty()) {
-    return opt.PopBack();
+  if (root->empty()) {
+    return {};
   }
-  if (req.size() == 1 && opt.empty()) {
-    return req.PopBack();
-  }
-  return root;
+  irs::Filter::ptr filter = std::move(root);
+  irs::Optimize(filter, {.scored = _scorer_ptr != nullptr});
+  return filter;
 }
 
 }  // namespace bench

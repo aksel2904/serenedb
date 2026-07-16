@@ -14,11 +14,12 @@ fi
 
 echo "=== Docker RTA: ${DOCKER_TEST_IMAGE} ==="
 mkdir -p "${WORKSPACE}/out/logs"
-mkdir -p "${WORKSPACE}/out/test-tmp"
 
 export DOCKER_UID="$(id -u)"
 export DOCKER_GID="$(id -g)"
 export CARGO_TARGET_CACHE="${CARGO_TARGET_CACHE:-${HOME}/.cache/serenedb-cargo-target}"
+export CARGO_HOME_CACHE="${CARGO_HOME_CACHE:-${HOME}/.cache/serenedb-cargo-home}"
+mkdir -p "$CARGO_TARGET_CACHE" "$CARGO_HOME_CACHE"
 
 PREFIX="docker-rta-$$"
 COMPOSE_FILE="${CI_DIR}/docker-compose.docker-rta.yml"
@@ -40,6 +41,14 @@ log_lines=$(docker compose -p "$PREFIX" -f "$COMPOSE_FILE" logs serenedb 2>&1 | 
 if [[ "$log_lines" -eq 0 ]]; then
 	echo "ERROR: No serened log output found - service likely failed to start"
 	test_rc=1
+fi
+
+# HBA network tests: standalone service (launches its own released serened
+# in-container), so it goes through `run`, not the client/server `up`.
+if [[ $test_rc -eq 0 ]]; then
+	echo "=== HBA network tests ==="
+	docker compose -p "$PREFIX" -f "$COMPOSE_FILE" run --rm network-tests \
+		2>&1 | tee "${WORKSPACE}/out/logs/docker-rta-network.log" || test_rc=$?
 fi
 
 # Optional drivers RTA. Gated on RTA_DRIVERS for the same reason as

@@ -33,7 +33,6 @@
 
 #include "basics/bit_utils.hpp"
 #include "basics/files.h"
-#include "basics/math_utils.hpp"
 #include "basics/serializer.h"
 #include "basics/simdjson_sink.h"
 #include "executor.h"
@@ -42,6 +41,7 @@
 #include "iresearch/analysis/token_attributes.hpp"
 #include "iresearch/search/bm25.hpp"
 #include "iresearch/search/term_filter.hpp"
+#include "search/filter_test_case_base.hpp"
 #include "tests_shared.hpp"
 
 namespace {
@@ -85,6 +85,16 @@ void FillViaFillBlock(irs::DocIterator& iter, irs::doc_id_t window_min,
   DecodeMask(mask.data(), mask_words, window_min, docs);
 }
 
+// Test fill: delegate to the EmitDocs API (writes doc-ids directly).
+void FillViaEmitDocs(irs::DocIterator& iter, irs::doc_id_t window_min,
+                     irs::doc_id_t window_max,
+                     std::vector<irs::doc_id_t>& docs) {
+  docs.resize(window_max -
+              window_min);  // value() >= window_min, matches <= span
+  const auto n = iter.EmitDocs(docs.data(), window_max);
+  docs.resize(n);
+}
+
 // Operation applied to BOTH iterators before each window fill.
 using BeforeWindowFunc =
   std::function<void(irs::DocIterator& iter, irs::doc_id_t window_min)>;
@@ -125,10 +135,11 @@ BeforeWindowFunc Cycle(std::vector<BeforeWindowFunc> ops, size_t num_iters) {
 // Before each window, `before_window` runs on BOTH iterators.
 // Then reference fills via advance-loop, test fills via FillBlock.
 // Returns total number of documents seen.
-size_t CompareWindowByWindow(irs::DocIterator& reference_iter,
-                             irs::DocIterator& test_iter, irs::doc_id_t max_doc,
-                             irs::doc_id_t window_size,
-                             const BeforeWindowFunc& before_window = {}) {
+size_t CompareWindowByWindow(
+  irs::DocIterator& reference_iter, irs::DocIterator& test_iter,
+  irs::doc_id_t max_doc, irs::doc_id_t window_size,
+  const BeforeWindowFunc& before_window = {},
+  const FillWindowFunc& test_fill = FillViaFillBlock) {
   size_t total_docs = 0;
   std::vector<irs::doc_id_t> reference_docs;
   std::vector<irs::doc_id_t> test_docs;
@@ -145,7 +156,7 @@ size_t CompareWindowByWindow(irs::DocIterator& reference_iter,
     reference_docs.clear();
     test_docs.clear();
     FillViaAdvance(reference_iter, window_min, window_max, reference_docs);
-    FillViaFillBlock(test_iter, window_min, window_max, test_docs);
+    test_fill(test_iter, window_min, window_max, test_docs);
 
     if (test_docs != reference_docs) {
       std::vector<irs::doc_id_t> only_in_reference;
@@ -194,8 +205,15 @@ IteratorFactory QueryIterator(bench::Executor& executor,
         const irs::DirectoryReader& reader, const irs::SubReader& segment) {
         auto filter = executor.ParseFilter(query);
         SDB_ASSERT(filter);
-        auto prepared = filter->prepare({.index = reader});
-        return prepared->execute({.segment = segment});
+        tests::PreparedFilter prepared{*filter, reader};
+        size_t i = 0;
+        for (const auto& sub : reader) {
+          if (&sub == &segment) {
+            break;
+          }
+          ++i;
+        }
+        return prepared.Execute(i);
       },
   };
 }
@@ -243,6 +261,28 @@ void TestAdvanceVsFillBlock(const irs::DirectoryReader& reader,
                        EXPECT_EQ(total, count_iter->count())
                          << "total docs vs count() mismatch";
                      });
+}
+
+void TestAdvanceVsEmitDocs(const irs::DirectoryReader& reader,
+                           const std::vector<IteratorFactory>& factories,
+                           std::span<const irs::doc_id_t> window_sizes) {
+  ForEachCombination(
+    reader, factories, window_sizes,
+    [](const auto& reader, const auto& segment, const auto& factory,
+       auto max_doc, auto window_size) {
+      auto reference_iter = factory.create(reader, segment);
+      auto test_iter = factory.create(reader, segment);
+      auto count_iter = factory.create(reader, segment);
+
+      reference_iter->advance();
+      test_iter->advance();
+
+      auto total = CompareWindowByWindow(*reference_iter, *test_iter, max_doc,
+                                         window_size, {}, FillViaEmitDocs);
+
+      EXPECT_GT(total, 0u) << "query should have matches";
+      EXPECT_EQ(total, count_iter->count()) << "total docs vs count() mismatch";
+    });
 }
 
 void TestSeekVsFillBlock(const irs::DirectoryReader& reader,
@@ -779,16 +819,17 @@ TEST_F(LoadTest, DisjunctionScoreAccuracy) {
 
     std::map<irs::doc_id_t, irs::score_t> reference_scores;
 
-    for (auto& segment : reader) {
+    for (size_t segment_idx = 0; auto& segment : reader) {
       for (auto term_str : terms) {
-        auto filter = irs::ByTerm::prepare(
-          {.index = reader, .scorer = &scorer}, bench::kTextFieldId,
+        irs::ByTerm filter;
+        *filter.mutable_field_id() = bench::kTextFieldId;
+        filter.mutable_options()->term =
           irs::ViewCast<irs::byte_type>(irs::bytes_view{
             reinterpret_cast<const irs::byte_type*>(term_str.data()),
-            term_str.size()}));
-        ASSERT_TRUE(filter);
+            term_str.size()});
+        tests::PreparedFilter prepared{filter, reader, &scorer};
 
-        auto it = filter->execute({.segment = segment, .scorer = &scorer});
+        auto it = prepared.Execute(segment_idx);
         ASSERT_TRUE(it);
 
         irs::ColumnArgsFetcher fetcher;
@@ -808,21 +849,21 @@ TEST_F(LoadTest, DisjunctionScoreAccuracy) {
           reference_scores[doc] += s;
         }
       }
+      ++segment_idx;
     }
     ASSERT_GT(reference_scores.size(), 0u) << "No reference docs found";
 
     auto filter = gExecutor->ParseFilter(std::string{query});
     ASSERT_TRUE(filter);
 
-    auto prepared = filter->prepare({.index = reader, .scorer = &scorer});
-    ASSERT_TRUE(prepared);
+    tests::PreparedFilter prepared{*filter, reader, &scorer};
 
     // 1) Compare via advance + Score
     {
       std::map<irs::doc_id_t, irs::score_t> bd_scores;
-      for (auto& segment : reader) {
+      for (size_t i = 0; auto& segment : reader) {
         irs::ColumnArgsFetcher fetcher;
-        auto it = prepared->execute({.segment = segment, .scorer = &scorer});
+        auto it = prepared.Execute(i);
         auto score_func = it->PrepareScore({
           .scorer = &scorer,
           .segment = &segment,
@@ -836,6 +877,7 @@ TEST_F(LoadTest, DisjunctionScoreAccuracy) {
           irs::score_t s = score_func.Score();
           bd_scores[doc] = s;
         }
+        ++i;
       }
 
       EXPECT_EQ(bd_scores.size(), reference_scores.size())
@@ -845,9 +887,8 @@ TEST_F(LoadTest, DisjunctionScoreAccuracy) {
         auto it = bd_scores.find(doc);
         ASSERT_NE(it, bd_scores.end())
           << "advance: ref doc " << doc << " missing from BD";
-        EXPECT_TRUE(irs::math::ApproxEquals(it->second, ref_score))
-          << "advance: score mismatch doc " << doc << ": BD=" << it->second
-          << " ref=" << ref_score;
+        EXPECT_FLOAT_EQ(it->second, ref_score)
+          << "advance: score mismatch doc " << doc;
       }
     }
 
@@ -878,9 +919,8 @@ TEST_F(LoadTest, DisjunctionScoreAccuracy) {
       for (size_t i = 0; i < result_count; ++i) {
         EXPECT_EQ(hits[i].doc, ref_top[i].doc)
           << "Collect: rank " << i << " doc mismatch";
-        EXPECT_TRUE(irs::math::ApproxEquals(hits[i].score, ref_top[i].score))
-          << "Collect: rank " << i << " score mismatch doc " << hits[i].doc
-          << ": collect=" << hits[i].score << " ref=" << ref_top[i].score;
+        EXPECT_FLOAT_EQ(hits[i].score, ref_top[i].score)
+          << "Collect: rank " << i << " score mismatch doc " << hits[i].doc;
       }
     }
 
@@ -896,14 +936,9 @@ TEST_F(LoadTest, DisjunctionScoreAccuracy) {
 
       const size_t result_count = std::min<size_t>(kCount, ref_top.size());
 
-      // FP accumulation order differs between WAND and non-WAND paths,
-      // so allow a wider epsilon than the default single-ULP tolerance.
-      static constexpr float kEps = 1e-5f;
       for (size_t i = 0; i < result_count; ++i) {
-        EXPECT_TRUE(
-          irs::math::ApproxEquals(hits[i].score, ref_top[i].score, kEps))
-          << "WAND: rank " << i << " score mismatch doc " << hits[i].doc
-          << ": wand=" << hits[i].score << " ref=" << ref_top[i].score;
+        EXPECT_FLOAT_EQ(hits[i].score, ref_top[i].score)
+          << "WAND: rank " << i << " score mismatch doc " << hits[i].doc;
       }
     }
   }
@@ -912,6 +947,11 @@ TEST_F(LoadTest, DisjunctionScoreAccuracy) {
 TEST_F(LoadTest, AdvanceVsFillBlock) {
   auto factories = MakeFactories(*gExecutor);
   TestAdvanceVsFillBlock(gExecutor->GetReader(), factories, kWindowSizes);
+}
+
+TEST_F(LoadTest, AdvanceVsEmitDocs) {
+  auto factories = MakeFactories(*gExecutor);
+  TestAdvanceVsEmitDocs(gExecutor->GetReader(), factories, kWindowSizes);
 }
 
 TEST_F(LoadTest, SeekVsFillBlock) {

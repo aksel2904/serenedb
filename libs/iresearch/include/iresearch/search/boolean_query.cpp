@@ -22,6 +22,8 @@
 
 #include "iresearch/search/boolean_query.hpp"
 
+#include <iresearch/search/filter.hpp>
+
 #include "iresearch/formats/posting/common.hpp"
 #include "iresearch/formats/posting/format_block_128.hpp"
 #include "iresearch/formats/posting/iterator_doc.hpp"
@@ -35,15 +37,26 @@
 namespace irs {
 namespace {
 
+// Executes child `query`, threading its own StatsBuffer subtree.
+DocIterator::ptr ExecuteChild(const ExecutionContext& ctx,
+                              const StatsBuffer& stats,
+                              const QueryBuilder::ptr& query, size_t index) {
+  if (!query) {
+    return DocIterator::empty();
+  }
+  return query->Execute(
+    ctx, stats.ChildCount() != 0 ? stats.Child(index) : StatsBuffer::Empty());
+}
+
 template<bool Conjunction, typename It>
-ScoreAdapters MakeScoreAdapters(const ExecutionContext& ctx, It begin, It end) {
+ScoreAdapters MakeScoreAdapters(const ExecutionContext& ctx,
+                                const StatsBuffer& stats, It begin, It end) {
   SDB_ASSERT(begin <= end);
   const size_t size = std::distance(begin, end);
   ScoreAdapters itrs;
   itrs.reserve(size);
-  do {
-    auto docs = (*begin)->execute(ctx);
-    ++begin;
+  for (size_t index = 0; begin != end; ++begin, ++index) {
+    auto docs = ExecuteChild(ctx, stats, *begin, index);
 
     // filter out empty iterators
     if (doc_limits::eof(docs->value())) {
@@ -55,7 +68,7 @@ ScoreAdapters MakeScoreAdapters(const ExecutionContext& ctx, It begin, It end) {
     }
 
     itrs.emplace_back(std::move(docs));
-  } while (begin != end);
+  }
 
   // if (Conjunction || itrs.size() > 1) {
   //   TODO(mbkkt) ctx.wand.strict = true;
@@ -66,6 +79,7 @@ ScoreAdapters MakeScoreAdapters(const ExecutionContext& ctx, It begin, It end) {
 // Returns disjunction iterator created from the specified queries
 template<typename QueryIterator, typename... Args>
 DocIterator::ptr MakeDisjunction(const ExecutionContext& ctx,
+                                 const StatsBuffer& stats, size_t docs_count,
                                  ScoreMergeType merge_type, QueryIterator begin,
                                  QueryIterator end, Args&&... args) {
   SDB_ASSERT(begin <= end);
@@ -76,24 +90,26 @@ DocIterator::ptr MakeDisjunction(const ExecutionContext& ctx,
     return DocIterator::empty();
   }
 
-  auto itrs = MakeScoreAdapters<false>(ctx, begin, end);
+  auto itrs = MakeScoreAdapters<false>(ctx, stats, begin, end);
   if (itrs.empty()) {
     return DocIterator::empty();
   }
 
-  return ResolveMergeType(
-    ctx.scorer ? merge_type : ScoreMergeType::Noop,
-    [&]<ScoreMergeType MergeType> {
-      using Disjunction = DisjunctionIterator<ScoreAdapter, MergeType>;
-      return MakeDisjunction<Disjunction>(
-        ctx.wand, static_cast<doc_id_t>(ctx.segment.docs_count()),
-        std::move(itrs), std::forward<Args>(args)...);
-    });
+  return ResolveMergeType(stats.GetScorer() ? merge_type : ScoreMergeType::Noop,
+                          [&]<ScoreMergeType MergeType> {
+                            using Disjunction =
+                              DisjunctionIterator<ScoreAdapter, MergeType>;
+                            return MakeDisjunction<Disjunction>(
+                              ctx.wand, static_cast<doc_id_t>(docs_count),
+                              std::move(itrs), std::forward<Args>(args)...);
+                          });
 }
 
 // Returns conjunction iterator created from the specified queries
 template<typename QueryIterator, typename... Args>
 DocIterator::ptr MakeConjunction(const ExecutionContext& ctx,
+                                 const StatsBuffer& stats, doc_id_t docs_count,
+                                 const Scorer* scorer,
                                  ScoreMergeType merge_type, QueryIterator begin,
                                  QueryIterator end, Args&&... args) {
   SDB_ASSERT(begin <= end);
@@ -103,46 +119,35 @@ DocIterator::ptr MakeConjunction(const ExecutionContext& ctx,
     case 0:
       return DocIterator::empty();
     case 1:
-      return (*begin)->execute(ctx);
+      return ExecuteChild(ctx, stats, *begin, 0);
   }
 
-  auto itrs = MakeScoreAdapters<true>(ctx, begin, end);
+  auto itrs = MakeScoreAdapters<true>(ctx, stats, begin, end);
   if (itrs.empty()) {
     return DocIterator::empty();
   }
 
-  return MakeConjunction(ctx.scorer ? merge_type : ScoreMergeType::Noop,
-                         ctx.wand,
-                         static_cast<doc_id_t>(ctx.segment.docs_count()),
-                         std::move(itrs), std::forward<Args>(args)...);
+  return MakeConjunction(scorer ? merge_type : ScoreMergeType::Noop, ctx.wand,
+                         docs_count, std::move(itrs),
+                         std::forward<Args>(args)...);
 }
 
 }  // namespace
 
-DocIterator::ptr BooleanQuery::execute(const ExecutionContext& old) const {
-  if (empty()) {
-    return DocIterator::empty();
-  }
-
-  SDB_ASSERT(_excl);
-  const auto excl_begin = this->excl_begin();
-  const auto end = this->end();
+DocIterator::ptr ExclusionQuery::Execute(const ExecutionContext& old,
+                                         const StatsBuffer& stats) const {
+  SDB_ASSERT(!_excludes.empty());
   ExecutionContext ctx{old};
-  if (excl_begin != end) {
-    // TODO(mbkkt) enable back?
-    ctx.wand.wand_enabled = false;
-  }
+  // TODO(mbkkt) enable back?
+  ctx.wand.wand_enabled = false;
 
-  auto incl = execute(ctx, begin(), excl_begin);
+  const bool has_children = stats.ChildCount() != 0;
 
-  if (excl_begin == end) {
-    return incl;
-  }
-
-  // TODO(gnusi): rewrite this to use ByTerms
+  auto incl = _include->Execute(
+    ctx, has_children ? stats.Child(0) : StatsBuffer::Empty());
 
   ScoreAdapters excl_itrs;
-  excl_itrs.reserve(std::distance(excl_begin, end));
+  excl_itrs.reserve(_excludes.size());
 
   using TermWithFreq = PostingIteratorBase<
     IteratorTraitsImpl<FormatTraits128, true, false, false>>;
@@ -153,8 +158,9 @@ DocIterator::ptr BooleanQuery::execute(const ExecutionContext& old) const {
   bool excl_has_term_without_freq = false;
   bool excl_has_abstract = false;
 
-  for (auto it = excl_begin; it != end; ++it) {
-    auto docs = (*it)->execute(ctx);
+  for (size_t i = 0, count = _excludes.size(); i < count; ++i) {
+    auto docs = _excludes[i]->Execute(
+      ctx, has_children ? stats.Child(i + 1) : StatsBuffer::Empty());
     if (doc_limits::eof(docs->value())) {
       continue;
     }
@@ -176,12 +182,14 @@ DocIterator::ptr BooleanQuery::execute(const ExecutionContext& old) const {
     [&]<typename IncludeAdapter, typename ExcludeAdapter> -> DocIterator::ptr {
     using ExcludeAdapters = std::vector<ExcludeAdapter>;
     if (excl_itrs.size() == 1) {
-      return memory::make_managed<Exclusion<IncludeAdapter, ExcludeAdapter>>(
+      return memory::make_managed<
+        ExclusionIterator<IncludeAdapter, ExcludeAdapter>>(
         IncludeAdapter{std::move(incl)},
         ExcludeAdapter{std::move(excl_itrs[0])});
     }
     if constexpr (std::is_same_v<ExcludeAdapters, ScoreAdapters>) {
-      return memory::make_managed<Exclusion<IncludeAdapter, ExcludeAdapters>>(
+      return memory::make_managed<
+        ExclusionIterator<IncludeAdapter, ExcludeAdapters>>(
         IncludeAdapter{std::move(incl)}, std::move(excl_itrs));
     } else {
       ExcludeAdapters excl;
@@ -189,7 +197,8 @@ DocIterator::ptr BooleanQuery::execute(const ExecutionContext& old) const {
       for (auto& it : excl_itrs) {
         excl.emplace_back(std::move(it));
       }
-      return memory::make_managed<Exclusion<IncludeAdapter, ExcludeAdapters>>(
+      return memory::make_managed<
+        ExclusionIterator<IncludeAdapter, ExcludeAdapters>>(
         IncludeAdapter{std::move(incl)}, std::move(excl));
     }
   };
@@ -217,68 +226,44 @@ DocIterator::ptr BooleanQuery::execute(const ExecutionContext& old) const {
   }
 }
 
-void BooleanQuery::visit(const SubReader& segment,
-                         PreparedStateVisitor& visitor, score_t boost) const {
+void BooleanQuery::Visit(PreparedStateVisitor& visitor, score_t boost) const {
   boost *= _boost;
 
   if (!visitor.Visit(*this, boost)) {
     return;
   }
 
-  // FIXME(gnusi): visit exclude group?
-  for (auto it = begin(), end = excl_begin(); it != end; ++it) {
-    (*it)->visit(segment, visitor, boost);
+  for (auto it = begin(), last = end(); it != last; ++it) {
+    (*it)->Visit(visitor, boost);
   }
 }
 
-void BooleanQuery::prepare(const PrepareContext& ctx, ScoreMergeType merge_type,
-                           queries_t queries, size_t exclude_start) {
-  // apply boost to the current node
-  _boost *= ctx.boost;
-  // nothrow block
-  _queries = std::move(queries);
-  _excl = exclude_start;
-  _merge_type = merge_type;
+DocIterator::ptr AndQuery::Execute(const ExecutionContext& ctx,
+                                   const StatsBuffer& stats) const {
+  const auto* scorer = stats.GetScorer();
+  return MakeConjunction(ctx, stats,
+                         static_cast<doc_id_t>(_segment.docs_count()), scorer,
+                         merge_type(), begin(), end());
 }
 
-void BooleanQuery::prepare(const PrepareContext& ctx, ScoreMergeType merge_type,
-                           std::span<const Filter* const> incl,
-                           std::span<const Filter* const> excl) {
-  queries_t queries{{ctx.memory}};
-  queries.reserve(incl.size() + excl.size());
-  // prepare included
-  for (const auto* filter : incl) {
-    queries.emplace_back(filter->prepare(ctx));
-  }
-  // prepare excluded
-  for (const auto* filter : excl) {
-    // exclusion part does not affect scoring at all
-    queries.emplace_back(filter->prepare({
-      .index = ctx.index,
-      .memory = ctx.memory,
-      .ctx = ctx.ctx,
-    }));
-  }
-  prepare(ctx, merge_type, std::move(queries), incl.size());
+DocIterator::ptr OrQuery::Execute(const ExecutionContext& ctx,
+                                  const StatsBuffer& stats) const {
+  return MakeDisjunction(ctx, stats,
+                         static_cast<doc_id_t>(_segment.docs_count()),
+                         merge_type(), begin(), end());
 }
 
-DocIterator::ptr AndQuery::execute(const ExecutionContext& ctx, iterator begin,
-                                   iterator end) const {
-  return MakeConjunction(ctx, merge_type(), begin, end);
-}
-
-DocIterator::ptr OrQuery::execute(const ExecutionContext& ctx, iterator begin,
-                                  iterator end) const {
-  return MakeDisjunction(ctx, merge_type(), begin, end);
-}
-
-DocIterator::ptr MinMatchQuery::execute(const ExecutionContext& ctx,
-                                        iterator begin, iterator end) const {
+DocIterator::ptr MinMatchQuery::Execute(const ExecutionContext& ctx,
+                                        const StatsBuffer& stats) const {
+  const auto begin = this->begin();
+  const auto end = this->end();
   SDB_ASSERT(std::distance(begin, end) >= 0);
   const auto size = size_t(std::distance(begin, end));
 
   // 1 <= min_match_count
   size_t min_match_count = std::max(size_t{1}, _min_match_count);
+
+  const auto* scorer = stats.GetScorer();
 
   // check the size before the execution
   if (0 == size || min_match_count > size) {
@@ -286,45 +271,42 @@ DocIterator::ptr MinMatchQuery::execute(const ExecutionContext& ctx,
     return DocIterator::empty();
   } else if (min_match_count == size) {
     // pure conjunction
-    return MakeConjunction(ctx, merge_type(), begin, end);
+    return MakeConjunction(ctx, stats,
+                           static_cast<doc_id_t>(_segment.docs_count()), scorer,
+                           merge_type(), begin, end);
   }
 
   // min_match_count <= size
   min_match_count = std::min(size, min_match_count);
 
-  auto itrs = MakeScoreAdapters<false>(ctx, begin, end);
+  auto itrs = MakeScoreAdapters<false>(ctx, stats, begin, end);
   if (itrs.empty()) {
     return DocIterator::empty();
   }
 
   return ResolveMergeType(
-    ctx.scorer ? merge_type() : ScoreMergeType::Noop,
+    scorer ? merge_type() : ScoreMergeType::Noop,
     [&]<ScoreMergeType MergeType> {
       // FIXME(gnusi): use FAST version
       using Disjunction = MinMatchIterator<ScoreAdapter, MergeType>;
       return MakeWeakDisjunction<Disjunction>(
-        ctx.wand, static_cast<doc_id_t>(ctx.segment.docs_count()),
-        std::move(itrs), min_match_count);
+        ctx.wand, static_cast<doc_id_t>(_segment.docs_count()), std::move(itrs),
+        min_match_count);
     });
 }
 
-void BoostQuery::Prepare(const PrepareContext& ctx, const BooleanFilter& req,
-                         const Or& opt) {
-  SDB_ASSERT(!req.empty());
-  _req = req.prepare(ctx);
-  const auto opt_ctx = ctx.Boost(opt.Boost());
-  _opt.reserve(opt.size());
-  for (const auto& opt_filter : opt) {
-    _opt.emplace_back(opt_filter->prepare(opt_ctx));
-  }
-}
-
-DocIterator::ptr BoostQuery::execute(const ExecutionContext& old) const {
+DocIterator::ptr BoostQuery::Execute(const ExecutionContext& old,
+                                     const StatsBuffer& stats) const {
   ExecutionContext ctx{old};
   // TODO(mbkkt) enable back?
   ctx.wand.wand_enabled = false;
-  auto req = _req->execute(ctx);
-  if (!ctx.scorer || doc_limits::eof(req->value())) {
+
+  const bool has_children = stats.ChildCount() != 0;
+  const auto* scorer = stats.GetScorer();
+
+  auto req =
+    _req->Execute(ctx, has_children ? stats.Child(0) : StatsBuffer::Empty());
+  if (!scorer || doc_limits::eof(req->value())) {
     return req;
   }
 
@@ -335,8 +317,9 @@ DocIterator::ptr BoostQuery::execute(const ExecutionContext& old) const {
   ScoreAdapters opt_itrs;
   opt_itrs.reserve(_opt.size());
   bool opt_is_term = true;
-  for (const auto& q : _opt) {
-    auto docs = q->execute(ctx);
+  for (size_t i = 0, count = _opt.size(); i < count; ++i) {
+    auto docs = _opt[i]->Execute(
+      ctx, has_children ? stats.Child(i + 1) : StatsBuffer::Empty());
     if (doc_limits::eof(docs->value())) {
       continue;
     }
@@ -380,9 +363,8 @@ DocIterator::ptr BoostQuery::execute(const ExecutionContext& old) const {
   return make.template operator()<ScoreAdapter, ScoreAdapter>();
 }
 
-void BoostQuery::visit(const SubReader& segment, PreparedStateVisitor& visitor,
-                       score_t boost) const {
-  _req->visit(segment, visitor, boost);
+void BoostQuery::Visit(PreparedStateVisitor& visitor, score_t boost) const {
+  _req->Visit(visitor, boost);
 }
 
 }  // namespace irs

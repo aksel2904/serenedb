@@ -20,19 +20,25 @@
 
 #include "search/wal_recovery.h"
 
-#include <absl/container/flat_hash_set.h>
 #include <absl/time/time.h>
 
 #include <chrono>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
+#include <duckdb/common/types/data_chunk.hpp>
 #include <duckdb/main/connection.hpp>
 #include <duckdb/storage/data_table.hpp>
+#include <iresearch/index/index_writer.hpp>
+#include <limits>
+#include <memory>
+#include <ranges>
+#include <string>
+#include <vector>
 
 #include "basics/assert.h"
+#include "basics/containers/flat_hash_set.h"
 #include "basics/down_cast.h"
 #include "basics/duckdb_engine.h"
-#include "basics/errors.h"
 #include "basics/log.h"
 #include "catalog/catalog.h"
 #include "catalog/identifiers/object_id.h"
@@ -59,7 +65,9 @@ void BindStoreTableIndexes(duckdb::ClientContext& context,
     catalog::StoreTableName(database_name, schema_name, table_name);
   auto& entry = duckdb::Catalog::GetEntry(
                   context, duckdb::CatalogType::TABLE_ENTRY,
-                  std::string{catalog::kStoreDatabaseName}, "main", store_name)
+                  duckdb::QualifiedName(
+                    duckdb::Identifier{catalog::kStoreDatabaseName},
+                    duckdb::Identifier{"main"}, duckdb::Identifier{store_name}))
                   .Cast<duckdb::DuckTableEntry>();
   entry.GetStorage().GetDataTableInfo()->BindIndexes(
     context, connector::InvertedStoreIndex::kTypeName);
@@ -67,7 +75,7 @@ void BindStoreTableIndexes(duckdb::ClientContext& context,
 
 }  // namespace
 
-void InitInvertedIndexes(bool skip_wal_recovery) {
+void InitInvertedIndexes() {
   auto begin = std::chrono::steady_clock::now();
 
   auto snapshot = catalog::GetCatalog().GetCatalogSnapshot();
@@ -83,7 +91,7 @@ void InitInvertedIndexes(bool skip_wal_recovery) {
     std::string table_name;
   };
   std::vector<TableCoord> tables_to_bind;
-  absl::flat_hash_set<ObjectId> seen_tables;
+  containers::FlatHashSet<ObjectId> seen_tables;
   std::vector<std::shared_ptr<InvertedIndexStorage>> recovering_storages;
   std::vector<std::shared_ptr<InvertedIndexStorage>> static_storages;
 
@@ -106,7 +114,7 @@ void InitInvertedIndexes(bool skip_wal_recovery) {
         const auto relation = snapshot->GetObject(idx->GetRelationId());
         const bool table_backed =
           relation && relation->GetType() == catalog::ObjectType::Table;
-        if (skip_wal_recovery || !table_backed) {
+        if (!table_backed) {
           static_storages.push_back(std::move(inv_storage));
           continue;
         }
