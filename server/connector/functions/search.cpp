@@ -66,6 +66,12 @@ duckdb::LogicalType MakeBoostedTSQueryType() {
   return type;
 }
 
+duckdb::LogicalType MakeSloppedTSQueryType() {
+  auto type = duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR);
+  type.SetAlias(std::string{kSloppedTSQueryTypeName});
+  return type;
+}
+
 void SearchStubFn(duckdb::DataChunk& /*args*/,
                   duckdb::ExpressionState& /*state*/,
                   duckdb::Vector& /*result*/) {
@@ -233,6 +239,36 @@ void RegisterTSQueryTypes(duckdb::ExtensionLoader& loader) {
       type.SetExtensionInfo(std::move(info));
       return type;
     });
+
+  // `slop(<budget>)` parameterised type: parallel to boost, INTEGER
+  // budget. Distinct alias keeps the cast wrapper alive so the filter
+  // builder can read the budget off the type.
+  loader.RegisterType(
+    std::string{kSlopTypeName}, MakeTSQueryType(),
+    +[](duckdb::BindLogicalTypeInput& input) -> duckdb::LogicalType {
+      const auto& modifiers = input.modifiers;
+      if (modifiers.size() != 1) {
+        THROW_SQL_ERROR(
+          ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
+          ERR_MSG("slop(<budget>) requires exactly one integer argument"));
+      }
+      auto budget =
+        modifiers[0].GetValue().DefaultCastAs(duckdb::LogicalType::BIGINT);
+      if (budget.IsNull()) {
+        THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
+                        ERR_MSG("slop() budget must be non-null"));
+      }
+      if (budget.GetValue<int64_t>() < 0) {
+        THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
+                        ERR_MSG("slop() budget must be >= 0, got ",
+                                budget.GetValue<int64_t>()));
+      }
+      auto type = MakeSloppedTSQueryType();
+      auto info = duckdb::make_uniq<duckdb::ExtensionTypeInfo>();
+      info->modifiers.emplace_back(std::move(budget));
+      type.SetExtensionInfo(std::move(info));
+      return type;
+    });
 }
 
 void RegisterTSQueryAliasCasts(duckdb::ExtensionLoader& loader) {
@@ -303,6 +339,33 @@ void RegisterTSQueryAliasCasts(duckdb::ExtensionLoader& loader) {
                               MakeTokenizedTSQueryType(),
                               duckdb::DefaultCasts::ReinterpretCast, 0);
   loader.RegisterCastFunction(MakeBoostedTSQueryType(),
+                              duckdb::LogicalType::VARCHAR,
+                              duckdb::DefaultCasts::ReinterpretCast, 100);
+  // SLOPPED <-> {VARCHAR, TSQ, TOK, BOOSTED}. Costs mirror BOOSTED:
+  // 0 inside the TSQ family so ::slop composes with ::tokenize/::boost
+  // in any order; 100 down to bare VARCHAR; 50 up from VARCHAR. No
+  // operator set targets SLOPPED, so the TOK/BOOSTED tie-break concerns
+  // don't apply here.
+  loader.RegisterCastFunction(duckdb::LogicalType::VARCHAR,
+                              MakeSloppedTSQueryType(),
+                              duckdb::DefaultCasts::ReinterpretCast, 50);
+  loader.RegisterCastFunction(MakeTSQueryType(), MakeSloppedTSQueryType(),
+                              duckdb::DefaultCasts::ReinterpretCast, 0);
+  loader.RegisterCastFunction(MakeTokenizedTSQueryType(),
+                              MakeSloppedTSQueryType(),
+                              duckdb::DefaultCasts::ReinterpretCast, 0);
+  loader.RegisterCastFunction(MakeBoostedTSQueryType(),
+                              MakeSloppedTSQueryType(),
+                              duckdb::DefaultCasts::ReinterpretCast, 0);
+  loader.RegisterCastFunction(MakeSloppedTSQueryType(), MakeTSQueryType(),
+                              duckdb::DefaultCasts::ReinterpretCast, 0);
+  loader.RegisterCastFunction(MakeSloppedTSQueryType(),
+                              MakeTokenizedTSQueryType(),
+                              duckdb::DefaultCasts::ReinterpretCast, 0);
+  loader.RegisterCastFunction(MakeSloppedTSQueryType(),
+                              MakeBoostedTSQueryType(),
+                              duckdb::DefaultCasts::ReinterpretCast, 0);
+  loader.RegisterCastFunction(MakeSloppedTSQueryType(),
                               duckdb::LogicalType::VARCHAR,
                               duckdb::DefaultCasts::ReinterpretCast, 100);
 }
@@ -405,12 +468,16 @@ void RegisterTSQueryConstructors(duckdb::ExtensionLoader& loader) {
   // falls through to the exact path; slop>0 picks the sloppy DP
   // matcher. Interval gaps + slop is rejected at filter-build time.
   {
-    duckdb::ScalarFunction fn(
-      std::string{kTSQSloppyPhrase},
-      {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::INTEGER},
-      MakeTSQueryType(), TSQueryStubFn);
-    fn.varargs = duckdb::LogicalType::ANY;
-    loader.RegisterFunction(std::move(fn));
+    duckdb::ScalarFunctionSet set{duckdb::Identifier{kTSQSloppyPhrase}};
+    for (auto first_arg :
+         {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BLOB}) {
+      duckdb::ScalarFunction fn(duckdb::Identifier{kTSQSloppyPhrase},
+                                {first_arg, duckdb::LogicalType::INTEGER},
+                                MakeTSQueryType(), TSQueryStubFn);
+      fn.SetVarArgs(duckdb::LogicalType::ANY);
+      set.AddFunction(std::move(fn));
+    }
+    loader.RegisterFunction(std::move(set));
   }
 
   // NGRAM(text [, threshold]) -- tokenises via ambient analyzer.

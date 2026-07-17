@@ -182,6 +182,22 @@ void FromPhrase(irs::BooleanFilter& filter, const FilterContext& ctx,
       ERR_HINT("All ts_phrase text arguments tokenised to nothing (e.g. "
                "all-stopword input). Provide at least one searchable term."));
   }
+
+  // Composable ::slop(N): ctx.slop > 0 only when a ::slop cast wrapped
+  // this phrase; otherwise a no-op and exact-phrase options are emitted
+  // byte-for-byte as before. Slop + interval gaps are mutually exclusive
+  // (see SDB_ENSURE in phrase_query.cpp).
+  if (ctx.slop > 0) {
+    for (const auto& info : *opts) {
+      if (info.offs_min != info.offs_max) {
+        THROW_SQL_ERROR(
+          ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
+          ERR_MSG("::slop is incompatible with interval gaps ([min, max])"),
+          ERR_HINT("Use exact gaps (single INTEGER) with ::slop, or drop it."));
+      }
+    }
+    opts->set_slop(ctx.slop);
+  }
 }
 
 void FromSloppyPhrase(irs::BooleanFilter& filter, const FilterContext& ctx,
@@ -192,9 +208,10 @@ void FromSloppyPhrase(irs::BooleanFilter& filter, const FilterContext& ctx,
     "non-negative INTEGER budget for position rearrangements. "
     "Interval gaps ([min, max]) are not allowed with slop - use "
     "exact gaps (single INTEGER) only.";
-  SDB_ASSERT(func.children.size() >= 2);
+  SDB_ASSERT(func.GetChildren().size() >= 2);
 
-  if (column_info.logical_type.id() != duckdb::LogicalTypeId::VARCHAR) {
+  if (column_info.logical_type.id() != duckdb::LogicalTypeId::VARCHAR &&
+      column_info.logical_type.id() != duckdb::LogicalTypeId::BLOB) {
     THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
                     ERR_MSG("ts_sloppy_phrase field is not VARCHAR"),
                     ERR_HINT(kSyntaxHint));
@@ -213,11 +230,8 @@ void FromSloppyPhrase(irs::BooleanFilter& filter, const FilterContext& ctx,
 
   // children[1] is slop (INTEGER per registration).
   int64_t slop_raw = 0;
-  if (auto r = GetIntArg(*func.children[1], "ts_sloppy_phrase slop", slop_raw);
-      !r.ok()) {
-    THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
-                    ERR_MSG(r.errorMessage()), ERR_HINT(kSyntaxHint));
-  }
+  GetIntArg(*func.GetChildren()[1], slop_raw,
+            {"ts_sloppy_phrase slop", kSyntaxHint});
   if (slop_raw < 0) {
     THROW_SQL_ERROR(
       ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -231,14 +245,11 @@ void FromSloppyPhrase(irs::BooleanFilter& filter, const FilterContext& ctx,
   }
   const auto slop = static_cast<irs::PosAttr::value_t>(slop_raw);
 
-  std::string field_name;
-  MakeFieldName(column_info, field_name);
-  search::mangling::MangleString(field_name);
-
   auto& phrase = ctx.negated ? Negate<irs::ByPhrase>(filter)
                              : AddFilter<irs::ByPhrase>(filter);
   phrase.boost(ctx.boost);
-  *phrase.mutable_field() = field_name;
+  *phrase.mutable_field_id() =
+    PickPerKindFieldId(column_info, duckdb::LogicalTypeId::VARCHAR);
   auto* opts = phrase.mutable_options();
   auto& analyzer = ctx.tokenizer;
   const irs::TermAttr* token = irs::get<irs::TermAttr>(analyzer);
@@ -247,19 +258,20 @@ void FromSloppyPhrase(irs::BooleanFilter& filter, const FilterContext& ctx,
 
   // Walk children: [0] is the first text, [1] is slop (already
   // consumed), [2..] alternates text and gap exactly like ts_phrase.
-  for (size_t i = 0; i < func.children.size(); ++i) {
+  for (size_t i = 0; i < func.GetChildren().size(); ++i) {
     if (i == 1) {
       continue;  // slop, already consumed above
     }
-    const auto* const_val = TryGetConstant(*func.children[i]);
+    const auto* const_val = TryGetConstant(*func.GetChildren()[i]);
     if (!const_val) {
       THROW_SQL_ERROR(
         ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
         ERR_MSG("ts_sloppy_phrase argument ", i, " must be a constant"),
         ERR_HINT(kSyntaxHint));
     }
-    if (const_val->type().id() == duckdb::LogicalTypeId::VARCHAR) {
-      auto text = const_val->GetValue<std::string>();
+    if (const_val->type().id() == duckdb::LogicalTypeId::VARCHAR ||
+        const_val->type().id() == duckdb::LogicalTypeId::BLOB) {
+      auto text = duckdb::StringValue::Get(*const_val);
       analyzer.reset(std::string_view{text});
       while (analyzer.next()) {
         if (pending_gap) {
