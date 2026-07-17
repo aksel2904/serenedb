@@ -23,7 +23,9 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <limits>
+#include <memory>
 #include <tuple>
 #include <vector>
 
@@ -201,6 +203,51 @@ struct PairMatch {
 struct PairScratch {
   std::vector<PosAttr::value_t> buf_pos;
   std::vector<PosOffset> buf_offs;
+};
+
+class UninitU32Buf {
+ public:
+  size_t Size() const noexcept { return _size; }
+
+  void Clear() noexcept { _size = 0; }
+
+  void ResizeUninit(size_t n) {
+    if (n > _cap) {
+      _data = std::make_unique_for_overwrite<uint32_t[]>(n);
+      _cap = n;
+    }
+    _size = n;
+  }
+
+  void PushBack(uint32_t v) {
+    if (_size == _cap) [[unlikely]] {
+      Grow();
+    }
+    _data[_size++] = v;
+  }
+
+  uint32_t* Data() noexcept { return _data.get(); }
+  const uint32_t* Data() const noexcept { return _data.get(); }
+
+  uint32_t operator[](size_t i) const noexcept {
+    SDB_ASSERT(i < _size);
+    return _data[i];
+  }
+
+ private:
+  void Grow() {
+    const size_t cap = _cap == 0 ? 16 : _cap * 2;
+    auto data = std::make_unique_for_overwrite<uint32_t[]>(cap);
+    if (_size != 0) {
+      std::memcpy(data.get(), _data.get(), _size * sizeof(uint32_t));
+    }
+    _data = std::move(data);
+    _cap = cap;
+  }
+
+  std::unique_ptr<uint32_t[]> _data;
+  size_t _size = 0;
+  size_t _cap = 0;
 };
 
 // n == 2 fused merge-join over two forward-only position iterators, replacing
@@ -871,20 +918,20 @@ class SlopPhraseFrequencyDP {
         auto& ends = _slot_offs_end[i];
         if (detail::slop_dp::gOffsBulkGatherDisabled) [[unlikely]] {
           positions.clear();
-          starts.clear();
-          ends.clear();
+          starts.Clear();
+          ends.Clear();
           const OffsAttr* offs = irs::get<OffsAttr>(it);
           while (it.next()) {
             positions.push_back(it.value());
-            starts.push_back(offs ? offs->start : 0);
-            ends.push_back(offs ? offs->end : 0);
+            starts.PushBack(offs ? offs->start : 0);
+            ends.PushBack(offs ? offs->end : 0);
           }
         } else {
           positions.resize(it.DocFreq());
-          starts.resize(positions.size());
-          ends.resize(positions.size());
+          starts.ResizeUninit(positions.size());
+          ends.ResizeUninit(positions.size());
           const auto count =
-            it.ReadAll(positions.data(), starts.data(), ends.data());
+            it.ReadAll(positions.data(), starts.Data(), ends.Data());
           SDB_ASSERT(count == positions.size());
         }
       }
@@ -897,8 +944,8 @@ class SlopPhraseFrequencyDP {
       positions.clear();
       [[maybe_unused]] const OffsAttr* offs = nullptr;
       if constexpr (Offs) {
-        _slot_offs_start[i].clear();
-        _slot_offs_end[i].clear();
+        _slot_offs_start[i].Clear();
+        _slot_offs_end[i].Clear();
         offs = irs::get<OffsAttr>(it);
       }
       for (const auto& [lo, hi] : _windows) {
@@ -908,8 +955,8 @@ class SlopPhraseFrequencyDP {
         while (v <= hi) {
           positions.push_back(v);
           if constexpr (Offs) {
-            _slot_offs_start[i].push_back(offs ? offs->start : 0);
-            _slot_offs_end[i].push_back(offs ? offs->end : 0);
+            _slot_offs_start[i].PushBack(offs ? offs->start : 0);
+            _slot_offs_end[i].PushBack(offs ? offs->end : 0);
           }
           if (!it.next()) {
             break;
@@ -1118,9 +1165,8 @@ class SlopPhraseFrequencyDP {
   PosAttr::value_t _window_half = 0;
   std::vector<std::vector<PosAttr::value_t>> _slot_pos;
   // Per-slot offsets, parallel to _slot_pos, stored as separate start/end
-  // arrays so the bulk ReadAll overload can fill them directly.
-  std::vector<std::vector<uint32_t>> _slot_offs_start;
-  std::vector<std::vector<uint32_t>> _slot_offs_end;
+  std::vector<detail::slop_dp::UninitU32Buf> _slot_offs_start;
+  std::vector<detail::slop_dp::UninitU32Buf> _slot_offs_end;
   // Merged slop-reachable windows around the rarest slot's positions
   // (seek-gather path only). These scratch members are reused across Match().
   std::vector<detail::slop_dp::Window> _windows;

@@ -107,17 +107,6 @@ void FromPhrase(irs::BooleanFilter& filter, const FilterContext& ctx,
                     ERR_HINT(kSyntaxHint));
   }
 
-  if ((column_info.tokenizer.features &
-       irs::PhraseQuery<irs::FixedPhraseState>::kRequiredFeatures) !=
-      irs::PhraseQuery<irs::FixedPhraseState>::kRequiredFeatures) {
-    THROW_SQL_ERROR(
-      ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
-      ERR_MSG("ts_phrase field should have Positions and Frequency features "
-              "enabled"),
-      ERR_HINT("Recreate the inverted index with both `Positions` and "
-               "`Frequency` features attached to the column."));
-  }
-
   auto& phrase = ctx.negated ? Negate<irs::ByPhrase>(filter)
                              : AddFilter<irs::ByPhrase>(filter);
   phrase.boost(ctx.boost);
@@ -181,6 +170,19 @@ void FromPhrase(irs::BooleanFilter& filter, const FilterContext& ctx,
       ERR_MSG("ts_phrase text arguments produced no searchable terms"),
       ERR_HINT("All ts_phrase text arguments tokenised to nothing (e.g. "
                "all-stopword input). Provide at least one searchable term."));
+  }
+
+  if (opts->size() > 1 &&
+      (column_info.tokenizer.features &
+       irs::PhraseQuery<irs::FixedPhraseState>::kRequiredFeatures) !=
+        irs::PhraseQuery<irs::FixedPhraseState>::kRequiredFeatures) {
+    THROW_SQL_ERROR(
+      ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
+      ERR_MSG("ts_phrase field should have Positions and Frequency features "
+              "enabled for multi-term phrases"),
+      ERR_HINT("Recreate the inverted index with both `Positions` and "
+               "`Frequency` features attached to the column, or query with a "
+               "single-term ts_phrase / ts_like."));
   }
 
   // Composable ::slop(N): ctx.slop > 0 only when a ::slop cast wrapped
@@ -373,23 +375,25 @@ void BuildFtsPhrase(irs::BooleanFilter& parent, const FilterContext& ctx,
     THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
                     ERR_MSG("ts_phrase field is not VARCHAR"));
   }
-  if ((column_info.tokenizer.features &
-       irs::PhraseQuery<irs::FixedPhraseState>::kRequiredFeatures) !=
-      irs::PhraseQuery<irs::FixedPhraseState>::kRequiredFeatures) {
-    THROW_SQL_ERROR(
-      ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
-      ERR_MSG("ts_phrase field should have Positions and Frequency features "
-              "enabled"),
-      ERR_HINT("Recreate the inverted index with both `Positions` and "
-               "`Frequency` features attached to the column."));
-  }
   auto& phrase = ctx.negated ? Negate<irs::ByPhrase>(parent)
                              : AddFilter<irs::ByPhrase>(parent);
   *phrase.mutable_field_id() =
     PickPerKindFieldId(column_info, duckdb::LogicalTypeId::VARCHAR);
   phrase.boost(ctx.boost);
-  EmitPhraseTokens(*phrase.mutable_options(), ctx, column_info, text,
-                   PhraseGap{});
+  auto* opts = phrase.mutable_options();
+  EmitPhraseTokens(*opts, ctx, column_info, text, PhraseGap{});
+  if (opts->size() > 1 &&
+      (column_info.tokenizer.features &
+       irs::PhraseQuery<irs::FixedPhraseState>::kRequiredFeatures) !=
+        irs::PhraseQuery<irs::FixedPhraseState>::kRequiredFeatures) {
+    THROW_SQL_ERROR(
+      ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
+      ERR_MSG("ts_phrase field should have Positions and Frequency features "
+              "enabled for multi-term phrases"),
+      ERR_HINT("Recreate the inverted index with both `Positions` and "
+               "`Frequency` features attached to the column, or query with a "
+               "single-term ts_phrase / ts_like."));
+  }
 }
 
 PhraseGap ParsePhraseSeqGap(const duckdb::Expression& expr) {
@@ -567,17 +571,6 @@ void EmitPhraseSeq(irs::BooleanFilter& parent, const FilterContext& ctx,
     THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
                     ERR_MSG("## field is not VARCHAR"), ERR_HINT(kSyntaxHint));
   }
-  if ((column_info.tokenizer.features &
-       irs::PhraseQuery<irs::FixedPhraseState>::kRequiredFeatures) !=
-      irs::PhraseQuery<irs::FixedPhraseState>::kRequiredFeatures) {
-    THROW_SQL_ERROR(
-      ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
-      ERR_MSG("## field should have Positions and Frequency features "
-              "enabled"),
-      ERR_HINT("Recreate the inverted index with both `Positions` and "
-               "`Frequency` features attached to the column."));
-  }
-
   auto& phrase = ctx.negated ? Negate<irs::ByPhrase>(parent)
                              : AddFilter<irs::ByPhrase>(parent);
   *phrase.mutable_field_id() =
@@ -758,6 +751,18 @@ void EmitPhraseSeq(irs::BooleanFilter& parent, const FilterContext& ctx,
           ERR_HINT("Supported phrase parts: bare 'word', ts_starts_with, "
                    "ts_like, ts_levenshtein, ts_phrase, ts_any, ts_between."));
     }
+  }
+  if (options->size() > 1 &&
+      (column_info.tokenizer.features &
+       irs::PhraseQuery<irs::FixedPhraseState>::kRequiredFeatures) !=
+        irs::PhraseQuery<irs::FixedPhraseState>::kRequiredFeatures) {
+    THROW_SQL_ERROR(
+      ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
+      ERR_MSG("## field should have Positions and Frequency features "
+              "enabled for multi-term phrases"),
+      ERR_HINT("Recreate the inverted index with both `Positions` and "
+               "`Frequency` features attached to the column, or query with a "
+               "single phrase part."));
   }
 }
 
