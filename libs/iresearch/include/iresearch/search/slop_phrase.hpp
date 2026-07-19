@@ -55,10 +55,10 @@
 // positions. ResolveSeekGather picks between them (kSeekGatherSkew,
 // overridable by the gGatherOverride test seam).
 //
-// expected_step == 1 reproduces the original SlopPhraseFrequency formula
-// bit-for-bit; expected_step > 1 adds per-slot positional gaps from
-// push_back(term, offs). Interval gaps (offs_min != offs_max) with slop are
-// rejected upstream by SDB_ENSURE.
+// expected_step == 1 is the plain adjacent-term cost model (ES-verified);
+// expected_step > 1 adds per-slot positional gaps from push_back(term, offs).
+// Interval gaps (offs_min != offs_max) with slop are rejected upstream by
+// SDB_ENSURE.
 
 // Profiling aid: with -DSLOP_PROFILE, force the matcher (Run), the window
 // builder (BuildWindows) and the pair join (JoinPair) out of line so a
@@ -78,7 +78,7 @@ class PhrasePosition;
 template<typename T>
 struct HasPosition;
 
-namespace detail::slop_dp {
+namespace detail::slop {
 
 // Step cost for one slot transition, over delta = pos[slot] - pos[partner]
 // in phrase order. For a regular adjacent term (expected == 1): adjacency
@@ -113,7 +113,7 @@ constexpr PosAttr::value_t StepCost(int64_t delta,
   return static_cast<PosAttr::value_t>(exp - delta + 1);
 }
 
-struct DpResult {
+struct MatchResult {
   uint64_t freq = 0;
   PosAttr::value_t best_distance = 0;
   bool any = false;
@@ -122,7 +122,7 @@ struct DpResult {
 // Scratch passed from the Frequency object into Run: the DFS chain and slot
 // visitation order, whose capacity is reused across anchor positions and
 // documents instead of reallocated per call.
-struct DpScratch {
+struct MatchScratch {
   std::vector<PosAttr::value_t> chain;
   std::vector<uint32_t> order;
 };
@@ -133,8 +133,8 @@ using Window = std::pair<PosAttr::value_t, PosAttr::value_t>;
 // Engage seek-based gather (read the rarest slot, seek the rest into
 // slop-reachable windows) only when the rarest slot is at least this many
 // times rarer than the densest. Conservative: on balanced frequencies plain
-// read-all is the safe choice. TODO(perf): 3 leaves some win on the table on
-// moderately-skewed data, and the crossover shifts with large slop (windows
+// read-all is the safe choice. TODO(aksel2904): 3 leaves some win on the table
+// on moderately-skewed data, and the crossover shifts with large slop (windows
 // widen toward full coverage and erode the seek win); recalibrate under
 // measurement.
 inline constexpr uint64_t kSeekGatherSkew = 3;
@@ -266,7 +266,7 @@ class UninitU32Buf {
 // leftmost_slot, rightmost_slot) as Run's collector does. When !HasFreq the
 // join returns at the first valid pair.
 template<bool Offs, bool HasFreq, typename AnchorIt, typename PartnerIt>
-SLOP_PROF_NOINLINE DpResult JoinPair(
+SLOP_PROF_NOINLINE MatchResult JoinPair(
   AnchorIt& anchor, PartnerIt& partner, const OffsAttr* anchor_offs,
   const OffsAttr* partner_offs, bool anchor_is_slot0, PosAttr::value_t slop,
   PosAttr::value_t expected, bool enforce_uniqueness, PairScratch& scratch,
@@ -275,7 +275,7 @@ SLOP_PROF_NOINLINE DpResult JoinPair(
     // A collector implies a full count; early exit would truncate it.
     SDB_ASSERT(out == nullptr);
   }
-  DpResult res{};
+  MatchResult res{};
   if (out) {
     out->clear();
   }
@@ -657,7 +657,7 @@ inline void CountFromAnchor(
   const std::vector<std::vector<PosAttr::value_t>>& slots,
   PosAttr::value_t slop, const std::vector<PosAttr::value_t>& expected_steps,
   std::vector<PosAttr::value_t>& chain, const std::vector<uint32_t>& order,
-  uint32_t anchor, size_t d, PosAttr::value_t cost_so_far, DpResult& res,
+  uint32_t anchor, size_t d, PosAttr::value_t cost_so_far, MatchResult& res,
   bool early_exit, const std::vector<uint32_t>& groups, bool enforce_uniqueness,
   std::vector<EnumeratedMatch>* out) {
   const size_t n = slots.size();
@@ -757,17 +757,18 @@ inline void CountFromAnchor(
   }
 }
 
-SLOP_PROF_NOINLINE inline DpResult Run(
+SLOP_PROF_NOINLINE inline MatchResult Run(
   const std::vector<std::vector<PosAttr::value_t>>& slot_pos,
   PosAttr::value_t slop, const std::vector<PosAttr::value_t>& expected_steps,
-  DpScratch& scratch, bool early_exit, const std::vector<uint32_t>& groups = {},
+  MatchScratch& scratch, bool early_exit,
+  const std::vector<uint32_t>& groups = {},
   std::vector<EnumeratedMatch>* out = nullptr) {
   // A collector implies a full count; early exit would truncate it.
   SDB_ASSERT(!(early_exit && out));
   if (out) {
     out->clear();
   }
-  DpResult res{};
+  MatchResult res{};
   const size_t n = slot_pos.size();
   if (n < 2) {
     return res;
@@ -832,15 +833,14 @@ SLOP_PROF_NOINLINE inline DpResult Run(
   return res;
 }
 
-}  // namespace detail::slop_dp
+}  // namespace detail::slop
 
-// Replaces SlopPhraseFrequency. Offs collects OffsAttr and emits per-match
-// offsets through PhrasePosition iteration. HasFreq computes exact freq +
-// best_distance; when false the DP early-exits on the first valid tuple and
-// sets freq to 1 to signal a match. kHasBoost = HasFreq, per the original
-// convention.
+// Sloppy counterpart of FixedPhraseFrequency. Offs collects OffsAttr and
+// emits per-match offsets through PhrasePosition iteration. HasFreq computes
+// exact freq + best_distance; when false the matcher early-exits on the first
+// valid tuple and sets freq to 1 to signal a match. kHasBoost = HasFreq.
 template<bool Offs, bool HasFreq>
-class SlopPhraseFrequencyDP {
+class SlopPhraseFrequency {
  public:
   using TermPosition = FixedTermPosition<Offs>;
   using Positions = std::vector<TermPosition>;
@@ -848,9 +848,9 @@ class SlopPhraseFrequencyDP {
   static constexpr bool kHasBoost = HasFreq;
   static constexpr bool kHasFreq = HasFreq;
 
-  SlopPhraseFrequencyDP(std::vector<TermPosition>&& pos,
-                        PosAttr::value_t max_slop,
-                        std::vector<PosAttr::value_t>&& expected_steps) noexcept
+  SlopPhraseFrequency(std::vector<TermPosition>&& pos,
+                      PosAttr::value_t max_slop,
+                      std::vector<PosAttr::value_t>&& expected_steps) noexcept
     : _pos{std::move(pos)},
       _max_slop{max_slop},
       _expected_steps{std::move(expected_steps)} {
@@ -887,7 +887,7 @@ class SlopPhraseFrequencyDP {
 
     // Two-slot phrases bypass gather + Run entirely: the fused
     // merge-join consumes the position iterators directly.
-    if (n == 2 && !detail::slop_dp::gPairJoinDisabled) {
+    if (n == 2 && !detail::slop::gPairJoinDisabled) {
       return MatchPair();
     }
 
@@ -916,7 +916,7 @@ class SlopPhraseFrequencyDP {
       } else {
         auto& starts = _slot_offs_start[i];
         auto& ends = _slot_offs_end[i];
-        if (detail::slop_dp::gOffsBulkGatherDisabled) [[unlikely]] {
+        if (detail::slop::gOffsBulkGatherDisabled) [[unlikely]] {
           positions.clear();
           starts.Clear();
           ends.Clear();
@@ -984,17 +984,16 @@ class SlopPhraseFrequencyDP {
         max_df = df;
       }
     }
-    const bool seek_gather = detail::slop_dp::ResolveSeekGather(
+    const bool seek_gather = detail::slop::ResolveSeekGather(
       min_df != 0 &&
-      static_cast<uint64_t>(min_df) * detail::slop_dp::kSeekGatherSkew <=
-        max_df);
+      static_cast<uint64_t>(min_df) * detail::slop::kSeekGatherSkew <= max_df);
 
     if (seek_gather) {
       gather_all(rare);
       if (_slot_pos[rare].empty()) {
         return false;
       }
-      detail::slop_dp::BuildWindows(_slot_pos[rare], _window_half, _windows);
+      detail::slop::BuildWindows(_slot_pos[rare], _window_half, _windows);
       for (size_t i = 0; i < n; ++i) {
         if (i == rare) {
           continue;
@@ -1013,13 +1012,13 @@ class SlopPhraseFrequencyDP {
       }
     }
 
-    std::vector<detail::slop_dp::EnumeratedMatch>* collect = nullptr;
+    std::vector<detail::slop::EnumeratedMatch>* collect = nullptr;
     if constexpr (Offs && HasFreq) {
       collect = &_enumerated;
     }
     auto res =
-      detail::slop_dp::Run(_slot_pos, _max_slop, _expected_steps, _dp_scratch,
-                           /*early_exit=*/!HasFreq, _term_groups, collect);
+      detail::slop::Run(_slot_pos, _max_slop, _expected_steps, _match_scratch,
+                        /*early_exit=*/!HasFreq, _term_groups, collect);
     if (!res.any) {
       return false;
     }
@@ -1046,7 +1045,7 @@ class SlopPhraseFrequencyDP {
   }
 
  private:
-  friend class PhrasePosition<SlopPhraseFrequencyDP>;
+  friend class PhrasePosition<SlopPhraseFrequency>;
 
   struct OffsetPair {
     uint32_t start;
@@ -1093,14 +1092,14 @@ class SlopPhraseFrequencyDP {
       partner_offs = irs::get<OffsAttr>(partner);
     }
 
-    std::vector<detail::slop_dp::PairMatch>* collect = nullptr;
+    std::vector<detail::slop::PairMatch>* collect = nullptr;
     if constexpr (Offs && HasFreq) {
       collect = &_pair_matches;
     }
 
-    const auto res = detail::slop_dp::JoinPair<Offs, HasFreq>(
+    const auto res = detail::slop::JoinPair<Offs, HasFreq>(
       anchor, partner, anchor_offs, partner_offs, anchor_is_slot0, _max_slop,
-      _expected_steps[0], detail::slop_dp::EnforceUniqueness(_term_groups),
+      _expected_steps[0], detail::slop::EnforceUniqueness(_term_groups),
       _pair_scratch, collect);
     if (!res.any) {
       return false;
@@ -1165,19 +1164,19 @@ class SlopPhraseFrequencyDP {
   PosAttr::value_t _window_half = 0;
   std::vector<std::vector<PosAttr::value_t>> _slot_pos;
   // Per-slot offsets, parallel to _slot_pos, stored as separate start/end
-  std::vector<detail::slop_dp::UninitU32Buf> _slot_offs_start;
-  std::vector<detail::slop_dp::UninitU32Buf> _slot_offs_end;
+  std::vector<detail::slop::UninitU32Buf> _slot_offs_start;
+  std::vector<detail::slop::UninitU32Buf> _slot_offs_end;
   // Merged slop-reachable windows around the rarest slot's positions
   // (seek-gather path only). These scratch members are reused across Match().
-  std::vector<detail::slop_dp::Window> _windows;
-  // DP scratch, kept off the allocator on the hot path.
-  detail::slop_dp::DpScratch _dp_scratch;
+  std::vector<detail::slop::Window> _windows;
+  // Matcher scratch, kept off the allocator on the hot path.
+  detail::slop::MatchScratch _match_scratch;
   // Valid tuples from the matcher pass, sorted by leftmost (Offs && HasFreq
   // only); source for BuildMatches.
-  std::vector<detail::slop_dp::EnumeratedMatch> _enumerated;
+  std::vector<detail::slop::EnumeratedMatch> _enumerated;
   // n == 2 fused merge-join state.
-  detail::slop_dp::PairScratch _pair_scratch;
-  std::vector<detail::slop_dp::PairMatch> _pair_matches;
+  detail::slop::PairScratch _pair_scratch;
+  std::vector<detail::slop::PairMatch> _pair_matches;
   // All emitted matches (Offs && HasFreq only), sorted by leftmost; each holds
   // the leftmost token's start and the rightmost token's end offset.
   std::vector<OffsetPair> _matches;
@@ -1190,9 +1189,9 @@ class SlopPhraseFrequencyDP {
   std::vector<uint32_t> _term_groups;
 };
 
-// Variadic sloppy phrase frequency. Replaces SlopVariadicPhraseFrequency.
+// Sloppy counterpart of VariadicPhraseFrequency.
 template<typename Adapter, bool HasFreq>
-class SlopVariadicPhraseFrequencyDP {
+class SlopVariadicPhraseFrequency {
  public:
   using TermPosition = VariadicTermPosition<Adapter>;
   using Positions = std::vector<TermPosition>;
@@ -1200,7 +1199,7 @@ class SlopVariadicPhraseFrequencyDP {
   static constexpr bool kHasBoost = HasFreq;
   static constexpr bool kHasFreq = HasFreq;
 
-  SlopVariadicPhraseFrequencyDP(
+  SlopVariadicPhraseFrequency(
     std::vector<TermPosition>&& pos, PosAttr::value_t max_slop,
     std::vector<PosAttr::value_t>&& expected_steps) noexcept
     : _pos{std::move(pos)},
@@ -1237,11 +1236,11 @@ class SlopVariadicPhraseFrequencyDP {
 
     // Two-slot phrases bypass gather + Run entirely: the fused merge-join
     // consumes the merged per-slot position streams directly.
-    if (n == 2 && !detail::slop_dp::gPairJoinDisabled) {
+    if (n == 2 && !detail::slop::gPairJoinDisabled) {
       return MatchPair();
     }
 
-    // Reuse inner vectors' capacity (see SlopPhraseFrequencyDP::Match)
+    // Reuse inner vectors' capacity (see SlopPhraseFrequency::Match)
     _slot_pos.resize(n);
     for (auto& s : _slot_pos) {
       s.clear();
@@ -1291,7 +1290,7 @@ class SlopVariadicPhraseFrequencyDP {
 
     // No exact per-doc position count on the compound iterator, so the rarest
     // slot is picked by the disjunction's doc-level cost estimate. Steers
-    // which slot leads the gather (perf), never correctness. TODO(perf): a
+    // which slot leads the gather (perf), never correctness. TODO(aksel2904): a
     // per-doc DocFreq-summing pass would gate more precisely; deferred.
     size_t rare = 0;
     uint64_t min_cost = std::numeric_limits<uint64_t>::max();
@@ -1306,14 +1305,14 @@ class SlopVariadicPhraseFrequencyDP {
         max_cost = c;
       }
     }
-    const bool seek_gather = detail::slop_dp::ResolveSeekGather(
-      min_cost != 0 && min_cost * detail::slop_dp::kSeekGatherSkew <= max_cost);
+    const bool seek_gather = detail::slop::ResolveSeekGather(
+      min_cost != 0 && min_cost * detail::slop::kSeekGatherSkew <= max_cost);
 
     if (seek_gather) {
       if (!gather_all(rare)) {
         return false;
       }
-      detail::slop_dp::BuildWindows(_slot_pos[rare], _window_half, _windows);
+      detail::slop::BuildWindows(_slot_pos[rare], _window_half, _windows);
       for (size_t i = 0; i < n; ++i) {
         if (i == rare) {
           continue;
@@ -1333,13 +1332,13 @@ class SlopVariadicPhraseFrequencyDP {
     // Uniqueness is scoped to slot groups: connectivity components of the
     // per-segment query term sets, computed at prepare-collect and carried
     // in TermInterval::term_group (ES-verified rule).
-    std::vector<detail::slop_dp::EnumeratedMatch>* collect = nullptr;
+    std::vector<detail::slop::EnumeratedMatch>* collect = nullptr;
     if constexpr (kHasOffsets && HasFreq) {
       collect = &_enumerated;
     }
     auto res =
-      detail::slop_dp::Run(_slot_pos, _max_slop, _expected_steps, _dp_scratch,
-                           /*early_exit=*/!HasFreq, _term_groups, collect);
+      detail::slop::Run(_slot_pos, _max_slop, _expected_steps, _match_scratch,
+                        /*early_exit=*/!HasFreq, _term_groups, collect);
     if (!res.any) {
       return false;
     }
@@ -1366,7 +1365,7 @@ class SlopVariadicPhraseFrequencyDP {
   }
 
  private:
-  friend class PhrasePosition<SlopVariadicPhraseFrequencyDP>;
+  friend class PhrasePosition<SlopVariadicPhraseFrequency>;
 
   static constexpr bool kHasOffsets =
     std::is_same_v<Adapter, VariadicPhraseOffsetAdapter>;
@@ -1420,7 +1419,7 @@ class SlopVariadicPhraseFrequencyDP {
   }
 
   struct BindCtx {
-    detail::slop_dp::MergedPosStream<kHasOffsets>* stream;
+    detail::slop::MergedPosStream<kHasOffsets>* stream;
   };
 
   // Registers one sub-iterator of the current document into the slot's
@@ -1465,7 +1464,7 @@ class SlopVariadicPhraseFrequencyDP {
 
   struct WindowCtx {
     std::vector<PosEntry>* out;
-    const std::vector<detail::slop_dp::Window>* windows;
+    const std::vector<detail::slop::Window>* windows;
   };
 
   // Seek-gather variant: for each sub-iterator, read only positions
@@ -1510,7 +1509,7 @@ class SlopVariadicPhraseFrequencyDP {
     return {&_start_offset, &_end_offset};
   }
 
-  // See SlopPhraseFrequencyDP::NextPosition() for state machine
+  // See SlopPhraseFrequency::NextPosition() for state machine
   uint32_t NextPosition() {
     if constexpr (!kHasOffsets || !HasFreq) {
       return 0;
@@ -1584,7 +1583,7 @@ class SlopVariadicPhraseFrequencyDP {
     return RunPair(_merged[a], a_offs, _merged[p], p_offs, anchor_is_slot0);
   }
 
-  std::vector<detail::slop_dp::PairMatch>* PairCollect() {
+  std::vector<detail::slop::PairMatch>* PairCollect() {
     if constexpr (kHasOffsets && HasFreq) {
       return &_pair_matches;
     } else {
@@ -1594,7 +1593,7 @@ class SlopVariadicPhraseFrequencyDP {
 
   // Maps a JoinPair result onto the generic outputs; shared by the raw and
   // merged branches of MatchPair.
-  bool FinishPair(const detail::slop_dp::DpResult& res) {
+  bool FinishPair(const detail::slop::MatchResult& res) {
     if (!res.any) {
       return false;
     }
@@ -1625,13 +1624,13 @@ class SlopVariadicPhraseFrequencyDP {
   bool RunPair(AnchorIt& anchor, const OffsAttr* anchor_offs,
                PartnerIt& partner, const OffsAttr* partner_offs,
                bool anchor_is_slot0) {
-    return FinishPair(detail::slop_dp::JoinPair<kHasOffsets, HasFreq>(
+    return FinishPair(detail::slop::JoinPair<kHasOffsets, HasFreq>(
       anchor, partner, anchor_offs, partner_offs, anchor_is_slot0, _max_slop,
-      _expected_steps[0], detail::slop_dp::EnforceUniqueness(_term_groups),
+      _expected_steps[0], detail::slop::EnforceUniqueness(_term_groups),
       _pair_scratch, PairCollect()));
   }
 
-  // See SlopPhraseFrequencyDP::BuildMatches
+  // See SlopPhraseFrequency::BuildMatches
   void BuildMatches() {
     if constexpr (!kHasOffsets || !HasFreq) {
       return;
@@ -1668,16 +1667,16 @@ class SlopVariadicPhraseFrequencyDP {
   std::vector<PosEntry> _scratch_entries;
   // Merged slop-reachable windows around the rarest slot's positions
   // (seek-gather path only). These scratch members are reused across Match().
-  std::vector<detail::slop_dp::Window> _windows;
-  // DP scratch, kept off the allocator on the hot path.
-  detail::slop_dp::DpScratch _dp_scratch;
+  std::vector<detail::slop::Window> _windows;
+  // Matcher scratch, kept off the allocator on the hot path.
+  detail::slop::MatchScratch _match_scratch;
   // Valid tuples from the matcher pass, sorted by leftmost (kHasOffsets &&
   // HasFreq only).
-  std::vector<detail::slop_dp::EnumeratedMatch> _enumerated;
+  std::vector<detail::slop::EnumeratedMatch> _enumerated;
   // n == 2 fused merge-join state.
-  std::array<detail::slop_dp::MergedPosStream<kHasOffsets>, 2> _merged;
-  detail::slop_dp::PairScratch _pair_scratch;
-  std::vector<detail::slop_dp::PairMatch> _pair_matches;
+  std::array<detail::slop::MergedPosStream<kHasOffsets>, 2> _merged;
+  detail::slop::PairScratch _pair_scratch;
+  std::vector<detail::slop::PairMatch> _pair_matches;
   std::vector<OffsetPair> _matches;
   size_t _match_idx = 0;
   uint32_t _phrase_freq = 0;

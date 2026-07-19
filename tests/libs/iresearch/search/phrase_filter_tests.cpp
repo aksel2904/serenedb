@@ -8066,6 +8066,31 @@ TEST_P(PhraseFilterTestCase, sloppy_phrase_edge_cases) {
     ASSERT_TRUE(irs::doc_limits::eof(docs->value()));
   }
 
+  // Single terms-set part + slop: one slot makes slop meaningless; must
+  // match exactly what the same query matches at slop 0.
+  {
+    const auto collect = [&](irs::PosAttr::value_t slop) {
+      irs::ByPhrase q;
+      *q.mutable_field_id() = kPhraseAnl;
+      auto& st = q.mutable_options()->push_back<irs::ByTermsOptions>();
+      st.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view("fox")));
+      st.terms.emplace(irs::ViewCast<irs::byte_type>(std::string_view("that")));
+      q.mutable_options()->set_slop(slop);
+
+      tests::PreparedFilter prepared{q, rdr};
+      std::vector<irs::doc_id_t> out;
+      auto docs = prepared.Execute(0);
+      while (!irs::doc_limits::eof(docs->advance())) {
+        out.push_back(docs->value());
+      }
+      return out;
+    };
+
+    const auto plain = collect(0);
+    ASSERT_FALSE(plain.empty());
+    ASSERT_EQ(plain, collect(5));
+  }
+
   // Empty field + slop.
   {
     irs::ByPhrase q;

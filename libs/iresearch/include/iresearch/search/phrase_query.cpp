@@ -22,7 +22,7 @@
 
 #include "phrase_query.hpp"
 
-#include <iresearch/search/slop_phrase_dp.hpp>
+#include <iresearch/search/slop_phrase.hpp>
 
 #include "iresearch/formats/posting/iterator_doc.hpp"
 #include "iresearch/index/field_meta.hpp"
@@ -112,8 +112,8 @@ DocIterator::ptr FixedPhraseQuery::Execute(const ExecutionContext& ctx,
   if (this->slop > 0) {
     auto expected_steps = BuildExpectedSteps(this->positions);
     if (!scorer) {
-      using SlopIterator = PhraseIterator<Conjunction<Adapter>,
-                                          SlopPhraseFrequencyDP<false, false>>;
+      using SlopIterator =
+        PhraseIterator<Conjunction<Adapter>, SlopPhraseFrequency<false, false>>;
       return memory::make_managed<SlopIterator>(
         static_cast<doc_id_t>(rdr.docs_count()), std::move(itrs),
         std::move(positions), this->slop, std::move(expected_steps));
@@ -122,7 +122,7 @@ DocIterator::ptr FixedPhraseQuery::Execute(const ExecutionContext& ctx,
     const auto* stats_data =
       all_stats.empty() ? nullptr : all_stats.back().c_str();
     using SlopIterator =
-      PhraseIterator<Conjunction<Adapter>, SlopPhraseFrequencyDP<false, true>>;
+      PhraseIterator<Conjunction<Adapter>, SlopPhraseFrequency<false, true>>;
     return memory::make_managed<SlopIterator>(
       static_cast<doc_id_t>(rdr.docs_count()), std::move(itrs),
       std::move(positions), this->slop, std::move(expected_steps),
@@ -174,7 +174,7 @@ DocIterator::ptr FixedPhraseQuery::ExecuteWithOffsets(
     using Adapter = PostingAdapter<PostingIteratorBase<FixedTermTraits<true>>>;
     using SlopIterator =
       PhraseIterator<Conjunction<Adapter>,
-                     PhrasePosition<SlopPhraseFrequencyDP<true, true>>>;
+                     PhrasePosition<SlopPhraseFrequency<true, true>>>;
 
     std::vector<Adapter> itrs;
     itrs.reserve(phrase_state->terms.size());
@@ -367,12 +367,14 @@ DocIterator::ptr VariadicPhraseQuery::Execute(const ExecutionContext& ctx,
   SDB_ENSURE(this->slop == 0 || !has_intervals,
              "slop and intervals are mutually exclusive");
 
-  if (this->slop > 0) {
+  // Slop is meaningless for a single slot; the plain path below already
+  // has the degenerate (term-query-like) semantics ES uses for it.
+  if (this->slop > 0 && phrase_size > 1) {
     auto expected_steps = BuildExpectedSteps(this->positions);
     if (!scorer) {
       using SlopIterator = PhraseIterator<
         Conjunction<ScoreAdapter>,
-        SlopVariadicPhraseFrequencyDP<VariadicPhraseAdapter, false>>;
+        SlopVariadicPhraseFrequency<VariadicPhraseAdapter, false>>;
       return memory::make_managed<SlopIterator>(
         static_cast<doc_id_t>(rdr.docs_count()), std::move(conj_itrs),
         std::move(positions), this->slop, std::move(expected_steps));
@@ -380,9 +382,9 @@ DocIterator::ptr VariadicPhraseQuery::Execute(const ExecutionContext& ctx,
     const auto& all_stats = stats.GetAllStats();
     const auto* stats_data =
       all_stats.empty() ? nullptr : all_stats.back().c_str();
-    using SlopIterator = PhraseIterator<
-      Conjunction<ScoreAdapter>,
-      SlopVariadicPhraseFrequencyDP<VariadicPhraseAdapter, true>>;
+    using SlopIterator =
+      PhraseIterator<Conjunction<ScoreAdapter>,
+                     SlopVariadicPhraseFrequency<VariadicPhraseAdapter, true>>;
     return memory::make_managed<SlopIterator>(
       static_cast<doc_id_t>(rdr.docs_count()), std::move(conj_itrs),
       std::move(positions), this->slop, std::move(expected_steps),
@@ -445,10 +447,12 @@ DocIterator::ptr VariadicPhraseQuery::ExecuteWithOffsets(
   SDB_ENSURE(this->slop == 0 || !has_intervals,
              "slop and intervals are mutually exclusive");
 
-  if (this->slop > 0) {
+  // Slop is meaningless for a single slot; the plain path below already
+  // has the degenerate (term-query-like) semantics ES uses for it.
+  if (this->slop > 0 && phrase_size > 1) {
     using SlopIterator = PhraseIterator<
       Conjunction<ScoreAdapter>,
-      PhrasePosition<SlopVariadicPhraseFrequencyDP<Adapter, true>>>;
+      PhrasePosition<SlopVariadicPhraseFrequency<Adapter, true>>>;
 
     std::vector<VariadicTermPosition<Adapter>> positions;
     positions.resize(phrase_size);

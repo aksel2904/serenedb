@@ -33,7 +33,7 @@
 // the join and the comparison would be a tautology. Join-vs-legacy
 // equivalence is asserted separately by the pair_join_equivalence_* tests.
 // The SlopOverlapMatcher tests at the end pin the n >= 3 same-position
-// (term-group) semantics of dp::Run.
+// (term-group) semantics of spm::Run.
 //
 
 #include "filter_test_case_base.hpp"
@@ -42,12 +42,12 @@
 #include "iresearch/search/phrase_filter.hpp"
 #include "iresearch/search/phrase_iterator.hpp"
 #include "iresearch/search/phrase_query.hpp"
-#include "iresearch/search/slop_phrase_dp.hpp"
+#include "iresearch/search/slop_phrase.hpp"
 #include "tests_shared.hpp"
 
 namespace {
 
-namespace dp = irs::detail::slop_dp;
+namespace spm = irs::detail::slop;
 
 constexpr irs::field_id kField = tests::FieldIdFor("phrase_anl");
 
@@ -55,10 +55,10 @@ constexpr irs::field_id kField = tests::FieldIdFor("phrase_anl");
 // never leaks into another test.
 class GatherModeGuard {
  public:
-  explicit GatherModeGuard(dp::GatherOverride mode) noexcept {
-    dp::gGatherOverride = mode;
+  explicit GatherModeGuard(spm::GatherOverride mode) noexcept {
+    spm::gGatherOverride = mode;
   }
-  ~GatherModeGuard() { dp::gGatherOverride = dp::GatherOverride::kAuto; }
+  ~GatherModeGuard() { spm::gGatherOverride = spm::GatherOverride::kAuto; }
 
   GatherModeGuard(const GatherModeGuard&) = delete;
   GatherModeGuard& operator=(const GatherModeGuard&) = delete;
@@ -70,8 +70,8 @@ class GatherModeGuard {
 // GatherModeGuard: never leaks past the scope.
 class PairJoinGuard {
  public:
-  PairJoinGuard() noexcept { dp::gPairJoinDisabled = true; }
-  ~PairJoinGuard() { dp::gPairJoinDisabled = false; }
+  PairJoinGuard() noexcept { spm::gPairJoinDisabled = true; }
+  ~PairJoinGuard() { spm::gPairJoinDisabled = false; }
 
   PairJoinGuard(const PairJoinGuard&) = delete;
   PairJoinGuard& operator=(const PairJoinGuard&) = delete;
@@ -83,8 +83,8 @@ class PairJoinGuard {
 // GatherModeGuard: never leaks past the scope.
 class OffsBulkScalarGuard {
  public:
-  OffsBulkScalarGuard() noexcept { dp::gOffsBulkGatherDisabled = true; }
-  ~OffsBulkScalarGuard() { dp::gOffsBulkGatherDisabled = false; }
+  OffsBulkScalarGuard() noexcept { spm::gOffsBulkGatherDisabled = true; }
+  ~OffsBulkScalarGuard() { spm::gOffsBulkGatherDisabled = false; }
 
   OffsBulkScalarGuard(const OffsBulkScalarGuard&) = delete;
   OffsBulkScalarGuard& operator=(const OffsBulkScalarGuard&) = delete;
@@ -163,12 +163,12 @@ class SlopSeekGatherTestCase : public tests::FilterTestCaseBase {
     std::vector<irs::doc_id_t> seek;
     {
       PairJoinGuard pj;
-      GatherModeGuard g{dp::GatherOverride::kForceReadAll};
+      GatherModeGuard g{spm::GatherOverride::kForceReadAll};
       read_all = CollectDocs(prepared);
     }
     {
       PairJoinGuard pj;
-      GatherModeGuard g{dp::GatherOverride::kForceSeek};
+      GatherModeGuard g{spm::GatherOverride::kForceSeek};
       seek = CollectDocs(prepared);
     }
     ASSERT_EQ(read_all, seek) << "seek-gather diverged from read-all: " << ctx;
@@ -181,8 +181,8 @@ class SlopSeekGatherTestCase : public tests::FilterTestCaseBase {
 // load-bearing because forward-only seek cannot re-read).
 
 TEST(SlopBuildWindows, single) {
-  std::vector<dp::Window> out;
-  dp::BuildWindows(/*lead_pos=*/{10}, /*w=*/2, out);
+  std::vector<spm::Window> out;
+  spm::BuildWindows(/*lead_pos=*/{10}, /*w=*/2, out);
   ASSERT_EQ(1u, out.size());
   ASSERT_EQ(8u, out[0].first);
   ASSERT_EQ(12u, out[0].second);
@@ -191,16 +191,16 @@ TEST(SlopBuildWindows, single) {
 TEST(SlopBuildWindows, lo_clamped_to_min) {
   // p <= w must clamp lo to pos_limits::min() (==1), not 0, so seek() on
   // a fresh iterator is not a no-op.
-  std::vector<dp::Window> out;
-  dp::BuildWindows(/*lead_pos=*/{2}, /*w=*/5, out);
+  std::vector<spm::Window> out;
+  spm::BuildWindows(/*lead_pos=*/{2}, /*w=*/5, out);
   ASSERT_EQ(1u, out.size());
   ASSERT_EQ(irs::pos_limits::min(), out[0].first);
   ASSERT_EQ(7u, out[0].second);
 }
 
 TEST(SlopBuildWindows, disjoint) {
-  std::vector<dp::Window> out;
-  dp::BuildWindows(/*lead_pos=*/{10, 100}, /*w=*/2, out);
+  std::vector<spm::Window> out;
+  spm::BuildWindows(/*lead_pos=*/{10, 100}, /*w=*/2, out);
   ASSERT_EQ(2u, out.size());
   ASSERT_EQ(8u, out[0].first);
   ASSERT_EQ(12u, out[0].second);
@@ -210,8 +210,8 @@ TEST(SlopBuildWindows, disjoint) {
 
 TEST(SlopBuildWindows, overlap_merges) {
   // 10 -> [8,12], 13 -> [11,15]; 11 <= 12 so they merge to [8,15].
-  std::vector<dp::Window> out;
-  dp::BuildWindows(/*lead_pos=*/{10, 13}, /*w=*/2, out);
+  std::vector<spm::Window> out;
+  spm::BuildWindows(/*lead_pos=*/{10, 13}, /*w=*/2, out);
   ASSERT_EQ(1u, out.size());
   ASSERT_EQ(8u, out[0].first);
   ASSERT_EQ(15u, out[0].second);
@@ -219,8 +219,8 @@ TEST(SlopBuildWindows, overlap_merges) {
 
 TEST(SlopBuildWindows, touching_then_gap) {
   // 10->[8,12], 12->[10,14] merge to [8,14]; 100->[98,102] stays separate.
-  std::vector<dp::Window> out;
-  dp::BuildWindows(/*lead_pos=*/{10, 12, 100}, /*w=*/2, out);
+  std::vector<spm::Window> out;
+  spm::BuildWindows(/*lead_pos=*/{10, 12, 100}, /*w=*/2, out);
   ASSERT_EQ(2u, out.size());
   ASSERT_EQ(8u, out[0].first);
   ASSERT_EQ(14u, out[0].second);
@@ -231,9 +231,9 @@ TEST(SlopBuildWindows, touching_then_gap) {
 TEST(SlopBuildWindows, hi_capped_below_eof) {
   // p + w overflowing toward eof must cap hi at eof() - 1: the gather
   // loops compare positions with a bare v <= hi, and eof may never pass.
-  std::vector<dp::Window> out;
+  std::vector<spm::Window> out;
   const irs::PosAttr::value_t p = irs::pos_limits::eof() - 2;
-  dp::BuildWindows({p}, /*w=*/5, out);
+  spm::BuildWindows({p}, /*w=*/5, out);
   ASSERT_EQ(1u, out.size());
   ASSERT_EQ(p - 5, out[0].first);
   ASSERT_EQ(irs::pos_limits::eof() - 1, out[0].second);
@@ -342,12 +342,12 @@ TEST_P(SlopSeekGatherTestCase, equivalence_offsets_fixed) {
   std::vector<OffsetMatch> seek;
   {
     PairJoinGuard pj;
-    GatherModeGuard g{dp::GatherOverride::kForceReadAll};
+    GatherModeGuard g{spm::GatherOverride::kForceReadAll};
     read_all = CollectOffsets<irs::FixedPhraseQuery>(prepared, rdr);
   }
   {
     PairJoinGuard pj;
-    GatherModeGuard g{dp::GatherOverride::kForceSeek};
+    GatherModeGuard g{spm::GatherOverride::kForceSeek};
     seek = CollectOffsets<irs::FixedPhraseQuery>(prepared, rdr);
   }
   ASSERT_FALSE(read_all.empty());
@@ -376,12 +376,12 @@ TEST_P(SlopSeekGatherTestCase, equivalence_offsets_variadic) {
   std::vector<OffsetMatch> seek;
   {
     PairJoinGuard pj;
-    GatherModeGuard g{dp::GatherOverride::kForceReadAll};
+    GatherModeGuard g{spm::GatherOverride::kForceReadAll};
     read_all = CollectOffsets<irs::VariadicPhraseQuery>(prepared, rdr);
   }
   {
     PairJoinGuard pj;
-    GatherModeGuard g{dp::GatherOverride::kForceSeek};
+    GatherModeGuard g{spm::GatherOverride::kForceSeek};
     seek = CollectOffsets<irs::VariadicPhraseQuery>(prepared, rdr);
   }
   ASSERT_FALSE(read_all.empty());
@@ -419,12 +419,12 @@ TEST_P(SlopSeekGatherTestCase, skewed_engages_and_matches) {
   std::vector<irs::doc_id_t> read_all;
   {
     PairJoinGuard pj;
-    GatherModeGuard g{dp::GatherOverride::kAuto};  // gate should pick seek
+    GatherModeGuard g{spm::GatherOverride::kAuto};  // gate should pick seek
     automatic = CollectDocs(prepared);
   }
   {
     PairJoinGuard pj;
-    GatherModeGuard g{dp::GatherOverride::kForceReadAll};
+    GatherModeGuard g{spm::GatherOverride::kForceReadAll};
     read_all = CollectDocs(prepared);
   }
   ASSERT_EQ(1u, automatic.size());  // SK matches (rarexyz@1, commonxyz@2)
@@ -501,12 +501,12 @@ TEST_P(SlopSeekGatherTestCase, pair_join_equivalence_fixed) {
     std::vector<irs::doc_id_t> legacy_seek;
     {
       PairJoinGuard pj;
-      GatherModeGuard g{dp::GatherOverride::kForceReadAll};
+      GatherModeGuard g{spm::GatherOverride::kForceReadAll};
       legacy_readall = CollectDocs(prepared);
     }
     {
       PairJoinGuard pj;
-      GatherModeGuard g{dp::GatherOverride::kForceSeek};
+      GatherModeGuard g{spm::GatherOverride::kForceSeek};
       legacy_seek = CollectDocs(prepared);
     }
     ASSERT_EQ(legacy_readall, join)
@@ -600,12 +600,12 @@ TEST_P(SlopSeekGatherTestCase, pair_join_equivalence_variadic) {
     std::vector<irs::doc_id_t> legacy_seek;
     {
       PairJoinGuard pj;
-      GatherModeGuard g{dp::GatherOverride::kForceReadAll};
+      GatherModeGuard g{spm::GatherOverride::kForceReadAll};
       legacy_readall = CollectDocs(prepared);
     }
     {
       PairJoinGuard pj;
-      GatherModeGuard g{dp::GatherOverride::kForceSeek};
+      GatherModeGuard g{spm::GatherOverride::kForceSeek};
       legacy_seek = CollectDocs(prepared);
     }
     ASSERT_EQ(legacy_readall, join)
@@ -749,12 +749,12 @@ TEST_P(SlopSeekGatherTestCase, equivalence_multi_block_postings) {
     ASSERT_EQ(2u, join.size());  // D1 and D3
     {
       PairJoinGuard pj;
-      GatherModeGuard g{dp::GatherOverride::kForceReadAll};
+      GatherModeGuard g{spm::GatherOverride::kForceReadAll};
       ASSERT_EQ(join, CollectDocs(prepared));
     }
     {
       PairJoinGuard pj;
-      GatherModeGuard g{dp::GatherOverride::kForceSeek};
+      GatherModeGuard g{spm::GatherOverride::kForceSeek};
       ASSERT_EQ(join, CollectDocs(prepared));
     }
   }
@@ -765,12 +765,12 @@ TEST_P(SlopSeekGatherTestCase, equivalence_multi_block_postings) {
     auto prepared = make({"xxx", "bbb", "aaa"}, 1);
     std::vector<irs::doc_id_t> read_all;
     {
-      GatherModeGuard g{dp::GatherOverride::kForceReadAll};
+      GatherModeGuard g{spm::GatherOverride::kForceReadAll};
       read_all = CollectDocs(prepared);
     }
     ASSERT_EQ(2u, read_all.size());  // D1 and D3
     {
-      GatherModeGuard g{dp::GatherOverride::kForceSeek};
+      GatherModeGuard g{spm::GatherOverride::kForceSeek};
       ASSERT_EQ(read_all, CollectDocs(prepared));
     }
     ASSERT_EQ(read_all, CollectDocs(prepared));  // kAuto
@@ -778,17 +778,17 @@ TEST_P(SlopSeekGatherTestCase, equivalence_multi_block_postings) {
     // Offsets: bulk three-array ReadAll vs its scalar loop vs seek.
     std::vector<OffsetMatch> bulk;
     {
-      GatherModeGuard g{dp::GatherOverride::kForceReadAll};
+      GatherModeGuard g{spm::GatherOverride::kForceReadAll};
       bulk = CollectOffsets<irs::FixedPhraseQuery>(prepared, rdr);
     }
     ASSERT_FALSE(bulk.empty());
     {
-      GatherModeGuard g{dp::GatherOverride::kForceReadAll};
+      GatherModeGuard g{spm::GatherOverride::kForceReadAll};
       OffsBulkScalarGuard scalar;
       ASSERT_EQ(bulk, CollectOffsets<irs::FixedPhraseQuery>(prepared, rdr));
     }
     {
-      GatherModeGuard g{dp::GatherOverride::kForceSeek};
+      GatherModeGuard g{spm::GatherOverride::kForceSeek};
       ASSERT_EQ(bulk, CollectOffsets<irs::FixedPhraseQuery>(prepared, rdr));
     }
   }
@@ -803,7 +803,7 @@ INSTANTIATE_TEST_SUITE_P(slop_seek_gather_test, SlopSeekGatherTestCase,
                          SlopSeekGatherTestCase::to_string);
 
 // SlopOverlapMatcher: n >= 3 same-position matching, driving
-// detail::slop_dp::Run directly with synthetic per-slot position lists and
+// detail::slop::Run directly with synthetic per-slot position lists and
 // term-group ids. Encodes the empirically-verified Elasticsearch n >= 3 spec
 // for "foo qux" indexed with synonym foo,bar (postings foo@0, bar@0, qux@1).
 // "foo bar qux": no match at slop 0, one match at slop >= 1 (distinct terms
@@ -816,7 +816,7 @@ INSTANTIATE_TEST_SUITE_P(slop_seek_gather_test, SlopSeekGatherTestCase,
 // Small slots: anchor DFS over single-position slots.
 
 TEST(SlopOverlapMatcher, n3_distinct_terms_share_position) {
-  dp::DpScratch scratch;
+  spm::MatchScratch scratch;
   const std::vector<std::vector<irs::PosAttr::value_t>> slot_pos = {
     {0}, {0}, {1}};
   const std::vector<irs::PosAttr::value_t> expected_steps = {1, 1};
@@ -824,14 +824,14 @@ TEST(SlopOverlapMatcher, n3_distinct_terms_share_position) {
 
   // slop 0: same position is not adjacency -> no match.
   {
-    auto r = dp::Run(slot_pos, /*slop=*/0, expected_steps, scratch,
-                     /*early_exit=*/false, groups);
+    auto r = spm::Run(slot_pos, /*slop=*/0, expected_steps, scratch,
+                      /*early_exit=*/false, groups);
     EXPECT_FALSE(r.any);
   }
   // slop >= 1: foo@0 -> bar@0 (delta 0, cost 1) -> qux@1 (delta 1, cost 0) = 1.
   for (const irs::PosAttr::value_t slop : {1u, 2u, 5u}) {
-    auto r = dp::Run(slot_pos, slop, expected_steps, scratch,
-                     /*early_exit=*/false, groups);
+    auto r = spm::Run(slot_pos, slop, expected_steps, scratch,
+                      /*early_exit=*/false, groups);
     EXPECT_TRUE(r.any) << "slop=" << slop;
     EXPECT_EQ(1u, r.freq) << "slop=" << slop;
     EXPECT_EQ(1u, r.best_distance) << "slop=" << slop;
@@ -839,7 +839,7 @@ TEST(SlopOverlapMatcher, n3_distinct_terms_share_position) {
 }
 
 TEST(SlopOverlapMatcher, n3_repeated_term_never_matches) {
-  dp::DpScratch scratch;
+  spm::MatchScratch scratch;
   const std::vector<std::vector<irs::PosAttr::value_t>> slot_pos = {
     {0}, {0}, {1}};
   const std::vector<irs::PosAttr::value_t> expected_steps = {1, 1};
@@ -847,19 +847,18 @@ TEST(SlopOverlapMatcher, n3_repeated_term_never_matches) {
 
   // The single foo occurrence (pos 0) cannot fill both foo slots, at any slop.
   for (const irs::PosAttr::value_t slop : {0u, 1u, 5u}) {
-    auto r = dp::Run(slot_pos, slop, expected_steps, scratch,
-                     /*early_exit=*/false, groups);
+    auto r = spm::Run(slot_pos, slop, expected_steps, scratch,
+                      /*early_exit=*/false, groups);
     EXPECT_FALSE(r.any) << "slop=" << slop;
   }
 }
 
-// Wide slot variant. Historically these covered the bitmask-DP overflow
-// fallback; that path is gone (the anchor DFS is unconditional), so today
-// they just re-check the same group-aware uniqueness with a wide third slot,
-// which changes the window volume the DFS prunes over. Cheap extra coverage.
+// Wide slot variant: the same group-aware uniqueness, but the third slot
+// spans 130 positions, so the DFS prunes over a much larger window volume.
+// Cheap extra coverage.
 
-TEST(SlopOverlapMatcher, n3_overflow_distinct_terms_share_position) {
-  dp::DpScratch scratch;
+TEST(SlopOverlapMatcher, n3_wide_slot_distinct_terms_share_position) {
+  spm::MatchScratch scratch;
   std::vector<irs::PosAttr::value_t> qux;
   for (irs::PosAttr::value_t p = 1; p <= 130; ++p) {
     qux.push_back(p);
@@ -869,14 +868,14 @@ TEST(SlopOverlapMatcher, n3_overflow_distinct_terms_share_position) {
   const std::vector<irs::PosAttr::value_t> expected_steps = {1, 1};
   const std::vector<uint32_t> groups = {0, 1, 2};  // foo, bar, qux
 
-  auto r = dp::Run(slot_pos, /*slop=*/200, expected_steps, scratch,
-                   /*early_exit=*/false, groups);
+  auto r = spm::Run(slot_pos, /*slop=*/200, expected_steps, scratch,
+                    /*early_exit=*/false, groups);
   EXPECT_TRUE(r.any);
   EXPECT_EQ(1u, r.best_distance);
 }
 
-TEST(SlopOverlapMatcher, n3_overflow_repeated_term_never_matches) {
-  dp::DpScratch scratch;
+TEST(SlopOverlapMatcher, n3_wide_slot_repeated_term_never_matches) {
+  spm::MatchScratch scratch;
   std::vector<irs::PosAttr::value_t> qux;
   for (irs::PosAttr::value_t p = 1; p <= 130; ++p) {
     qux.push_back(p);
@@ -886,8 +885,8 @@ TEST(SlopOverlapMatcher, n3_overflow_repeated_term_never_matches) {
   const std::vector<irs::PosAttr::value_t> expected_steps = {1, 1};
   const std::vector<uint32_t> groups = {0, 0, 2};  // foo, foo, qux
 
-  auto r = dp::Run(slot_pos, /*slop=*/200, expected_steps, scratch,
-                   /*early_exit=*/false, groups);
+  auto r = spm::Run(slot_pos, /*slop=*/200, expected_steps, scratch,
+                    /*early_exit=*/false, groups);
   EXPECT_FALSE(r.any);
 }
 
@@ -896,7 +895,7 @@ TEST(SlopOverlapMatcher, n3_overflow_repeated_term_never_matches) {
 // pre-fix behavior: two slots cannot share a position.
 
 TEST(SlopOverlapMatcher, n3_empty_groups_enforces_position_uniqueness) {
-  dp::DpScratch scratch;
+  spm::MatchScratch scratch;
   const std::vector<std::vector<irs::PosAttr::value_t>> slot_pos = {
     {0}, {0}, {1}};
   const std::vector<irs::PosAttr::value_t> expected_steps = {1, 1};
@@ -905,8 +904,8 @@ TEST(SlopOverlapMatcher, n3_empty_groups_enforces_position_uniqueness) {
   // collision dropped -> no match at any slop.
 
   for (const irs::PosAttr::value_t slop : {0u, 1u, 5u}) {
-    auto r = dp::Run(slot_pos, slop, expected_steps, scratch,
-                     /*early_exit=*/false);
+    auto r = spm::Run(slot_pos, slop, expected_steps, scratch,
+                      /*early_exit=*/false);
     EXPECT_FALSE(r.any) << "slop=" << slop;
   }
 }
