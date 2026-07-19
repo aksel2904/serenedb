@@ -18,7 +18,7 @@
 /// Copyright holder is SereneDB GmbH, Berlin, Germany
 ////////////////////////////////////////////////////////////////////////////////
 
-// Microbenchmark: SlopPhrase (DP) vs a functionally-equivalent disjunction of
+// Microbenchmark: SlopPhrase vs a functionally-equivalent disjunction of
 // fixed phrases, on europarl text plus synthetic corpora.
 //
 // For two terms with slop N and expected step 1, the equivalent disjunction
@@ -60,7 +60,7 @@
 #include <iresearch/search/boolean_filter.hpp>
 #include <iresearch/search/phrase_filter.hpp>
 #include <iresearch/search/phrase_query.hpp>
-#include <iresearch/search/slop_phrase_dp.hpp>
+#include <iresearch/search/slop_phrase.hpp>
 #include <iresearch/store/data_output.hpp>
 #include <iresearch/store/mmap_directory.hpp>
 #include <iresearch/utils/string.hpp>
@@ -299,7 +299,7 @@ class EuroparlReader {
 }  // namespace bench_sloppy
 namespace {
 
-namespace dp = irs::detail::slop_dp;
+namespace spm = irs::detail::slop;
 
 constexpr std::string_view kEuroparlFallbackPath =
   "resources/tests/iresearch/europarl.subset.big.txt";
@@ -331,21 +331,21 @@ constexpr int kFarApartGap = 50;
 // the seek-gather and read-all paths over identical data. Production
 // never writes gGatherOverride; this is benchmark/test-only.
 struct GatherModeGuard {
-  explicit GatherModeGuard(dp::GatherOverride mode) noexcept {
-    dp::gGatherOverride = mode;
+  explicit GatherModeGuard(spm::GatherOverride mode) noexcept {
+    spm::gGatherOverride = mode;
   }
-  ~GatherModeGuard() { dp::gGatherOverride = dp::GatherOverride::kAuto; }
+  ~GatherModeGuard() { spm::gGatherOverride = spm::GatherOverride::kAuto; }
 };
 
 struct ModeReg {
   const char* suffix;
-  dp::GatherOverride mode;
+  spm::GatherOverride mode;
 };
 
 constexpr ModeReg kModes[] = {
-  {"_auto", dp::GatherOverride::kAuto},
-  {"_seek", dp::GatherOverride::kForceSeek},
-  {"_readall", dp::GatherOverride::kForceReadAll},
+  {"_auto", spm::GatherOverride::kAuto},
+  {"_seek", spm::GatherOverride::kForceSeek},
+  {"_readall", spm::GatherOverride::kForceReadAll},
 };
 
 struct TermPair {
@@ -359,7 +359,7 @@ constexpr TermPair kTermPairs[] = {
   {"human_rights", "human", "rights"},
   {"climate_change", "climate", "change"},
   // Skewed: slot0 "the" is dense, "commission" is sparse, so the gate
-  // engages and the DP would otherwise lead from the dense slot.
+  // engages and the matcher would otherwise lead from the dense slot.
   {"the_commission", "the", "commission"},
   // Dense-dense: both terms occur in nearly every document with high
   // per-doc frequency. Worst case for the join's sliding partner
@@ -881,7 +881,7 @@ void AppendSlopPhraseVariants(irs::Or& or_filter,
     for (size_t i = 0; i + 1 < n; ++i) {
       const int64_t delta =
         static_cast<int64_t>(pos[i + 1]) - static_cast<int64_t>(pos[i]);
-      cost = static_cast<irs::PosAttr::value_t>(cost + dp::StepCost(delta, 1));
+      cost = static_cast<irs::PosAttr::value_t>(cost + spm::StepCost(delta, 1));
       if (cost > slop) {
         return;
       }
@@ -994,7 +994,7 @@ void BenchPrepare(benchmark::State& state, const irs::DirectoryReader& rdr,
 template<typename MakeFn>
 [[gnu::noinline]] void BenchExecuteOnly(
   benchmark::State& state, const irs::DirectoryReader& rdr, MakeFn make,
-  dp::GatherOverride mode = dp::GatherOverride::kAuto) {
+  spm::GatherOverride mode = spm::GatherOverride::kAuto) {
   GatherModeGuard guard{mode};
 
   auto q = make();
@@ -1090,7 +1090,7 @@ irs::Or MakeDisjunctionEquivalentVariadic4(irs::PosAttr::value_t slop) {
 template<typename PhraseQueryT = irs::FixedPhraseQuery, typename MakeFn>
 [[gnu::noinline]] void BenchExecuteWithOffsets(
   benchmark::State& state, const irs::DirectoryReader& rdr, MakeFn make,
-  dp::GatherOverride mode = dp::GatherOverride::kAuto) {
+  spm::GatherOverride mode = spm::GatherOverride::kAuto) {
   GatherModeGuard guard{mode};
 
   auto q = make();
@@ -1533,7 +1533,7 @@ int main(int argc, char** argv) {
   // flags.
   for (int i = 1; i < argc;) {
     if (std::string_view{argv[i]} == "--disable-offs-bulk-gather") {
-      dp::gOffsBulkGatherDisabled = true;
+      spm::gOffsBulkGatherDisabled = true;
       for (int j = i; j + 1 < argc; ++j) {
         argv[j] = argv[j + 1];
       }
