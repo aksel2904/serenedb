@@ -55,10 +55,10 @@
 // positions. ResolveSeekGather picks between them (kSeekGatherSkew,
 // overridable by the gGatherOverride test seam).
 //
-// expected_step == 1 reproduces the original SlopPhraseFrequency formula
-// bit-for-bit; expected_step > 1 adds per-slot positional gaps from
-// push_back(term, offs). Interval gaps (offs_min != offs_max) with slop are
-// rejected upstream by SDB_ENSURE.
+// expected_step == 1 is the plain adjacent-term cost model (ES-verified);
+// expected_step > 1 adds per-slot positional gaps from push_back(term, offs).
+// Interval gaps (offs_min != offs_max) with slop are rejected upstream by
+// SDB_ENSURE.
 
 // Profiling aid: with -DSLOP_PROFILE, force the matcher (Run), the window
 // builder (BuildWindows) and the pair join (JoinPair) out of line so a
@@ -133,8 +133,8 @@ using Window = std::pair<PosAttr::value_t, PosAttr::value_t>;
 // Engage seek-based gather (read the rarest slot, seek the rest into
 // slop-reachable windows) only when the rarest slot is at least this many
 // times rarer than the densest. Conservative: on balanced frequencies plain
-// read-all is the safe choice. TODO(perf): 3 leaves some win on the table on
-// moderately-skewed data, and the crossover shifts with large slop (windows
+// read-all is the safe choice. TODO(aksel2904): 3 leaves some win on the table
+// on moderately-skewed data, and the crossover shifts with large slop (windows
 // widen toward full coverage and erode the seek win); recalibrate under
 // measurement.
 inline constexpr uint64_t kSeekGatherSkew = 3;
@@ -834,11 +834,10 @@ SLOP_PROF_NOINLINE inline DpResult Run(
 
 }  // namespace detail::slop_dp
 
-// Replaces SlopPhraseFrequency. Offs collects OffsAttr and emits per-match
-// offsets through PhrasePosition iteration. HasFreq computes exact freq +
-// best_distance; when false the DP early-exits on the first valid tuple and
-// sets freq to 1 to signal a match. kHasBoost = HasFreq, per the original
-// convention.
+// Sloppy counterpart of FixedPhraseFrequency. Offs collects OffsAttr and
+// emits per-match offsets through PhrasePosition iteration. HasFreq computes
+// exact freq + best_distance; when false the DP early-exits on the first
+// valid tuple and sets freq to 1 to signal a match. kHasBoost = HasFreq.
 template<bool Offs, bool HasFreq>
 class SlopPhraseFrequencyDP {
  public:
@@ -1190,7 +1189,7 @@ class SlopPhraseFrequencyDP {
   std::vector<uint32_t> _term_groups;
 };
 
-// Variadic sloppy phrase frequency. Replaces SlopVariadicPhraseFrequency.
+// Sloppy counterpart of VariadicPhraseFrequency.
 template<typename Adapter, bool HasFreq>
 class SlopVariadicPhraseFrequencyDP {
  public:
@@ -1291,7 +1290,7 @@ class SlopVariadicPhraseFrequencyDP {
 
     // No exact per-doc position count on the compound iterator, so the rarest
     // slot is picked by the disjunction's doc-level cost estimate. Steers
-    // which slot leads the gather (perf), never correctness. TODO(perf): a
+    // which slot leads the gather (perf), never correctness. TODO(aksel2904): a
     // per-doc DocFreq-summing pass would gate more precisely; deferred.
     size_t rare = 0;
     uint64_t min_cost = std::numeric_limits<uint64_t>::max();

@@ -367,7 +367,9 @@ DocIterator::ptr VariadicPhraseQuery::Execute(const ExecutionContext& ctx,
   SDB_ENSURE(this->slop == 0 || !has_intervals,
              "slop and intervals are mutually exclusive");
 
-  if (this->slop > 0) {
+  // Slop is meaningless for a single slot; the plain path below already
+  // has the degenerate (term-query-like) semantics ES uses for it.
+  if (this->slop > 0 && phrase_size > 1) {
     auto expected_steps = BuildExpectedSteps(this->positions);
     if (!scorer) {
       using SlopIterator = PhraseIterator<
@@ -445,7 +447,9 @@ DocIterator::ptr VariadicPhraseQuery::ExecuteWithOffsets(
   SDB_ENSURE(this->slop == 0 || !has_intervals,
              "slop and intervals are mutually exclusive");
 
-  if (this->slop > 0) {
+  // Slop is meaningless for a single slot; the plain path below already
+  // has the degenerate (term-query-like) semantics ES uses for it.
+  if (this->slop > 0 && phrase_size > 1) {
     using SlopIterator = PhraseIterator<
       Conjunction<ScoreAdapter>,
       PhrasePosition<SlopVariadicPhraseFrequencyDP<Adapter, true>>>;

@@ -641,8 +641,9 @@ Case RandomCase(std::mt19937_64& rng) {
 
   c.expected_steps.resize(n - 1);
   for (auto& e : c.expected_steps) {
-    const uint32_t roll = rng() % 5;  // weight 1 heavily, sometimes 2/3
-    e = (roll < 3) ? 1u : (roll == 3 ? 2u : 3u);
+    // weight 1 heavily, sometimes 2/3, occasionally 0 (increment-0 parts)
+    const uint32_t roll = rng() % 6;
+    e = (roll < 3) ? 1u : (roll == 3 ? 2u : (roll == 4 ? 3u : 0u));
   }
 
   std::uniform_int_distribution<value_t> slop_dist(0, 6);
@@ -723,6 +724,19 @@ int RunEdgeCases() {
           .groups = {0, 1, 0},
           .slop = 5},
          false, 0, 0, "samepos_same_group_barred");
+  // Increment-0 pair (expected 0): the same position costs 0, so it hits at
+  // slop 0 across groups; within one group it stays barred.
+  expect(
+    {.slots = {{3}, {3}}, .expected_steps = {0}, .groups = {0, 1}, .slop = 0},
+    true, 1, 0, "increment0_distinct_groups");
+  expect(
+    {.slots = {{3}, {3}}, .expected_steps = {0}, .groups = {0, 0}, .slop = 0},
+    false, 0, 0, "increment0_same_group_barred");
+  // Adjacent (delta 1) under expected 0 costs 1.
+  expect({.slots = {{3}, {4}}, .expected_steps = {0}, .groups = {}, .slop = 0},
+         false, 0, 0, "increment0_adjacent_slop0_miss");
+  expect({.slots = {{3}, {4}}, .expected_steps = {0}, .groups = {}, .slop = 1},
+         true, 1, 1, "increment0_adjacent_slop1_hit");
   // Empty slot -> no match.
   expect({.slots = {{}, {1}}, .expected_steps = {1}, .groups = {}, .slop = 5},
          false, 0, 0, "empty_slot");
@@ -755,8 +769,9 @@ MergedCase RandomMergedCase(std::mt19937_64& rng) {
       sub = RandomSlot(rng, universe, /*allow_empty=*/rng() % 8 == 0);
     }
   }
-  const uint32_t roll = rng() % 5;  // weight 1 heavily, sometimes 2/3
-  c.expected = (roll < 3) ? 1u : (roll == 3 ? 2u : 3u);
+  // weight 1 heavily, sometimes 2/3, occasionally 0 (increment-0 parts)
+  const uint32_t roll = rng() % 6;
+  c.expected = (roll < 3) ? 1u : (roll == 3 ? 2u : (roll == 4 ? 3u : 0u));
   std::uniform_int_distribution<value_t> slop_dist(0, 6);
   c.slop = slop_dist(rng);
   c.same_group = (rng() % 2) == 0;
