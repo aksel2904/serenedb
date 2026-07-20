@@ -54,6 +54,21 @@
 namespace sdb::connector {
 namespace {
 
+// DECIMAL/DOUBLE -> BIGINT rounds even under a strict cast, so
+// integrality is enforced by an exact round-trip: 2.0 passes, 1.5
+// errors instead of silently becoming 2.
+bool TryCastExactInt64(const duckdb::Value& v, duckdb::Value& out) {
+  if (v.IsNull() || !v.type().IsNumeric() ||
+      !v.DefaultTryCastAs(duckdb::LogicalType::BIGINT, out,
+                          /*error_message=*/nullptr, /*strict=*/true)) {
+    return false;
+  }
+  duckdb::Value back;
+  return out.DefaultTryCastAs(v.type(), back,
+                              /*error_message=*/nullptr, /*strict=*/false) &&
+         duckdb::Value::NotDistinctFrom(back, v);
+}
+
 duckdb::LogicalType MakeTokenizedTSQueryType() {
   auto type = duckdb::LogicalType(duckdb::LogicalTypeId::VARCHAR);
   type.SetAlias(std::string{kTokenizedTSQueryTypeName});
@@ -252,11 +267,13 @@ void RegisterTSQueryTypes(duckdb::ExtensionLoader& loader) {
           ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
           ERR_MSG("slop(<budget>) requires exactly one integer argument"));
       }
-      auto budget =
-        modifiers[0].GetValue().DefaultCastAs(duckdb::LogicalType::BIGINT);
-      if (budget.IsNull()) {
+      const auto raw = modifiers[0].GetValue();
+      duckdb::Value budget;
+      if (!TryCastExactInt64(raw, budget)) {
         THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
-                        ERR_MSG("slop() budget must be non-null"));
+                        ERR_MSG("slop() budget must be a non-null integer, "
+                                "got ",
+                                raw.ToString()));
       }
       if (budget.GetValue<int64_t>() < 0) {
         THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -464,15 +481,18 @@ void RegisterTSQueryConstructors(duckdb::ExtensionLoader& loader) {
   }
 
   // ts_sloppy_phrase(text, slop [, gap, text, ...]) -- same grammar
-  // as ts_phrase plus a non-negative INTEGER slop budget. slop=0
+  // as ts_phrase plus a non-negative integer slop budget. slop=0
   // falls through to the exact path; slop>0 picks the sloppy DP
   // matcher. Interval gaps + slop is rejected at filter-build time.
+  // BIGINT (not INTEGER) so out-of-range budgets reach the builder's
+  // "slop too large" check instead of a generic binder cast error --
+  // symmetric with `::slop(N)`.
   {
     duckdb::ScalarFunctionSet set{duckdb::Identifier{kTSQSloppyPhrase}};
     for (auto first_arg :
          {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BLOB}) {
       duckdb::ScalarFunction fn(duckdb::Identifier{kTSQSloppyPhrase},
-                                {first_arg, duckdb::LogicalType::INTEGER},
+                                {first_arg, duckdb::LogicalType::BIGINT},
                                 MakeTSQueryType(), TSQueryStubFn);
       fn.SetVarArgs(duckdb::LogicalType::ANY);
       set.AddFunction(std::move(fn));

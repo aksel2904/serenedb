@@ -1073,8 +1073,6 @@ bool TryDispatchSlopCast(irs::BooleanFilter& parent, const FilterContext& ctx,
       THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
                       ERR_MSG("::slop too large: ", raw));
     }
-    fprintf(stderr, "DBG slop apply raw=%lld -> WithSlop, inner.class=%d\n",
-            (long long)raw, (int)inner.GetExpressionClass());
     BuildTSQuery(parent, ctx.WithSlop(static_cast<irs::PosAttr::value_t>(raw)),
                  column_info, inner);
   };
@@ -1204,14 +1202,6 @@ bool TryDispatchTokenizeCast(irs::BooleanFilter& parent,
 void FromTSQueryMatch(irs::BooleanFilter& filter, const FilterContext& ctx,
                       const duckdb::Expression& lhs,
                       const duckdb::Expression& rhs) {
-  fprintf(stderr, "DBG @@ lhs.class=%d rhs.class=%d\n",
-          (int)lhs.GetExpressionClass(), (int)rhs.GetExpressionClass());
-  if (rhs.GetExpressionClass() == duckdb::ExpressionClass::BOUND_CAST) {
-    const auto& c = rhs.Cast<duckdb::BoundCastExpression>();
-    fprintf(stderr, "DBG @@ rhs is CAST, return_type=%s, child.class=%d\n",
-            c.GetReturnType().ToString().c_str(),
-            (int)c.Child().GetExpressionClass());
-  }
   // `@@` accepts either a bare column reference or a JSON-path expression
   // (e.g. `content->>'host'`) on the field side. FindColumnInfoForExpr
   // handles both, peeling any cast wrappers; the TSQuery cast is peeled
@@ -1704,12 +1694,6 @@ void BuildTSQuery(irs::BooleanFilter& parent, const FilterContext& ctx,
                   const duckdb::Expression& expr) {
   const duckdb::Expression& unwrapped = UnwrapTSQueryCast(expr);
 
-  fprintf(
-    stderr,
-    "DBG BuildTSQuery: expr.class=%d -> unwrapped.class=%d, ctx.slop=%u\n",
-    (int)expr.GetExpressionClass(), (int)unwrapped.GetExpressionClass(),
-    ctx.slop);
-
   // Trivial-constant short-circuit: NULL -> Empty, true -> All,
   // false -> Empty. Surfaces as either a NULL TSQUERY constant or a
   // BoundCast<TSQUERY> wrapping a BOOLEAN constant. Works at any
@@ -1756,7 +1740,6 @@ void BuildTSQuery(irs::BooleanFilter& parent, const FilterContext& ctx,
   // rule. Non-VARCHAR / analyzer-less paths fall back to raw ByTerm.
   if (unwrapped.GetExpressionClass() ==
       duckdb::ExpressionClass::BOUND_CONSTANT) {
-    fprintf(stderr, "DBG bare-const reached, ctx.slop=%u\n", ctx.slop);
     RejectSlopOnNonPhrase(ctx);
     const auto& val =
       unwrapped.Cast<duckdb::BoundConstantExpression>().GetValue();

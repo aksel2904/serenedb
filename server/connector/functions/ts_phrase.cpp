@@ -27,6 +27,7 @@
 #include <iresearch/search/phrase_query.hpp>
 #include <iresearch/search/range_filter.hpp>
 #include <iresearch/utils/string.hpp>
+#include <limits>
 
 #include "basics/assert.h"
 #include "pg/errcodes.h"
@@ -41,6 +42,21 @@ TSQueryOp ClassifyTSQueryFunction(std::string_view name);
 
 namespace {
 
+// DECIMAL/DOUBLE -> BIGINT rounds even under a strict cast, so
+// integrality is enforced by an exact round-trip: 2.0 passes, 1.5
+// errors instead of silently becoming 2.
+bool TryCastExactInt64(const duckdb::Value& v, duckdb::Value& out) {
+  if (v.IsNull() || !v.type().IsNumeric() ||
+      !v.DefaultTryCastAs(duckdb::LogicalType::BIGINT, out,
+                          /*error_message=*/nullptr, /*strict=*/true)) {
+    return false;
+  }
+  duckdb::Value back;
+  return out.DefaultTryCastAs(v.type(), back,
+                              /*error_message=*/nullptr, /*strict=*/false) &&
+         duckdb::Value::NotDistinctFrom(back, v);
+}
+
 PhraseGap ParsePhraseGap(const duckdb::Value& val, std::string_view label,
                          std::string_view hint,
                          std::optional<size_t> arg_index = std::nullopt) {
@@ -54,9 +70,7 @@ PhraseGap ParsePhraseGap(const duckdb::Value& val, std::string_view label,
   };
   auto coerce = [&](const duckdb::Value& v) -> int64_t {
     duckdb::Value out;
-    if (v.IsNull() || !v.type().IsNumeric() ||
-        !v.DefaultTryCastAs(duckdb::LogicalType::BIGINT, out,
-                            /*error_message=*/nullptr, /*strict=*/true)) {
+    if (!TryCastExactInt64(v, out)) {
       error(" gap must be a non-null non-negative integer, got ", v.ToString(),
             " of type ", v.type().ToString());
     }
@@ -219,18 +233,7 @@ void FromSloppyPhrase(irs::BooleanFilter& filter, const FilterContext& ctx,
                     ERR_HINT(kSyntaxHint));
   }
 
-  if ((column_info.tokenizer.features &
-       irs::PhraseQuery<irs::FixedPhraseState>::kRequiredFeatures) !=
-      irs::PhraseQuery<irs::FixedPhraseState>::kRequiredFeatures) {
-    THROW_SQL_ERROR(
-      ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
-      ERR_MSG("ts_sloppy_phrase field should have Positions and Frequency "
-              "features enabled"),
-      ERR_HINT("Recreate the inverted index with both `Positions` and "
-               "`Frequency` features attached to the column."));
-  }
-
-  // children[1] is slop (INTEGER per registration).
+  // children[1] is slop (BIGINT per registration).
   int64_t slop_raw = 0;
   GetIntArg(*func.GetChildren()[1], slop_raw,
             {"ts_sloppy_phrase slop", kSyntaxHint});
@@ -317,6 +320,23 @@ void FromSloppyPhrase(irs::BooleanFilter& filter, const FilterContext& ctx,
               "terms"),
       ERR_HINT("All text arguments tokenised to nothing (e.g. all-stopword "
                "input). Provide at least one searchable term."));
+  }
+
+  // Mirrors FromPhrase: a single-term phrase reduces to a term query
+  // at prepare time (GetKind -> kSingleWord) and the matcher ignores
+  // slop for phrase_size == 1, so positions are only required for
+  // multi-term phrases.
+  if (opts->size() > 1 &&
+      (column_info.tokenizer.features &
+       irs::PhraseQuery<irs::FixedPhraseState>::kRequiredFeatures) !=
+        irs::PhraseQuery<irs::FixedPhraseState>::kRequiredFeatures) {
+    THROW_SQL_ERROR(
+      ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
+      ERR_MSG("ts_sloppy_phrase field should have Positions and Frequency "
+              "features enabled for multi-term phrases"),
+      ERR_HINT("Recreate the inverted index with both `Positions` and "
+               "`Frequency` features attached to the column, or query with "
+               "a single-term ts_sloppy_phrase / ts_like."));
   }
 
   // Slop + interval gaps are mutually exclusive (see SDB_ENSURE in
