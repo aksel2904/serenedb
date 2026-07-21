@@ -48,23 +48,25 @@
 // same pass emits one EnumeratedMatch per valid tuple, so freq and the
 // enumerated count come from one walk and agree by construction.
 //
-// Gather: read-all reads every slot fully; seek-gather reads only the rarest
-// slot and seeks the others into the windows around it (BuildWindows). By the
-// coverage lemma |p_a - p_b| <= slop + sum_expected this drops no match, so
-// the two paths match identically - seek-gather just feeds in fewer
-// positions. ResolveSeekGather picks between them (kSeekGatherSkew,
-// overridable by the gGatherOverride test seam).
+// Gather: every slot is read in full via the bulk ReadAll decode. A
+// windowed seek-gather alternative (read the rarest slot, seek the rest
+// into slop-reachable windows) was built and then removed: intra-doc
+// position seek is a sequential decode in this format (iterator_pos.hpp
+// seek() walks every skipped position and its attributes), so windowing
+// saves no decode work and only adds per-window overhead - measured
+// 1.2-11x slower than read-all across skew ratios 1-60, slop 1-50, on
+// shallow and multi-block postings alike. See the removal note in the PR.
 //
 // expected_step == 1 is the plain adjacent-term cost model (ES-verified);
 // expected_step > 1 adds per-slot positional gaps from push_back(term, offs).
 // Interval gaps (offs_min != offs_max) with slop are rejected upstream by
 // SDB_ENSURE.
 
-// Profiling aid: with -DSLOP_PROFILE, force the matcher (Run), the window
-// builder (BuildWindows) and the pair join (JoinPair) out of line so a
-// profiler can split "build windows" vs "match" vs position decode (iterator
-// next/seek, already out of line). Each runs once per candidate doc, so the
-// perturbation is negligible. Never defined in production.
+// Profiling aid: with -DSLOP_PROFILE, force the matcher (Run) and the
+// pair join (JoinPair) out of line so a profiler can split matching vs
+// position decode (iterator next/seek, already out of line). Each runs
+// once per candidate doc, so the perturbation is negligible. Never
+// defined in production.
 #ifdef SLOP_PROFILE
 #define SLOP_PROF_NOINLINE [[gnu::noinline]]
 #else
@@ -126,45 +128,6 @@ struct MatchScratch {
   std::vector<PosAttr::value_t> chain;
   std::vector<uint32_t> order;
 };
-
-// Disjoint, ascending [lo, hi] gather interval (inclusive).
-using Window = std::pair<PosAttr::value_t, PosAttr::value_t>;
-
-// Engage seek-based gather (read the rarest slot, seek the rest into
-// slop-reachable windows) only when the rarest slot is at least this many
-// times rarer than the densest. Conservative: on balanced frequencies plain
-// read-all is the safe choice. TODO(aksel2904): 3 leaves some win on the table
-// on moderately-skewed data, and the crossover shifts with large slop (windows
-// widen toward full coverage and erode the seek win); recalibrate under
-// measurement.
-inline constexpr uint64_t kSeekGatherSkew = 3;
-
-// Test seam for the gather strategy. Production leaves this at kAuto; tests
-// flip it to kForceSeek / kForceReadAll to drive both paths over identical
-// data and assert they match. Without it the seek-gather branch is
-// unreachable on balanced data, where the heuristic never selects it.
-enum class GatherOverride : uint8_t {
-  kAuto,
-  kForceSeek,
-  kForceReadAll,
-};
-
-inline GatherOverride gGatherOverride = GatherOverride::kAuto;
-
-// Applies the test seam on top of the heuristic. Seek-gather is correct for
-// any input (it changes which positions are read, not the match set), so
-// forcing it on balanced data is safe.
-inline bool ResolveSeekGather(bool heuristic) noexcept {
-  switch (gGatherOverride) {
-    case GatherOverride::kForceSeek:
-      return true;
-    case GatherOverride::kForceReadAll:
-      return false;
-    case GatherOverride::kAuto:
-      break;
-  }
-  return heuristic;
-}
 
 // Test seam for the n == 2 fused merge-join (JoinPair), fixed and variadic.
 // Production leaves this false; tests set it to route n == 2 through the
@@ -251,10 +214,10 @@ class UninitU32Buf {
 };
 
 // n == 2 fused merge-join over two forward-only position iterators, replacing
-// gather + BuildWindows + Run for two-slot phrases. Anchor positions are read
+// gather + Run for two-slot phrases. Anchor positions are read
 // straight off their iterator; partner positions are decoded exactly once
 // into a sliding buffer bounded by the anchor window [pa - w, pa + w],
-// w = slop + expected (the BuildWindows coverage window). Candidates are then
+// w = slop + expected (the coverage window). Candidates are then
 // exact-checked with StepCost, so the accept set equals Run's. Both bounds
 // are nondecreasing in pa, which is what makes the single forward pass and
 // the front-trimmed buffer sound.
@@ -584,36 +547,6 @@ class MergedPosStream {
   OffsAttr _offs;
 };
 
-// Merge [pos - W, pos + W] over the lead slot's already-sorted
-// positions into disjoint ascending windows. lo is clamped to
-// pos_limits::min() because positions are 1-based and seek(0) is a
-// no-op on a freshly positioned iterator. By the coverage lemma
-// (|p_a - p_b| <= slop + sum_expected for any two slots of a valid
-// tuple) every position of every valid match lies in one of these
-// windows, so gathering other slots within them drops no match.
-SLOP_PROF_NOINLINE inline void BuildWindows(
-  const std::vector<PosAttr::value_t>& lead_pos, PosAttr::value_t w,
-  std::vector<Window>& out) {
-  out.clear();
-  // Cap hi below eof: no real position is ever eof, so nothing is lost,
-  // and the gather loops can bound-check with a bare v <= hi - an
-  // exhausted iterator (v == eof) can never pass it.
-  constexpr PosAttr::value_t kMaxPos = pos_limits::eof() - 1;
-  for (const PosAttr::value_t p : lead_pos) {
-    const PosAttr::value_t lo = (p > w) ? (p - w) : pos_limits::min();
-    const PosAttr::value_t hi = (p > kMaxPos - w) ? kMaxPos : (p + w);
-    if (!out.empty() && lo <= out.back().second) {
-      // Overlaps the previous window: extend it. Forward-only seek
-      // cannot re-read, so the gather windows must stay disjoint.
-      if (hi > out.back().second) {
-        out.back().second = hi;
-      }
-    } else {
-      out.push_back({lo, hi});
-    }
-  }
-}
-
 // A single enumerated valid tuple, recording leftmost and rightmost
 // position with their originating slot indices (used to look up
 // OffsAttr from per-slot materialized offset arrays).
@@ -857,10 +790,6 @@ class SlopPhraseFrequency {
     SDB_ASSERT(_pos.size() >= 2);
     SDB_ASSERT(_max_slop > 0);
     SDB_ASSERT(_expected_steps.size() == _pos.size() - 1);
-    _window_half = _max_slop;
-    for (auto e : _expected_steps) {
-      _window_half += e;
-    }
   }
 
   IRS_FORCE_INLINE bool Match() {
@@ -896,11 +825,8 @@ class SlopPhraseFrequency {
       _slot_offs_end.resize(n);
     }
 
-    // Per-slot gather. gather_all reads the whole posting; gather_windows
-    // reads only positions inside the precomputed slop-reachable windows
-    // via forward seek. Both fill _slot_pos[i] (+ _slot_offs_start[i] /
-    // _slot_offs_end[i] when Offs); each path resets its own slot before
-    // filling it.
+    // Per-slot gather: read the whole posting into _slot_pos[i]
+    // (+ _slot_offs_start[i] / _slot_offs_end[i] when Offs).
     const auto gather_all = [&](size_t i) {
       auto& it = *_pos[i].first;
       auto& positions = _slot_pos[i];
@@ -937,78 +863,10 @@ class SlopPhraseFrequency {
       }
     };
 
-    const auto gather_windows = [&](size_t i) {
-      auto& it = *_pos[i].first;
-      auto& positions = _slot_pos[i];
-
-      positions.clear();
-      [[maybe_unused]] const OffsAttr* offs = nullptr;
-      if constexpr (Offs) {
-        _slot_offs_start[i].Clear();
-        _slot_offs_end[i].Clear();
-        offs = irs::get<OffsAttr>(it);
-      }
-      for (const auto& [lo, hi] : _windows) {
-        // seek(lo >= min) returns a real position or eof, and hi < eof
-        // (BuildWindows caps it), so the bound check alone suffices.
-        auto v = it.seek(lo);
-        while (v <= hi) {
-          positions.push_back(v);
-          if constexpr (Offs) {
-            _slot_offs_start[i].PushBack(offs ? offs->start : 0);
-            _slot_offs_end[i].PushBack(offs ? offs->end : 0);
-          }
-          if (!it.next()) {
-            break;
-          }
-          v = it.value();
-        }
-      }
-    };
-
-    // Pick the rarest slot by exact per-doc position count (DocFreq is
-    // already set by the doc-level advance and reads nothing). When the
-    // frequencies are skewed enough, lead the gather from the rarest
-    // slot and seek the rest only within slop-reachable windows;
-    // otherwise keep the plain read-all path.
-    size_t rare = 0;
-    uint32_t min_df = std::numeric_limits<uint32_t>::max();
-    uint32_t max_df = 0;
     for (size_t i = 0; i < n; ++i) {
-      const uint32_t df = _pos[i].first->DocFreq();
-      if (df < min_df) {
-        min_df = df;
-        rare = i;
-      }
-      if (df > max_df) {
-        max_df = df;
-      }
-    }
-    const bool seek_gather = detail::slop::ResolveSeekGather(
-      min_df != 0 &&
-      static_cast<uint64_t>(min_df) * detail::slop::kSeekGatherSkew <= max_df);
-
-    if (seek_gather) {
-      gather_all(rare);
-      if (_slot_pos[rare].empty()) {
+      gather_all(i);
+      if (_slot_pos[i].empty()) {
         return false;
-      }
-      detail::slop::BuildWindows(_slot_pos[rare], _window_half, _windows);
-      for (size_t i = 0; i < n; ++i) {
-        if (i == rare) {
-          continue;
-        }
-        gather_windows(i);
-        if (_slot_pos[i].empty()) {
-          return false;
-        }
-      }
-    } else {
-      for (size_t i = 0; i < n; ++i) {
-        gather_all(i);
-        if (_slot_pos[i].empty()) {
-          return false;
-        }
       }
     }
 
@@ -1160,15 +1018,10 @@ class SlopPhraseFrequency {
   Positions _pos;
   PosAttr::value_t _max_slop;
   std::vector<PosAttr::value_t> _expected_steps;
-  // Window half-width slop + sum(expected_steps); cached for gather.
-  PosAttr::value_t _window_half = 0;
   std::vector<std::vector<PosAttr::value_t>> _slot_pos;
   // Per-slot offsets, parallel to _slot_pos, stored as separate start/end
   std::vector<detail::slop::UninitU32Buf> _slot_offs_start;
   std::vector<detail::slop::UninitU32Buf> _slot_offs_end;
-  // Merged slop-reachable windows around the rarest slot's positions
-  // (seek-gather path only). These scratch members are reused across Match().
-  std::vector<detail::slop::Window> _windows;
   // Matcher scratch, kept off the allocator on the hot path.
   detail::slop::MatchScratch _match_scratch;
   // Valid tuples from the matcher pass, sorted by leftmost (Offs && HasFreq
@@ -1208,10 +1061,6 @@ class SlopVariadicPhraseFrequency {
     SDB_ASSERT(_pos.size() >= 2);
     SDB_ASSERT(_max_slop > 0);
     SDB_ASSERT(_expected_steps.size() == _pos.size() - 1);
-    _window_half = _max_slop;
-    for (auto e : _expected_steps) {
-      _window_half += e;
-    }
   }
 
   IRS_FORCE_INLINE bool Match() {
@@ -1281,51 +1130,9 @@ class SlopVariadicPhraseFrequency {
       return finalize_slot(i);
     };
 
-    const auto gather_windows = [&](size_t i) -> bool {
-      _scratch_entries.clear();
-      WindowCtx ctx{&_scratch_entries, &_windows};
-      _pos[i].first->visit(&ctx, CollectWindowedSubIter);
-      return finalize_slot(i);
-    };
-
-    // No exact per-doc position count on the compound iterator, so the rarest
-    // slot is picked by the disjunction's doc-level cost estimate. Steers
-    // which slot leads the gather (perf), never correctness. TODO(aksel2904): a
-    // per-doc DocFreq-summing pass would gate more precisely; deferred.
-    size_t rare = 0;
-    uint64_t min_cost = std::numeric_limits<uint64_t>::max();
-    uint64_t max_cost = 0;
     for (size_t i = 0; i < n; ++i) {
-      const uint64_t c = CostAttr::extract(*_pos[i].first);
-      if (c < min_cost) {
-        min_cost = c;
-        rare = i;
-      }
-      if (c > max_cost) {
-        max_cost = c;
-      }
-    }
-    const bool seek_gather = detail::slop::ResolveSeekGather(
-      min_cost != 0 && min_cost * detail::slop::kSeekGatherSkew <= max_cost);
-
-    if (seek_gather) {
-      if (!gather_all(rare)) {
+      if (!gather_all(i)) {
         return false;
-      }
-      detail::slop::BuildWindows(_slot_pos[rare], _window_half, _windows);
-      for (size_t i = 0; i < n; ++i) {
-        if (i == rare) {
-          continue;
-        }
-        if (!gather_windows(i)) {
-          return false;
-        }
-      }
-    } else {
-      for (size_t i = 0; i < n; ++i) {
-        if (!gather_all(i)) {
-          return false;
-        }
       }
     }
 
@@ -1458,49 +1265,6 @@ class SlopVariadicPhraseFrequency {
     c.pos = adapter.position;
     if constexpr (kHasOffsets) {
       c.offs = adapter.offset;
-    }
-    return true;
-  }
-
-  struct WindowCtx {
-    std::vector<PosEntry>* out;
-    const std::vector<detail::slop::Window>* windows;
-  };
-
-  // Seek-gather variant: for each sub-iterator, read only positions
-  // inside the precomputed disjoint windows via forward seek. reset()
-  // rewinds to the doc start (forward-only seek must begin before the
-  // first window); windows are ascending and disjoint, so the seeks
-  // never go backwards.
-  static bool CollectWindowedSubIter(void* ctx, Adapter& adapter) {
-    SDB_ASSERT(ctx);
-    auto& c = *reinterpret_cast<WindowCtx*>(ctx);
-    auto* p = adapter.position;
-    if (!p) {
-      return true;
-    }
-    const OffsAttr* offs = nullptr;
-    if constexpr (kHasOffsets) {
-      offs = adapter.offset;
-    }
-    p->reset();
-    for (const auto& [lo, hi] : *c.windows) {
-      // Same bound-only check as the fixed gather_windows: hi < eof.
-      auto v = p->seek(lo);
-      while (v <= hi) {
-        PosEntry e{.pos = v};
-        if constexpr (kHasOffsets) {
-          if (offs) {
-            e.start_offs = offs->start;
-            e.end_offs = offs->end;
-          }
-        }
-        c.out->push_back(e);
-        if (!p->next()) {
-          break;
-        }
-        v = p->value();
-      }
     }
     return true;
   }
@@ -1660,14 +1424,9 @@ class SlopVariadicPhraseFrequency {
   Positions _pos;
   PosAttr::value_t _max_slop;
   std::vector<PosAttr::value_t> _expected_steps;
-  // Window half-width slop + sum(expected_steps); cached for gather.
-  PosAttr::value_t _window_half = 0;
   std::vector<std::vector<PosAttr::value_t>> _slot_pos;
   std::vector<std::vector<OffsetPair>> _slot_offs;
   std::vector<PosEntry> _scratch_entries;
-  // Merged slop-reachable windows around the rarest slot's positions
-  // (seek-gather path only). These scratch members are reused across Match().
-  std::vector<detail::slop::Window> _windows;
   // Matcher scratch, kept off the allocator on the hot path.
   detail::slop::MatchScratch _match_scratch;
   // Valid tuples from the matcher pass, sorted by leftmost (kHasOffsets &&
