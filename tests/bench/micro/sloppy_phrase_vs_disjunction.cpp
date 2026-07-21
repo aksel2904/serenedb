@@ -24,12 +24,8 @@
 // For two terms with slop N and expected step 1, the equivalent disjunction
 // is built by MakeDisjunctionEquivalent.
 //
-// Two-term phrases run the fused merge-join (JoinPair), which bypasses gather,
-// so the gGatherOverride seam can't reach them and n == 2 registers a single
-// Exec variant. For n >= 3 the Execute path is measured under three gather
-// strategies via the seam: _auto (production heuristic per document), _seek
-// (force seek-gather), _readall (force read-all). _seek vs _readall isolates
-// the gather mechanism, _auto shows what the heuristic picks, and
+// Two-term phrases run the fused merge-join (JoinPair); n >= 3 gathers
+// every slot in full (bulk ReadAll) and runs the DFS matcher.
 // DisjunctionExec is the baseline.
 //
 // Corpora: europarl (real text - balanced pairs, skewed "the commission",
@@ -327,27 +323,6 @@ constexpr size_t kFarApartDocs = 64;
 constexpr int kFarApartReps = 24;
 constexpr int kFarApartGap = 50;
 
-// Drive the gather strategy explicitly so the benchmark can compare
-// the seek-gather and read-all paths over identical data. Production
-// never writes gGatherOverride; this is benchmark/test-only.
-struct GatherModeGuard {
-  explicit GatherModeGuard(spm::GatherOverride mode) noexcept {
-    spm::gGatherOverride = mode;
-  }
-  ~GatherModeGuard() { spm::gGatherOverride = spm::GatherOverride::kAuto; }
-};
-
-struct ModeReg {
-  const char* suffix;
-  spm::GatherOverride mode;
-};
-
-constexpr ModeReg kModes[] = {
-  {"_auto", spm::GatherOverride::kAuto},
-  {"_seek", spm::GatherOverride::kForceSeek},
-  {"_readall", spm::GatherOverride::kForceReadAll},
-};
-
 struct TermPair {
   std::string_view label;
   std::string_view term0;
@@ -472,7 +447,8 @@ Corpus BuildIndex() {
 
 // Builds a synthetic corpus where every document is 30x "zzcmn", one
 // "zzrre", 30x "zzcmn" - a 60:1 in-document frequency skew with the
-// dense term as phrase slot0. This is the ceiling case for seek-gather.
+// dense term as phrase slot0 - the skew ceiling for the join's
+// rare-anchor pick.
 Corpus BuildSyntheticIndex() {
   auto tmp_root =
     std::filesystem::temp_directory_path() / "serenedb-bench-sloppy-synthetic";
@@ -992,11 +968,9 @@ void BenchPrepare(benchmark::State& state, const irs::DirectoryReader& rdr,
 }
 
 template<typename MakeFn>
-[[gnu::noinline]] void BenchExecuteOnly(
-  benchmark::State& state, const irs::DirectoryReader& rdr, MakeFn make,
-  spm::GatherOverride mode = spm::GatherOverride::kAuto) {
-  GatherModeGuard guard{mode};
-
+[[gnu::noinline]] void BenchExecuteOnly(benchmark::State& state,
+                                        const irs::DirectoryReader& rdr,
+                                        MakeFn make) {
   auto q = make();
   auto prepared = Prepare(q, rdr);
   if (prepared.AnyNull()) {
@@ -1088,11 +1062,9 @@ irs::Or MakeDisjunctionEquivalentVariadic4(irs::PosAttr::value_t slop) {
 // (PhraseQueryT selects which); slop only, no disjunction analogue. Drains
 // pos->next() per matched doc.
 template<typename PhraseQueryT = irs::FixedPhraseQuery, typename MakeFn>
-[[gnu::noinline]] void BenchExecuteWithOffsets(
-  benchmark::State& state, const irs::DirectoryReader& rdr, MakeFn make,
-  spm::GatherOverride mode = spm::GatherOverride::kAuto) {
-  GatherModeGuard guard{mode};
-
+[[gnu::noinline]] void BenchExecuteWithOffsets(benchmark::State& state,
+                                               const irs::DirectoryReader& rdr,
+                                               MakeFn make) {
   auto q = make();
   auto prepared = Prepare(q, rdr);
   if (prepared.AnyNull()) {
@@ -1148,11 +1120,8 @@ template<typename PhraseQueryT = irs::FixedPhraseQuery, typename MakeFn>
   state.counters["matches"] = static_cast<double>(matches_per_iter);
 }
 
-// Registers the slop Execute benchmark plus the disjunction baseline for
-// one n == 2 (corpus, term pair, slop). Two-term phrases run the fused
-// merge-join, which bypasses gather - the gGatherOverride modes cannot
-// reach them, so exactly one Exec variant is registered (renamed from
-// the historical _auto/_seek/_readall triple).
+// Registers the slop Execute benchmark plus the disjunction baseline
+// for one n == 2 (corpus, term pair, slop).
 void RegisterExecVariants(const std::string& suffix, std::string_view t0,
                           std::string_view t1, irs::PosAttr::value_t slop,
                           const Corpus& (*corpus)()) {
@@ -1231,30 +1200,24 @@ void RegisterAll() {
   for (auto slop : kSlopValues) {
     const std::string suffix =
       "_the_european_union3_slop" + std::to_string(static_cast<unsigned>(slop));
-    for (const auto& m : kModes) {
-      benchmark::RegisterBenchmark(
-        ("SlopPhraseExec" + suffix + m.suffix).c_str(),
-        [slop, mode = m.mode](benchmark::State& state) {
-          BenchExecuteOnly(
-            state, GetCorpus().reader,
-            [slop] { return MakeTheEuropeanUnion(slop); }, mode);
-        })
-        ->Repetitions(kRepetitions)
-        ->ReportAggregatesOnly(true);
-    }
-    // n >= 3 with offsets has no pair-join bypass, so this is the gather's
-    // Offs side; the mode variants cover both gather paths.
-    for (const auto& m : kModes) {
-      benchmark::RegisterBenchmark(
-        ("SlopPhraseExecOffs" + suffix + m.suffix).c_str(),
-        [slop, mode = m.mode](benchmark::State& state) {
-          BenchExecuteWithOffsets(
-            state, GetCorpus().reader,
-            [slop] { return MakeTheEuropeanUnion(slop); }, mode);
-        })
-        ->Repetitions(kRepetitions)
-        ->ReportAggregatesOnly(true);
-    }
+    benchmark::RegisterBenchmark(
+      ("SlopPhraseExec" + suffix).c_str(),
+      [slop](benchmark::State& state) {
+        BenchExecuteOnly(state, GetCorpus().reader,
+                         [slop] { return MakeTheEuropeanUnion(slop); });
+      })
+      ->Repetitions(kRepetitions)
+      ->ReportAggregatesOnly(true);
+    // n >= 3 with offsets has no pair-join bypass: the bulk Offs gather
+    // plus the enumerating matcher.
+    benchmark::RegisterBenchmark(
+      ("SlopPhraseExecOffs" + suffix).c_str(),
+      [slop](benchmark::State& state) {
+        BenchExecuteWithOffsets(state, GetCorpus().reader,
+                                [slop] { return MakeTheEuropeanUnion(slop); });
+      })
+      ->Repetitions(kRepetitions)
+      ->ReportAggregatesOnly(true);
     benchmark::RegisterBenchmark(
       ("DisjunctionExec" + suffix).c_str(),
       [slop](benchmark::State& state) {
@@ -1270,20 +1233,15 @@ void RegisterAll() {
   for (auto slop : kSlopValues) {
     const std::string suffix = "_the_european_union_and4_slop" +
                                std::to_string(static_cast<unsigned>(slop));
-    for (const auto& m : kModes) {
-      benchmark::RegisterBenchmark(
-        ("SlopPhraseExec" + suffix + m.suffix).c_str(),
-        [slop, mode = m.mode](benchmark::State& state) {
-          BenchExecuteOnly(
-            state, GetCorpus().reader,
-            [slop] {
-              return MakeSlopPhrase4("the", "european", "union", "and", slop);
-            },
-            mode);
-        })
-        ->Repetitions(kRepetitions)
-        ->ReportAggregatesOnly(true);
-    }
+    benchmark::RegisterBenchmark(
+      ("SlopPhraseExec" + suffix).c_str(),
+      [slop](benchmark::State& state) {
+        BenchExecuteOnly(state, GetCorpus().reader, [slop] {
+          return MakeSlopPhrase4("the", "european", "union", "and", slop);
+        });
+      })
+      ->Repetitions(kRepetitions)
+      ->ReportAggregatesOnly(true);
     benchmark::RegisterBenchmark(
       ("DisjunctionExec" + suffix).c_str(),
       [slop](benchmark::State& state) {
@@ -1420,17 +1378,15 @@ void RegisterAll() {
   for (auto slop : kSlopValues) {
     const std::string suffix =
       "_one_of_the3_slop" + std::to_string(static_cast<unsigned>(slop));
-    for (const auto& m : kModes) {
-      benchmark::RegisterBenchmark(
-        ("SlopPhraseExec" + suffix + m.suffix).c_str(),
-        [slop, mode = m.mode](benchmark::State& state) {
-          BenchExecuteOnly(
-            state, GetCorpus().reader,
-            [slop] { return MakeSlopPhrase3("one", "of", "the", slop); }, mode);
-        })
-        ->Repetitions(kRepetitions)
-        ->ReportAggregatesOnly(true);
-    }
+    benchmark::RegisterBenchmark(
+      ("SlopPhraseExec" + suffix).c_str(),
+      [slop](benchmark::State& state) {
+        BenchExecuteOnly(state, GetCorpus().reader, [slop] {
+          return MakeSlopPhrase3("one", "of", "the", slop);
+        });
+      })
+      ->Repetitions(kRepetitions)
+      ->ReportAggregatesOnly(true);
     benchmark::RegisterBenchmark(
       ("DisjunctionExec" + suffix).c_str(),
       [slop](benchmark::State& state) {
@@ -1471,34 +1427,26 @@ void RegisterAll() {
   // 3-term equivalent helper registered for this corpus).
   for (unsigned slop : {1u, 2u, 5u, 10u}) {
     const std::string suffix = "_dense3_slop" + std::to_string(slop);
-    for (const auto& m : kModes) {
-      benchmark::RegisterBenchmark(
-        ("SlopPhraseExec" + suffix + m.suffix).c_str(),
-        [slop, mode = m.mode](benchmark::State& state) {
-          BenchExecuteOnly(
-            state, GetDense3Corpus().reader,
-            [slop] {
-              return MakeSlopPhrase3("aaa", "bbb", "ccc",
-                                     static_cast<irs::PosAttr::value_t>(slop));
-            },
-            mode);
-        })
-        ->Repetitions(kRepetitions)
-        ->ReportAggregatesOnly(true);
-      benchmark::RegisterBenchmark(
-        ("SlopPhraseExecOffs" + suffix + m.suffix).c_str(),
-        [slop, mode = m.mode](benchmark::State& state) {
-          BenchExecuteWithOffsets(
-            state, GetDense3Corpus().reader,
-            [slop] {
-              return MakeSlopPhrase3("aaa", "bbb", "ccc",
-                                     static_cast<irs::PosAttr::value_t>(slop));
-            },
-            mode);
-        })
-        ->Repetitions(kRepetitions)
-        ->ReportAggregatesOnly(true);
-    }
+    benchmark::RegisterBenchmark(
+      ("SlopPhraseExec" + suffix).c_str(),
+      [slop](benchmark::State& state) {
+        BenchExecuteOnly(state, GetDense3Corpus().reader, [slop] {
+          return MakeSlopPhrase3("aaa", "bbb", "ccc",
+                                 static_cast<irs::PosAttr::value_t>(slop));
+        });
+      })
+      ->Repetitions(kRepetitions)
+      ->ReportAggregatesOnly(true);
+    benchmark::RegisterBenchmark(
+      ("SlopPhraseExecOffs" + suffix).c_str(),
+      [slop](benchmark::State& state) {
+        BenchExecuteWithOffsets(state, GetDense3Corpus().reader, [slop] {
+          return MakeSlopPhrase3("aaa", "bbb", "ccc",
+                                 static_cast<irs::PosAttr::value_t>(slop));
+        });
+      })
+      ->Repetitions(kRepetitions)
+      ->ReportAggregatesOnly(true);
   }
 
   // Adversarial repeated-term phrases on the single-term corpus: n=3 and n=4

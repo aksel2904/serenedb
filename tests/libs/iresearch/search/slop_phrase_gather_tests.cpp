@@ -21,20 +21,12 @@
 // Correctness coverage for the sloppy-phrase gather machinery and the n == 2
 // fused merge-join.
 //
-// On balanced data the heuristic never selects seek-gather, and read-all
-// would produce the same matches anyway, so black-box data tests can't prove
-// the seek-gather path. Instead these drive both gather strategies over
-// identical data via the gGatherOverride seam and assert bit-for-bit equal
-// results, plus unit-test BuildWindows directly.
-//
 // n == 2 phrases - fixed and variadic alike - route to the merge-join in
-// production and never reach gather, so every gather-equivalence check on a
-// two-term query runs under PairJoinGuard - otherwise both sides would run
-// the join and the comparison would be a tautology. Join-vs-legacy
-// equivalence is asserted separately by the pair_join_equivalence_* tests.
-// The SlopOverlapMatcher tests at the end pin the n >= 3 same-position
-// (term-group) semantics of spm::Run.
-//
+// production and never reach gather; gPairJoinDisabled exposes the generic
+// gather + Run path, and the pair_join_equivalence_* tests assert
+// join-vs-generic equivalence over identical data. The SlopOverlapMatcher
+// tests at the end pin the n >= 3 same-position (term-group) semantics of
+// spm::Run.
 
 #include "filter_test_case_base.hpp"
 #include "iresearch/analysis/token_attributes.hpp"
@@ -51,23 +43,10 @@ namespace spm = irs::detail::slop;
 
 constexpr irs::field_id kField = tests::FieldIdFor("phrase_anl");
 
-// Restores the gather override to kAuto on scope exit so a forced mode
-// never leaks into another test.
-class GatherModeGuard {
- public:
-  explicit GatherModeGuard(spm::GatherOverride mode) noexcept {
-    spm::gGatherOverride = mode;
-  }
-  ~GatherModeGuard() { spm::gGatherOverride = spm::GatherOverride::kAuto; }
-
-  GatherModeGuard(const GatherModeGuard&) = delete;
-  GatherModeGuard& operator=(const GatherModeGuard&) = delete;
-};
-
 // Routes n == 2 phrases through the generic gather + Run path for the
 // duration of the scope (the production default is the fused
-// merge-join, which bypasses gather entirely). Same discipline as
-// GatherModeGuard: never leaks past the scope.
+// merge-join, which bypasses gather entirely). Never leaks past the
+// scope.
 class PairJoinGuard {
  public:
   PairJoinGuard() noexcept { spm::gPairJoinDisabled = true; }
@@ -79,8 +58,8 @@ class PairJoinGuard {
 
 // Routes the offset-enabled read-all gather through the scalar
 // per-position loop for the duration of the scope (the production
-// default is the bulk three-array ReadAll). Same discipline as
-// GatherModeGuard: never leaks past the scope.
+// default is the bulk three-array ReadAll). Never leaks past the
+// scope.
 class OffsBulkScalarGuard {
  public:
   OffsBulkScalarGuard() noexcept { spm::gOffsBulkGatherDisabled = true; }
@@ -95,8 +74,8 @@ irs::bytes_view Term(std::string_view s) {
 }
 
 // Collects matched doc ids across all segments for the prepared query.
-// The gather mode is read at iteration time, so the same prepared query
-// can be re-run under different GatherModeGuard scopes.
+// The path toggles are read at iteration time, so the same prepared
+// query can be re-run under different guard scopes.
 std::vector<irs::doc_id_t> CollectDocs(const tests::PreparedFilter& prepared) {
   std::vector<irs::doc_id_t> out;
   for (size_t i = 0; i < prepared.size(); ++i) {
@@ -150,320 +129,12 @@ std::vector<OffsetMatch> CollectOffsets(const tests::PreparedFilter& prepared,
 
 }  // namespace
 
-class SlopSeekGatherTestCase : public tests::FilterTestCaseBase {
- protected:
-  // Runs the prepared query under read-all and seek-gather and asserts
-  // identical doc ids (ctx is forwarded to the failure message). PairJoinGuard
-  // keeps n == 2 queries - fixed and variadic alike - on the gather path this
-  // helper exercises (production would route them to the join, making the
-  // comparison vacuous); it is a no-op for n >= 3.
-  void AssertExecuteEquivalent(const tests::PreparedFilter& prepared,
-                               std::string_view ctx) {
-    std::vector<irs::doc_id_t> read_all;
-    std::vector<irs::doc_id_t> seek;
-    {
-      PairJoinGuard pj;
-      GatherModeGuard g{spm::GatherOverride::kForceReadAll};
-      read_all = CollectDocs(prepared);
-    }
-    {
-      PairJoinGuard pj;
-      GatherModeGuard g{spm::GatherOverride::kForceSeek};
-      seek = CollectDocs(prepared);
-    }
-    ASSERT_EQ(read_all, seek) << "seek-gather diverged from read-all: " << ctx;
-    ASSERT_FALSE(read_all.empty()) << "expected matches for: " << ctx;
-  }
-};
-
-// BuildWindows: pure unit tests. Highest-certainty coverage of the merge
-// logic, which is the genuinely new algorithmic bit (overlap handling is
-// load-bearing because forward-only seek cannot re-read).
-
-TEST(SlopBuildWindows, single) {
-  std::vector<spm::Window> out;
-  spm::BuildWindows(/*lead_pos=*/{10}, /*w=*/2, out);
-  ASSERT_EQ(1u, out.size());
-  ASSERT_EQ(8u, out[0].first);
-  ASSERT_EQ(12u, out[0].second);
-}
-
-TEST(SlopBuildWindows, lo_clamped_to_min) {
-  // p <= w must clamp lo to pos_limits::min() (==1), not 0, so seek() on
-  // a fresh iterator is not a no-op.
-  std::vector<spm::Window> out;
-  spm::BuildWindows(/*lead_pos=*/{2}, /*w=*/5, out);
-  ASSERT_EQ(1u, out.size());
-  ASSERT_EQ(irs::pos_limits::min(), out[0].first);
-  ASSERT_EQ(7u, out[0].second);
-}
-
-TEST(SlopBuildWindows, disjoint) {
-  std::vector<spm::Window> out;
-  spm::BuildWindows(/*lead_pos=*/{10, 100}, /*w=*/2, out);
-  ASSERT_EQ(2u, out.size());
-  ASSERT_EQ(8u, out[0].first);
-  ASSERT_EQ(12u, out[0].second);
-  ASSERT_EQ(98u, out[1].first);
-  ASSERT_EQ(102u, out[1].second);
-}
-
-TEST(SlopBuildWindows, overlap_merges) {
-  // 10 -> [8,12], 13 -> [11,15]; 11 <= 12 so they merge to [8,15].
-  std::vector<spm::Window> out;
-  spm::BuildWindows(/*lead_pos=*/{10, 13}, /*w=*/2, out);
-  ASSERT_EQ(1u, out.size());
-  ASSERT_EQ(8u, out[0].first);
-  ASSERT_EQ(15u, out[0].second);
-}
-
-TEST(SlopBuildWindows, touching_then_gap) {
-  // 10->[8,12], 12->[10,14] merge to [8,14]; 100->[98,102] stays separate.
-  std::vector<spm::Window> out;
-  spm::BuildWindows(/*lead_pos=*/{10, 12, 100}, /*w=*/2, out);
-  ASSERT_EQ(2u, out.size());
-  ASSERT_EQ(8u, out[0].first);
-  ASSERT_EQ(14u, out[0].second);
-  ASSERT_EQ(98u, out[1].first);
-  ASSERT_EQ(102u, out[1].second);
-}
-
-TEST(SlopBuildWindows, hi_capped_below_eof) {
-  // p + w overflowing toward eof must cap hi at eof() - 1: the gather
-  // loops compare positions with a bare v <= hi, and eof may never pass.
-  std::vector<spm::Window> out;
-  const irs::PosAttr::value_t p = irs::pos_limits::eof() - 2;
-  spm::BuildWindows({p}, /*w=*/5, out);
-  ASSERT_EQ(1u, out.size());
-  ASSERT_EQ(p - 5, out[0].first);
-  ASSERT_EQ(irs::pos_limits::eof() - 1, out[0].second);
-}
-
-// Equivalence: drive read-all vs seek-gather over the standard sequential
-// corpus for a representative set of sloppy queries. Reuses the same query
-// shapes as the existing sloppy tests.
-
-TEST_P(SlopSeekGatherTestCase, equivalence_fixed) {
-  {
-    tests::JsonDocGenerator gen(resource("phrase_sequential.json"),
-                                &tests::PayloadedJsonFieldFactory);
-    add_segment(gen);
-  }
-  auto rdr = open_reader();
-
-  struct Spec {
-    std::string_view ctx;
-    std::vector<std::string_view> terms;
-    irs::PosAttr::value_t slop;
-  };
-  const Spec specs[] = {
-    {"quick fox s1", {"quick", "fox"}, 1},
-    {"quick moved s3", {"quick", "moved"}, 3},
-    {"fox brown s2 (reversal)", {"fox", "brown"}, 2},
-    {"quick brown fox s1", {"quick", "brown", "fox"}, 1},
-    {"quick fox moved s2", {"quick", "fox", "moved"}, 2},
-    {"fox brown quick s4", {"fox", "brown", "quick"}, 4},
-  };
-
-  for (const auto& s : specs) {
-    irs::ByPhrase q;
-    *q.mutable_field_id() = kField;
-    for (auto t : s.terms) {
-      q.mutable_options()->push_back<irs::ByTermOptions>().term = Term(t);
-    }
-    q.mutable_options()->set_slop(s.slop);
-
-    tests::PreparedFilter prepared{q, rdr};
-    AssertExecuteEquivalent(prepared, s.ctx);
-  }
-}
-
-TEST_P(SlopSeekGatherTestCase, equivalence_explicit_gap) {
-  {
-    tests::JsonDocGenerator gen(resource("phrase_sequential.json"),
-                                &tests::PayloadedJsonFieldFactory);
-    add_segment(gen);
-  }
-  auto rdr = open_reader();
-
-  // "quick __ moved": expected step 2 between slots.
-  irs::ByPhrase q;
-  *q.mutable_field_id() = kField;
-  q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("quick");
-  q.mutable_options()->push_back<irs::ByTermOptions>(/*offs=*/1).term =
-    Term("moved");
-  q.mutable_options()->set_slop(1);
-
-  tests::PreparedFilter prepared{q, rdr};
-  AssertExecuteEquivalent(prepared, "quick __ moved s1");
-}
-
-TEST_P(SlopSeekGatherTestCase, equivalence_variadic) {
-  {
-    tests::JsonDocGenerator gen(resource("phrase_sequential.json"),
-                                &tests::PayloadedJsonFieldFactory);
-    add_segment(gen);
-  }
-  auto rdr = open_reader();
-
-  // prefix qui* + fox -> VariadicPhraseQuery path.
-  irs::ByPhrase q;
-  *q.mutable_field_id() = kField;
-  q.mutable_options()->push_back<irs::ByPrefixOptions>().term = Term("qui");
-  q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("fox");
-  q.mutable_options()->set_slop(1);
-
-  tests::PreparedFilter prepared{q, rdr};
-  AssertExecuteEquivalent(prepared, "qui* fox s1 (variadic)");
-}
-
-// Offsets equivalence: ExecuteWithOffsets must emit identical per-match
-// offsets under both gather strategies (covers _offs correctness after a
-// multi-step forward seek).
-
-TEST_P(SlopSeekGatherTestCase, equivalence_offsets_fixed) {
-  {
-    tests::JsonDocGenerator gen(resource("phrase_sequential.json"),
-                                &tests::PayloadedJsonFieldFactory);
-    add_segment(gen);
-  }
-  auto rdr = open_reader();
-
-  irs::ByPhrase q;
-  *q.mutable_field_id() = kField;
-  q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("quick");
-  q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("fox");
-  q.mutable_options()->set_slop(1);
-
-  tests::PreparedFilter prepared{q, rdr};
-
-  // n == 2: guard keeps the offsets runs on the gather path (see header).
-  std::vector<OffsetMatch> read_all;
-  std::vector<OffsetMatch> seek;
-  {
-    PairJoinGuard pj;
-    GatherModeGuard g{spm::GatherOverride::kForceReadAll};
-    read_all = CollectOffsets<irs::FixedPhraseQuery>(prepared, rdr);
-  }
-  {
-    PairJoinGuard pj;
-    GatherModeGuard g{spm::GatherOverride::kForceSeek};
-    seek = CollectOffsets<irs::FixedPhraseQuery>(prepared, rdr);
-  }
-  ASSERT_FALSE(read_all.empty());
-  ASSERT_EQ(read_all, seek);
-}
-
-TEST_P(SlopSeekGatherTestCase, equivalence_offsets_variadic) {
-  {
-    tests::JsonDocGenerator gen(resource("phrase_sequential.json"),
-                                &tests::PayloadedJsonFieldFactory);
-    add_segment(gen);
-  }
-  auto rdr = open_reader();
-
-  irs::ByPhrase q;
-  *q.mutable_field_id() = kField;
-  q.mutable_options()->push_back<irs::ByPrefixOptions>().term = Term("qui");
-  q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("fox");
-  q.mutable_options()->set_slop(1);
-
-  tests::PreparedFilter prepared{q, rdr};
-
-  // n == 2: without the guard both runs would take the variadic join and
-  // never consult the gather gate at all (see file header).
-  std::vector<OffsetMatch> read_all;
-  std::vector<OffsetMatch> seek;
-  {
-    PairJoinGuard pj;
-    GatherModeGuard g{spm::GatherOverride::kForceReadAll};
-    read_all = CollectOffsets<irs::VariadicPhraseQuery>(prepared, rdr);
-  }
-  {
-    PairJoinGuard pj;
-    GatherModeGuard g{spm::GatherOverride::kForceSeek};
-    seek = CollectOffsets<irs::VariadicPhraseQuery>(prepared, rdr);
-  }
-  ASSERT_FALSE(read_all.empty());
-  ASSERT_EQ(read_all, seek);
-}
-
-// Skewed inline data: a document with a 1:N in-doc frequency ratio so the
-// heuristic (kAuto) actually selects seek-gather, and an adjacent slop-0 hit
-// must still be found. The large ratio keeps the test robust if
-// kSeekGatherSkew is raised; kAuto vs kForceReadAll cross-checks the gate.
-
-TEST_P(SlopSeekGatherTestCase, skewed_engages_and_matches) {
-  static constexpr char kData[] =
-    R"([{"name":"SK","phrase":"rarexyz commonxyz commonxyz commonxyz )"
-    R"(commonxyz commonxyz commonxyz commonxyz commonxyz commonxyz commonxyz )"
-    R"(commonxyz commonxyz commonxyz commonxyz commonxyz commonxyz commonxyz )"
-    R"(commonxyz commonxyz commonxyz"}])";
-  {
-    tests::JsonDocGenerator gen(kData, &tests::PayloadedJsonFieldFactory);
-    add_segment(gen);
-  }
-  auto rdr = open_reader();
-
-  irs::ByPhrase q;
-  *q.mutable_field_id() = kField;
-  q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("rarexyz");
-  q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("commonxyz");
-  q.mutable_options()->set_slop(1);
-
-  tests::PreparedFilter prepared{q, rdr};
-
-  // Guard: without it this n == 2 query runs the join and the gate is
-  // never consulted at all (see file header).
-  std::vector<irs::doc_id_t> automatic;
-  std::vector<irs::doc_id_t> read_all;
-  {
-    PairJoinGuard pj;
-    GatherModeGuard g{spm::GatherOverride::kAuto};  // gate should pick seek
-    automatic = CollectDocs(prepared);
-  }
-  {
-    PairJoinGuard pj;
-    GatherModeGuard g{spm::GatherOverride::kForceReadAll};
-    read_all = CollectDocs(prepared);
-  }
-  ASSERT_EQ(1u, automatic.size());  // SK matches (rarexyz@1, commonxyz@2)
-  ASSERT_EQ(read_all, automatic);
-}
-
-// Overlapping windows: two occurrences of the rare term close enough that
-// their slop windows merge, exercising the merged-window forward sweep in
-// the seek-gather collectors.
-
-TEST_P(SlopSeekGatherTestCase, overlapping_windows_equivalent) {
-  // rareq appears twice (@1 and @4); with slop large enough the two
-  // windows around them overlap. commonq is dense so the gate triggers.
-  static constexpr char kData[] =
-    R"([{"name":"OV","phrase":"rareq commonq commonq rareq commonq commonq )"
-    R"(commonq commonq commonq commonq commonq commonq commonq commonq )"
-    R"(commonq commonq commonq commonq commonq commonq"}])";
-  {
-    tests::JsonDocGenerator gen(kData, &tests::PayloadedJsonFieldFactory);
-    add_segment(gen);
-  }
-  auto rdr = open_reader();
-
-  irs::ByPhrase q;
-  *q.mutable_field_id() = kField;
-  q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("rareq");
-  q.mutable_options()->push_back<irs::ByTermOptions>().term = Term("commonq");
-  q.mutable_options()->set_slop(
-    3);  // W = slop + 1 = 4; windows around 1 & 4 overlap
-
-  tests::PreparedFilter prepared{q, rdr};
-  AssertExecuteEquivalent(prepared, "overlapping windows");
-}
+class SlopGatherTestCase : public tests::FilterTestCaseBase {};
 
 // Pair-join equivalence: the n == 2 merge-join (production default) must
-// produce exactly the docs the generic gather + Run path does. The join
-// bypasses gather, so gGatherOverride can't reach it; gPairJoinDisabled
-// exposes the legacy path, driven here under both gather modes.
-TEST_P(SlopSeekGatherTestCase, pair_join_equivalence_fixed) {
+// produce exactly the docs the generic gather + Run path does;
+// gPairJoinDisabled exposes the legacy path.
+TEST_P(SlopGatherTestCase, pair_join_equivalence_fixed) {
   {
     tests::JsonDocGenerator gen(resource("phrase_sequential.json"),
                                 &tests::PayloadedJsonFieldFactory);
@@ -497,29 +168,19 @@ TEST_P(SlopSeekGatherTestCase, pair_join_equivalence_fixed) {
     tests::PreparedFilter prepared{q, rdr};
 
     const auto join = CollectDocs(prepared);
-    std::vector<irs::doc_id_t> legacy_readall;
-    std::vector<irs::doc_id_t> legacy_seek;
+    std::vector<irs::doc_id_t> legacy;
     {
       PairJoinGuard pj;
-      GatherModeGuard g{spm::GatherOverride::kForceReadAll};
-      legacy_readall = CollectDocs(prepared);
+      legacy = CollectDocs(prepared);
     }
-    {
-      PairJoinGuard pj;
-      GatherModeGuard g{spm::GatherOverride::kForceSeek};
-      legacy_seek = CollectDocs(prepared);
-    }
-    ASSERT_EQ(legacy_readall, join)
-      << "pair join diverged from read-all: " << s.ctx;
-    ASSERT_EQ(legacy_seek, join)
-      << "pair join diverged from seek-gather: " << s.ctx;
+    ASSERT_EQ(legacy, join) << "pair join diverged from gather: " << s.ctx;
     ASSERT_FALSE(join.empty()) << "expected matches for: " << s.ctx;
   }
 }
 
 // Same for the offsets path: per-match offsets (and, via the match
 // count, freq) from the join must be identical to the generic path's.
-TEST_P(SlopSeekGatherTestCase, pair_join_equivalence_offsets) {
+TEST_P(SlopGatherTestCase, pair_join_equivalence_offsets) {
   {
     tests::JsonDocGenerator gen(resource("phrase_sequential.json"),
                                 &tests::PayloadedJsonFieldFactory);
@@ -550,7 +211,7 @@ TEST_P(SlopSeekGatherTestCase, pair_join_equivalence_offsets) {
 // MergedPosStream. Same join-vs-legacy discipline as the fixed test.
 // Duplicate positions inside a slot (same-position synonyms) cannot occur
 // on this corpus; that case is pinned by the merged-stream fuzz oracle.
-TEST_P(SlopSeekGatherTestCase, pair_join_equivalence_variadic) {
+TEST_P(SlopGatherTestCase, pair_join_equivalence_variadic) {
   {
     tests::JsonDocGenerator gen(resource("phrase_sequential.json"),
                                 &tests::PayloadedJsonFieldFactory);
@@ -596,22 +257,13 @@ TEST_P(SlopSeekGatherTestCase, pair_join_equivalence_variadic) {
     tests::PreparedFilter prepared{q, rdr};
 
     const auto join = CollectDocs(prepared);
-    std::vector<irs::doc_id_t> legacy_readall;
-    std::vector<irs::doc_id_t> legacy_seek;
+    std::vector<irs::doc_id_t> legacy;
     {
       PairJoinGuard pj;
-      GatherModeGuard g{spm::GatherOverride::kForceReadAll};
-      legacy_readall = CollectDocs(prepared);
+      legacy = CollectDocs(prepared);
     }
-    {
-      PairJoinGuard pj;
-      GatherModeGuard g{spm::GatherOverride::kForceSeek};
-      legacy_seek = CollectDocs(prepared);
-    }
-    ASSERT_EQ(legacy_readall, join)
-      << "variadic pair join diverged from read-all: " << s.ctx;
-    ASSERT_EQ(legacy_seek, join)
-      << "variadic pair join diverged from seek-gather: " << s.ctx;
+    ASSERT_EQ(legacy, join)
+      << "variadic pair join diverged from gather: " << s.ctx;
     ASSERT_FALSE(join.empty()) << "expected matches for: " << s.ctx;
   }
 }
@@ -621,7 +273,7 @@ TEST_P(SlopSeekGatherTestCase, pair_join_equivalence_variadic) {
 // comparison is safe here: with no same-position tokens in the corpus no
 // slot holds duplicate positions, the one case where the two paths may
 // legitimately source offsets from different equal-position terms.
-TEST_P(SlopSeekGatherTestCase, pair_join_equivalence_offsets_variadic) {
+TEST_P(SlopGatherTestCase, pair_join_equivalence_offsets_variadic) {
   {
     tests::JsonDocGenerator gen(resource("phrase_sequential.json"),
                                 &tests::PayloadedJsonFieldFactory);
@@ -654,7 +306,7 @@ TEST_P(SlopSeekGatherTestCase, pair_join_equivalence_offsets_variadic) {
 // counting itself) is pinned here on an inline corpus. No same-position
 // tokens, so exact offsets comparison is safe (see
 // pair_join_equivalence_offsets_variadic).
-TEST_P(SlopSeekGatherTestCase, pair_join_solo_dispatch_equivalence) {
+TEST_P(SlopGatherTestCase, pair_join_solo_dispatch_equivalence) {
   // qui* -> {quick, quilt}, fo* -> {fox, forward}; the per-doc live sub
   // counts walk all four dispatch branches across the documents.
   static constexpr char kData[] =
@@ -700,14 +352,13 @@ TEST_P(SlopSeekGatherTestCase, pair_join_solo_dispatch_equivalence) {
 }
 
 // Multi-block postings: every corpus above keeps a term's positions within
-// a single 128-entry block, so the bulk ReadAll refill, its backlog Skip,
-// and the block-skipping side of seek-gather never run in CI (benches are
-// the only consumers). This corpus gives the dense term hundreds of
-// positions per document - several position blocks - plus a document the
-// conjunction skips, so the pending-position catch-up crosses blocks too.
-// All decode paths must agree: join vs gather for the pair, read-all vs
-// seek for n == 3, and bulk vs scalar offset gather.
-TEST_P(SlopSeekGatherTestCase, equivalence_multi_block_postings) {
+// a single 128-entry block, so the bulk ReadAll refill and its backlog Skip
+// never run in CI (benches are the only consumers). This corpus gives the
+// dense term hundreds of positions per document - several position blocks -
+// plus a document the conjunction skips, so the pending-position catch-up
+// crosses blocks too. All decode paths must agree: join vs gather for the
+// pair, and bulk vs scalar offset gather for n == 3.
+TEST_P(SlopGatherTestCase, multi_block_postings) {
   const auto repeat = [](std::string_view tok, size_t n) {
     std::string s;
     for (size_t i = 0; i != n; ++i) {
@@ -742,53 +393,28 @@ TEST_P(SlopSeekGatherTestCase, equivalence_multi_block_postings) {
     return tests::PreparedFilter{q, rdr};
   };
 
-  // Pair: production join vs both gather modes.
+  // Pair: production join vs the generic gather path.
   {
     auto prepared = make({"bbb", "aaa"}, 1);
     const auto join = CollectDocs(prepared);
     ASSERT_EQ(2u, join.size());  // D1 and D3
     {
       PairJoinGuard pj;
-      GatherModeGuard g{spm::GatherOverride::kForceReadAll};
-      ASSERT_EQ(join, CollectDocs(prepared));
-    }
-    {
-      PairJoinGuard pj;
-      GatherModeGuard g{spm::GatherOverride::kForceSeek};
       ASSERT_EQ(join, CollectDocs(prepared));
     }
   }
 
-  // Triple: read-all (bulk ReadAll with refills) vs seek (scalar windowed
-  // decode with SkipBlock) vs the production heuristic.
+  // Triple: bulk ReadAll with refills, positions and offsets.
   {
     auto prepared = make({"xxx", "bbb", "aaa"}, 1);
-    std::vector<irs::doc_id_t> read_all;
-    {
-      GatherModeGuard g{spm::GatherOverride::kForceReadAll};
-      read_all = CollectDocs(prepared);
-    }
+    const auto read_all = CollectDocs(prepared);
     ASSERT_EQ(2u, read_all.size());  // D1 and D3
-    {
-      GatherModeGuard g{spm::GatherOverride::kForceSeek};
-      ASSERT_EQ(read_all, CollectDocs(prepared));
-    }
-    ASSERT_EQ(read_all, CollectDocs(prepared));  // kAuto
 
-    // Offsets: bulk three-array ReadAll vs its scalar loop vs seek.
-    std::vector<OffsetMatch> bulk;
-    {
-      GatherModeGuard g{spm::GatherOverride::kForceReadAll};
-      bulk = CollectOffsets<irs::FixedPhraseQuery>(prepared, rdr);
-    }
+    // Offsets: bulk three-array ReadAll vs its scalar loop.
+    const auto bulk = CollectOffsets<irs::FixedPhraseQuery>(prepared, rdr);
     ASSERT_FALSE(bulk.empty());
     {
-      GatherModeGuard g{spm::GatherOverride::kForceReadAll};
       OffsBulkScalarGuard scalar;
-      ASSERT_EQ(bulk, CollectOffsets<irs::FixedPhraseQuery>(prepared, rdr));
-    }
-    {
-      GatherModeGuard g{spm::GatherOverride::kForceSeek};
       ASSERT_EQ(bulk, CollectOffsets<irs::FixedPhraseQuery>(prepared, rdr));
     }
   }
@@ -796,11 +422,11 @@ TEST_P(SlopSeekGatherTestCase, equivalence_multi_block_postings) {
 
 static constexpr auto kTestDirs = tests::GetDirectories<tests::kTypesDefault>();
 
-INSTANTIATE_TEST_SUITE_P(slop_seek_gather_test, SlopSeekGatherTestCase,
+INSTANTIATE_TEST_SUITE_P(slop_gather_test, SlopGatherTestCase,
                          ::testing::Combine(::testing::ValuesIn(kTestDirs),
                                             ::testing::Values(tests::FormatInfo{
                                               "1_5simd"})),
-                         SlopSeekGatherTestCase::to_string);
+                         SlopGatherTestCase::to_string);
 
 // SlopOverlapMatcher: n >= 3 same-position matching, driving
 // detail::slop::Run directly with synthetic per-slot position lists and
