@@ -99,6 +99,7 @@ class ByPhraseOptions {
   void clear() noexcept {
     _phrase.clear();
     _is_simple_term_only = true;
+    _slop = 0;
   }
 
   // Returns true if phrase composed of simple terms only, false - otherwise
