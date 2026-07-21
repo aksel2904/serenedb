@@ -74,6 +74,19 @@ bool GroupDistinct(const std::vector<value_t>& chain,
   return true;
 }
 
+// Independently re-derived step cost, deliberately not calling
+// spm::StepCost so a cost-model bug cannot cancel out between the
+// matcher and the oracle: plain |delta - expected| distance, plus one
+// extra move for a reversal (delta < 0) - except at expected == 1,
+// where |delta - 1| already absorbs it. StepCostSpec pins the two
+// formulations against each other, including expected == 0.
+uint64_t BruteStepCost(int64_t delta, value_t expected) {
+  const int64_t e = static_cast<int64_t>(expected);
+  const int64_t dist = delta > e ? delta - e : e - delta;
+  const int64_t reversal = (expected != 1 && delta < 0) ? 1 : 0;
+  return static_cast<uint64_t>(dist + reversal);
+}
+
 // Counts valid tuples; cost is computed only at a full tuple, so none of
 // Run's window/pruning leaks in.
 spm::MatchResult BruteRun(const Case& c) {
@@ -99,7 +112,7 @@ spm::MatchResult BruteRun(const Case& c) {
       for (size_t k = 1; k < n; ++k) {
         const int64_t delta =
           static_cast<int64_t>(chain[k]) - static_cast<int64_t>(chain[k - 1]);
-        cost += spm::StepCost(delta, c.expected_steps[k - 1]);
+        cost += BruteStepCost(delta, c.expected_steps[k - 1]);
       }
       if (cost > c.slop) {
         return;
@@ -858,5 +871,18 @@ TEST(SlopMatcherFuzz, RandomMergedPairCases) {
     ASSERT_TRUE(CheckMergedJoin(c))
       << "iteration " << i << " seed " << seed
       << " (set SLOP_FUZZ_SEED to this value to reproduce the stream)";
+  }
+}
+
+// The production case ladder and the oracle's |delta - expected| form
+// must agree everywhere; exhaustive over a domain wider than any fuzz
+// case generates.
+TEST(SlopMatcherFuzz, StepCostSpec) {
+  for (value_t expected = 0; expected <= 16; ++expected) {
+    for (int64_t delta = -256; delta <= 256; ++delta) {
+      ASSERT_EQ(BruteStepCost(delta, expected),
+                static_cast<uint64_t>(spm::StepCost(delta, expected)))
+        << "delta=" << delta << " expected=" << expected;
+    }
   }
 }
