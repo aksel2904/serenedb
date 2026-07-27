@@ -416,8 +416,13 @@ struct SchemaDependency : DependencyMixin<SchemaDependency> {
 
 struct DatabaseDependency : DependencyMixin<DatabaseDependency> {
   containers::FlatHashSet<ObjectId> schemas;
+  // Foreign servers are database children, like PG (pg_foreign_server has no
+  // namespace column; DROP SCHEMA can never take a server down).
+  containers::FlatHashSet<ObjectId> foreign_servers;
   static constexpr std::array kEdges = {
     Edge<DatabaseDependency>{&DatabaseDependency::schemas,
+                             CascadeVerb::AutoDrop},
+    Edge<DatabaseDependency>{&DatabaseDependency::foreign_servers,
                              CascadeVerb::AutoDrop},
   };
 };
@@ -433,6 +438,10 @@ struct TokenizerDependency : DependencyMixin<TokenizerDependency> {
 struct RoleDependency : DependencyMixin<RoleDependency> {
   containers::FlatHashSet<ObjectId> referencing_objects;
   static constexpr std::array<Edge<RoleDependency>, 0> kEdges{};
+};
+
+struct ForeignServerDependency : DependencyMixin<ForeignServerDependency> {
+  static constexpr std::array<Edge<ForeignServerDependency>, 0> kEdges{};
 };
 
 inline DropPlan DropEmitter::ComputePlan() && {

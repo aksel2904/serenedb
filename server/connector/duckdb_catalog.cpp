@@ -75,6 +75,7 @@
 #include "basics/down_cast.h"
 #include "basics/static_strings.h"
 #include "catalog/catalog.h"
+#include "catalog/foreign_server.h"
 #include "catalog/inverted_index.h"
 #include "catalog/pk_spec.h"
 #include "catalog/schema.h"
@@ -95,6 +96,7 @@
 #include "connector/duckdb_table_entry.h"
 #include "connector/duckdb_table_function.h"
 #include "connector/inverted_index_options_util.h"
+#include "connector/pg_logical_types.h"
 #include "connector/search_table_dispatch.h"
 #include "connector/view_fast_path.h"
 #include "pg/connection_context.h"
@@ -329,6 +331,8 @@ void DropObject(duckdb::ClientContext& context, duckdb::DropInfo& info) {
           ERR_MSG("cannot drop schema ", info_name,
                   " because it is required by the database system"));
       } else {
+        // Foreign servers are database children (PG shape): DROP SCHEMA can
+        // never take one down, so no attachment cleanup is needed here.
         dropped = catalog.DropSchema(catalog::ActingAs(context), info_catalog,
                                      info_name, info.cascade, missing_ok);
       }
@@ -904,7 +908,9 @@ duckdb::unique_ptr<duckdb::LogicalOperator> SereneDBCatalog::BindCreateIndex(
         relation_obj->GetType() == catalog::ObjectType::PgSqlView) {
       auto view =
         std::static_pointer_cast<const catalog::PgSqlView>(relation_obj);
-      fp = ResolveViewFastPath(binder.context, *view);
+      auto key_cols = KeyColumnsFromOptions(
+        stmt.info->Cast<duckdb::CreateIndexInfo>().options);
+      fp = ResolveViewFastPath(binder.context, *view, key_cols);
     }
     duckdb::LogicalOperator* leaf_parent_chain_root = plan.get();
     duckdb::LogicalGet* leaf_get = nullptr;
@@ -930,9 +936,19 @@ duckdb::unique_ptr<duckdb::LogicalOperator> SereneDBCatalog::BindCreateIndex(
       const auto leaf_orig_size = leaf_get->GetColumnIds().size();
       duckdb::vector<duckdb::LogicalType> pk_types;
       pk_types.reserve(vcols.size());
-      for (auto vcol : vcols) {
+      for (size_t i = 0; i < vcols.size(); ++i) {
+        const auto vcol = vcols[i];
         if (vcol == duckdb::MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX) {
           pk_types.push_back(duckdb::LogicalType::UBIGINT);
+        } else if (view_fast_path->pk_spec ==
+                   catalog::PkSpec::ExternalColumnKey) {
+          // Real key columns of arbitrary types -- project their own types, not
+          // a hardcoded BIGINT (which only fits the file/rowid int64 keys).
+          pk_types.push_back(view_fast_path->key_columns[i].type);
+        } else if (view_fast_path->pk_spec ==
+                   catalog::PkSpec::ExternalPostgresCtid) {
+          // The postgres scanner emits the ctid straight as the struct.
+          pk_types.push_back(pg::CTID());
         } else {
           pk_types.push_back(duckdb::LogicalType::BIGINT);
         }
@@ -945,6 +961,12 @@ duckdb::unique_ptr<duckdb::LogicalOperator> SereneDBCatalog::BindCreateIndex(
       for (size_t i = 0; i < vcols.size(); ++i) {
         leaf_get->AddColumnId(vcols[i]);
         leaf_get->types.push_back(pk_types[i]);
+        if (view_fast_path->pk_spec == catalog::PkSpec::ExternalPostgresCtid &&
+            vcols[i] == duckdb::COLUMN_IDENTIFIER_ROW_ID) {
+          leaf_get->virtual_columns.insert_or_assign(
+            duckdb::COLUMN_IDENTIFIER_ROW_ID,
+            duckdb::TableColumn("ctid", pg::CTID()));
+        }
         // Iceberg's get_virtual_columns omits file_index even though the
         // reader produces it -- patch the map.
         if (leaf_get->virtual_columns.find(vcols[i]) ==
@@ -1210,6 +1232,14 @@ duckdb::unique_ptr<duckdb::LogicalOperator> SereneDBCatalog::BindCreateIndex(
     create_index_info->SetCatalog(target.ParentCatalog().GetName());
     if (view_fast_path) {
       switch (view_fast_path->pk_spec) {
+        case catalog::PkSpec::ExternalPostgresCtid:
+          create_index_info->options["_sdb_view_fast_path_pk"] =
+            duckdb::Value("external_postgres_ctid");
+          break;
+        case catalog::PkSpec::ExternalColumnKey:
+          create_index_info->options["_sdb_view_fast_path_pk"] =
+            duckdb::Value("external_struct_key");
+          break;
         case catalog::PkSpec::DuckDBRowId:
           create_index_info->options["_sdb_view_fast_path_pk"] =
             duckdb::Value("duckdb_rowid");

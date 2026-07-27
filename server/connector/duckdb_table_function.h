@@ -42,6 +42,7 @@
 #include "catalog/scorer_options.h"
 #include "catalog/table.h"
 #include "catalog/view.h"
+#include "connector/view_fast_path.h"
 
 namespace irs {
 
@@ -304,6 +305,7 @@ struct TableScanBindData final : public SereneDBScanBindData {
 
 struct ViewScanBindData final : public SereneDBScanBindData {
   std::shared_ptr<const catalog::PgSqlView> view;
+  std::optional<ViewFastPath> fast_path;
 
   ViewScanBindData() : SereneDBScanBindData(Kind::View) {}
 
