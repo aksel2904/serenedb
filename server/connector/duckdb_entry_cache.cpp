@@ -70,7 +70,7 @@ std::shared_ptr<const catalog::PgSqlView> FindView(
   }
   auto relation =
     snapshot.GetRelation(catalog::NoAccessCheck(), db_id, schema_name, name);
-  if (relation && relation->GetType() == catalog::ObjectType::PgSqlView) {
+  if (relation && relation->GetType() == catalog::ObjectType::View) {
     return std::static_pointer_cast<const catalog::PgSqlView>(relation);
   }
   return nullptr;
@@ -152,6 +152,9 @@ duckdb::unique_ptr<duckdb::CatalogEntry> MakeMacroEntry(
 
 bool ScanTypeAcceptsEntry(duckdb::CatalogType scan, duckdb::CatalogType entry) {
   using enum duckdb::CatalogType;
+  if (scan == TABLE_ENTRY) {
+    return entry == TABLE_ENTRY || entry == VIEW_ENTRY;
+  }
   auto group = [](duckdb::CatalogType t) {
     switch (t) {
       case SCALAR_FUNCTION_ENTRY:
@@ -246,6 +249,7 @@ TableInfoAndIndices BuildTableInfoAndIndices(
     }
     auto cd =
       duckdb::ColumnDefinition(duckdb::Identifier{col.GetName()}, col.type);
+    cd.SetCompressionType(col.compression);
     if (!col.comment.empty()) {
       cd.SetComment(duckdb::Value(col.comment));
     }
@@ -353,7 +357,7 @@ duckdb::unique_ptr<duckdb::CatalogEntry> DuckDBEntryCache::BuildIndexScanEntry(
   if (!relation_obj) {
     return nullptr;
   }
-  if (relation_obj->GetType() == catalog::ObjectType::PgSqlView) {
+  if (relation_obj->GetType() == catalog::ObjectType::View) {
     auto view =
       std::static_pointer_cast<const catalog::PgSqlView>(relation_obj);
     const auto& vinfo = view->GetInfo();
@@ -669,7 +673,7 @@ duckdb::unique_ptr<duckdb::CatalogEntry> DuckDBEntryCache::BuildEntryObject(
                                    snapshot);
           }
           return nullptr;
-        case catalog::ObjectType::PgSqlView:
+        case catalog::ObjectType::View:
           if (type == TABLE_ENTRY || type == VIEW_ENTRY) {
             return MakeViewEntry(
               catalog, entry, schema,
@@ -709,6 +713,9 @@ duckdb::unique_ptr<duckdb::CatalogEntry> DuckDBEntryCache::BuildEntryObject(
           info->constraint_type = is_unique
                                     ? duckdb::IndexConstraintType::UNIQUE
                                     : duckdb::IndexConstraintType::NONE;
+          if (!index.Comment().empty()) {
+            info->comment = duckdb::Value(std::string{index.Comment()});
+          }
           return duckdb::make_uniq<SereneDBIndexEntry>(
             catalog, entry, *info, info->table.GetIdentifierName());
         }
@@ -768,6 +775,9 @@ duckdb::unique_ptr<duckdb::CatalogEntry> DuckDBEntryCache::BuildEntryObject(
       info.max_value = seq->Options().max_value;
       info.cycle = seq->Options().cycle;
       info.usage_count = 0;
+      if (!seq->Comment().empty()) {
+        info.comment = duckdb::Value(std::string{seq->Comment()});
+      }
       return duckdb::make_uniq<duckdb::SequenceCatalogEntry>(catalog, entry,
                                                              info);
     }

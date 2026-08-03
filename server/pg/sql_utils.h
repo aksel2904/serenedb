@@ -45,12 +45,12 @@ constexpr std::string_view ToPgObjectTypeName(catalog::ObjectType t) noexcept {
     using enum catalog::ObjectType;
     case Table:
       return "table";
-    case PgSqlView:
+    case View:
       return "view";
     case SecondaryIndex:
     case InvertedIndex:
       return "index";
-    case PgSqlFunction:
+    case Function:
       return "function";
     case Sequence:
       return "sequence";
@@ -60,8 +60,12 @@ constexpr std::string_view ToPgObjectTypeName(catalog::ObjectType t) noexcept {
       return "database";
     case Tokenizer:
       return "text search dictionary";
-    case PgSqlType:
+    case Type:
       return "type";
+    case ForeignServer:
+      return "foreign server";
+    case UserMapping:
+      return "user mapping";
     default:
       // usually used for error messages, so we want to specify the type.
       SDB_ASSERT(false);
@@ -76,13 +80,13 @@ constexpr catalog::ObjectType FromPgObjectTypeName(
     return Table;
   }
   if (word == "VIEW") {
-    return PgSqlView;
+    return View;
   }
   if (word == "SEQUENCE") {
     return Sequence;
   }
   if (word == "FUNCTION") {
-    return PgSqlFunction;
+    return Function;
   }
   if (word == "DATABASE") {
     return Database;
@@ -91,7 +95,13 @@ constexpr catalog::ObjectType FromPgObjectTypeName(
     return Schema;
   }
   if (word == "TYPE") {
-    return PgSqlType;
+    return Type;
+  }
+  if (word == "FOREIGN SERVER") {
+    return ForeignServer;
+  }
+  if (word == "USER MAPPING") {
+    return UserMapping;
   }
   return Invalid;
 }

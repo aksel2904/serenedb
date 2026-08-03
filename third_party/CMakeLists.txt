@@ -15,32 +15,55 @@ sdb_update_module(${GIT_EXECUTABLE} "sqllogictest-rs" ${CMAKE_SOURCE_DIR}/third_
 ## JEMALLOC
 ################################################################################
 if("${SDB_ALLOC}" MATCHES "JE")
-    # TODO(mbkkt) make it submodule
-    add_subdirectory(jemalloc)
-    file(MAKE_DIRECTORY "${JEMALLOC_HOME}/include")
+    # jemalloc source is the third_party/jemalloc submodule; jemalloc-cmake
+    # compiles it natively (no autotools) into the `jemalloc_native` target.
+    add_subdirectory(jemalloc-cmake)
+    # Expose it as an IMPORTED target: it is linked globally, so it ends up in
+    # the link interface of vendored libs that export() their targets (croaring),
+    # and export() tolerates IMPORTED but not in-tree targets.
     add_library(jemalloc STATIC IMPORTED GLOBAL)
     set_target_properties(
         jemalloc
         PROPERTIES
-            IMPORTED_LOCATION "${JEMALLOC_HOME}/lib/libjemalloc.a"
-            INTERFACE_INCLUDE_DIRECTORIES "${JEMALLOC_HOME}/include"
+            IMPORTED_LOCATION
+                "${CMAKE_CURRENT_BINARY_DIR}/jemalloc-cmake/libjemalloc_native.a"
+            INTERFACE_INCLUDE_DIRECTORIES
+                "${CMAKE_CURRENT_SOURCE_DIR}/jemalloc-cmake/include"
     )
-    add_dependencies(jemalloc jemalloc_build)
+    add_dependencies(jemalloc jemalloc_native)
     link_libraries(jemalloc)
     set(FOLLY_USE_JEMALLOC ON)
 else()
     set(FOLLY_USE_JEMALLOC OFF)
 endif()
 
-################################################################################
-## geographiclib-c
+###############################################################################
+## simdutf (SIMD UTF-8 validation + base64)
 ################################################################################
 
-# TODO(mbkkt) make it submodule
-add_subdirectory(geographiclib-c)
-if(USE_DTRACE)
-    set(SDT_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/sdt PARENT_SCOPE)
-endif()
+set(SIMDUTF_TESTS OFF CACHE BOOL "" FORCE)
+set(SIMDUTF_TOOLS OFF CACHE BOOL "" FORCE)
+set(SIMDUTF_ICONV OFF CACHE BOOL "" FORCE)
+set(SIMDUTF_CXX_STANDARD ${CMAKE_CXX_STANDARD} CACHE STRING "" FORCE)
+sdb_update_module(${GIT_EXECUTABLE} "simdutf" ${CMAKE_CURRENT_SOURCE_DIR} "README.md")
+add_subdirectory(simdutf)
+
+################################################################################
+## fast_float
+################################################################################
+
+set(FASTFLOAT_INSTALL OFF CACHE BOOL "" FORCE)
+sdb_update_module(${GIT_EXECUTABLE} "fast_float" ${CMAKE_CURRENT_SOURCE_DIR} "README.md")
+add_subdirectory(fast_float)
+
+###############################################################################
+## simdjson
+################################################################################
+
+set(SIMDJSON_ENABLE_THREADS OFF CACHE BOOL "" FORCE)
+set(SIMDJSON_CXX_STANDARD ${CMAKE_CXX_STANDARD} CACHE STRING "" FORCE)
+sdb_update_module(${GIT_EXECUTABLE} "simdjson" ${CMAKE_CURRENT_SOURCE_DIR} "README.md")
+add_subdirectory(simdjson)
 
 ################################################################################
 ## YACLib
@@ -121,12 +144,13 @@ set(WITH_RUNTIME_CPU_DETECTION ON CACHE BOOL "" FORCE)
 set(WITH_INFLATE_STRICT OFF CACHE BOOL "" FORCE)
 set(WITH_INFLATE_ALLOW_INVALID_DIST OFF CACHE BOOL "" FORCE)
 set(SKIP_INSTALL_ALL ON CACHE BOOL "" FORCE)
+set(WITH_SANITIZER "OFF" CACHE STRING "" FORCE)
 
 sdb_update_module(${GIT_EXECUTABLE} "zlib-ng" ${CMAKE_CURRENT_SOURCE_DIR} "README.md")
 add_subdirectory(zlib-ng)
 
 # Create ZLIB::ZLIB alias for velox compatibility
-add_library(ZLIB::ZLIB ALIAS zlib)
+add_library(ZLIB::ZLIB ALIAS zlib-ng)
 
 ################################################################################
 ## MINIZIP-NG
@@ -145,11 +169,12 @@ set(MZ_WZAES OFF CACHE BOOL "" FORCE)
 set(MZ_OPENSSL OFF CACHE BOOL "" FORCE)
 set(MZ_LIBBSD OFF CACHE BOOL "" FORCE)
 set(MZ_ICONV OFF CACHE BOOL "" FORCE)
+set(MZ_SANITIZER "OFF" CACHE STRING "" FORCE)
 
 sdb_update_module(${GIT_EXECUTABLE} "minizip-ng" ${CMAKE_CURRENT_SOURCE_DIR} "README.md")
 add_subdirectory(minizip-ng)
 
-target_link_libraries(minizip PUBLIC zlib)
+target_link_libraries(minizip PUBLIC zlib-ng)
 
 ################################################################################
 ## BOOST
@@ -200,6 +225,7 @@ sdb_update_module(${GIT_EXECUTABLE} "abseil-cpp" ${CMAKE_CURRENT_SOURCE_DIR} "RE
 set(ABSL_PROPAGATE_CXX_STD OFF CACHE BOOL "" FORCE)
 set(ABSL_USE_SYSTEM_INCLUDES ON CACHE BOOL "" FORCE)
 add_subdirectory(abseil-cpp)
+target_link_libraries(absl_strings PUBLIC simdutf)
 
 ################################################################################
 ### re2 library
@@ -343,6 +369,31 @@ target_compile_definitions(
 add_subdirectory(fastText)
 
 ################################################################################
+### BLAS
+################################################################################
+add_library(sdb_blas INTERFACE)
+add_library(sdb::blas ALIAS sdb_blas)
+
+sdb_update_module(${GIT_EXECUTABLE} "OpenBLAS" ${CMAKE_CURRENT_SOURCE_DIR} "README.md")
+set(USE_THREAD 0 CACHE BOOL "" FORCE)
+set(USE_OPENMP 0 CACHE BOOL "" FORCE)
+set(USE_LOCKING 1 CACHE BOOL "" FORCE)
+set(NO_WARMUP 1 CACHE BOOL "" FORCE)
+set(NO_AFFINITY 1 CACHE BOOL "" FORCE)
+set(NO_LAPACK 1 CACHE BOOL "" FORCE)
+set(BUILD_SINGLE 1 CACHE BOOL "" FORCE) # only sgemm_ is ever called; drops DOUBLE/COMPLEX/COMPLEX16
+set(NO_CBLAS 1 CACHE BOOL "" FORCE) # only the Fortran-ABI sgemm_ is called, never cblas_sgemm
+set(CMAKE_Fortran_COMPILER NOTFOUND CACHE FILEPATH "" FORCE)
+set(DYNAMIC_ARCH OFF CACHE BOOL "" FORCE)
+if(ARCH_AARCH64)
+    set(TARGET ARMV8 CACHE STRING "" FORCE)
+elseif(ARCH_AMD64)
+    set(TARGET HASWELL CACHE STRING "" FORCE)
+endif()
+add_subdirectory(OpenBLAS)
+target_link_libraries(sdb_blas INTERFACE openblas)
+
+################################################################################
 ### faiss library
 ################################################################################
 set(FAISS_LIB "")
@@ -351,15 +402,23 @@ if(ARCH_AMD64)
     set(FAISS_OPT_LEVEL "avx2")
     set(FAISS_LIB faiss_avx2)
 elseif(ARCH_AARCH64)
-    # TODO(mbkkt) is it ok?
-    set(FAISS_OPT_LEVEL "sve")
-    set(FAISS_LIB faiss_sve)
+    set(FAISS_OPT_LEVEL "generic")
+    set(FAISS_LIB faiss)
 endif()
+set(FAISS_LIB "${FAISS_LIB}" CACHE INTERNAL "faiss target to link" FORCE)
 
 sdb_update_module(${GIT_EXECUTABLE} "faiss" ${CMAKE_CURRENT_SOURCE_DIR} "README.md")
 set(FAISS_ENABLE_GPU OFF CACHE BOOL "" FORCE)
 set(FAISS_ENABLE_PYTHON OFF CACHE BOOL "" FORCE)
+set(FAISS_ENABLE_EXTRAS OFF CACHE BOOL "" FORCE)
 add_subdirectory(faiss)
+target_compile_options(
+    ${FAISS_LIB}
+    PUBLIC
+        -Wno-suggest-override
+        -Wno-sign-compare
+        -Wno-suggest-destructor-override
+)
 
 ################################################################################
 ## snowball stemmer
@@ -390,9 +449,6 @@ add_subdirectory(lz4/build/cmake)
 
 get_target_property(LZ4_INCLUDE_DIR lz4_static INTERFACE_INCLUDE_DIRECTORIES)
 
-# Create lz4::lz4 alias for velox compatibility
-add_library(lz4::lz4 ALIAS lz4_static)
-
 ################################################################################
 ## ZSTD
 ################################################################################
@@ -406,7 +462,6 @@ set(ZSTD_INSTALL OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(zstd/build/cmake)
 
-# Create zstd::zstd alias for velox compatibility
 add_library(zstd::zstd ALIAS libzstd_static)
 
 ################################################################################
@@ -419,6 +474,17 @@ set(SNAPPY_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
 set(SNAPPY_INSTALL OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(snappy)
+
+################################################################################
+## BROTLI
+################################################################################
+
+sdb_update_module(${GIT_EXECUTABLE} "brotli" ${CMAKE_CURRENT_SOURCE_DIR} "README.md")
+set(BROTLI_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
+set(BROTLI_DISABLE_TESTS ON CACHE BOOL "" FORCE)
+set(BROTLI_BUNDLED_MODE ON CACHE BOOL "" FORCE)
+
+add_subdirectory(brotli)
 
 ################################################################################
 ## Google S2
@@ -510,16 +576,39 @@ set(CURL_LIBRARIES CURL::libcurl CACHE INTERNAL "")
 set(CURL_LIBRARY CURL::libcurl CACHE INTERNAL "")
 
 ################################################################################
-## IMMER
+## clickhouse-cpp (submodule; compiled into our own static lib; do NOT
+## add_subdirectory its CMakeLists -- that bundles contrib/{absl,lz4,zstd}
+## and collides with ours)
 ################################################################################
 
-sdb_update_module(${GIT_EXECUTABLE} "immer" ${CMAKE_CURRENT_SOURCE_DIR} "README.rst")
+file(
+    GLOB_RECURSE CLICKHOUSE_CPP_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/clickhouse-cpp/clickhouse/*.cpp"
+)
+list(
+    APPEND CLICKHOUSE_CPP_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/clickhouse-cpp/contrib/cityhash/cityhash/city.cc"
+)
 
-set(immer_BUILD_EXAMPLES OFF CACHE BOOL "don't build examples")
-set(immer_BUILD_EXTRAS OFF CACHE BOOL "don't build extras")
-set(immer_BUILD_TESTS OFF CACHE BOOL "don't build tests")
-set(immer_BUILD_DOCS OFF CACHE BOOL "don't docs")
-add_subdirectory(immer)
+add_library(clickhouse_cpp STATIC ${CLICKHOUSE_CPP_SOURCES})
+
+target_include_directories(
+    clickhouse_cpp
+    SYSTEM
+    PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/clickhouse-cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/clickhouse-cpp/contrib/cityhash/cityhash"
+)
+
+target_compile_definitions(
+    clickhouse_cpp
+    PUBLIC WITH_OPENSSL=1 CH_MAP_BOOL_TO_UINT8=1
+)
+
+target_link_libraries(
+    clickhouse_cpp
+    PUBLIC lz4_static zstd::zstd absl::int128 OpenSSL::SSL OpenSSL::Crypto
+)
 
 ################################################################################
 ## LINK_DIRECTORIES
@@ -528,36 +617,13 @@ add_subdirectory(immer)
 set(LINK_DIRECTORIES "${LINK_DIRECTORIES}" PARENT_SCOPE)
 
 ###############################################################################
-## simdjson
-################################################################################
-
-set(SIMDJSON_ENABLE_THREADS OFF CACHE BOOL "" FORCE)
-set(SIMDJSON_CXX_STANDARD ${CMAKE_CXX_STANDARD} CACHE STRING "" FORCE)
-sdb_update_module(${GIT_EXECUTABLE} "simdjson" ${CMAKE_CURRENT_SOURCE_DIR} "README.md")
-add_subdirectory(simdjson)
-
-###############################################################################
-## simdutf (SIMD UTF-8 validation + base64)
-################################################################################
-
-set(SIMDUTF_TESTS OFF CACHE BOOL "" FORCE)
-set(SIMDUTF_BENCHMARKS OFF CACHE BOOL "" FORCE)
-set(SIMDUTF_TOOLS OFF CACHE BOOL "" FORCE)
-set(SIMDUTF_ICONV OFF CACHE BOOL "" FORCE)
-set(SIMDUTF_FUZZERS OFF CACHE BOOL "" FORCE)
-sdb_update_module(${GIT_EXECUTABLE} "simdutf" ${CMAKE_CURRENT_SOURCE_DIR} "README.md")
-add_subdirectory(simdutf)
-
-###############################################################################
 ## ada (WHATWG URL parsing) -- comes after simdutf (ADA_USE_SIMDUTF can use it)
 ################################################################################
 
 set(ADA_TESTING OFF CACHE BOOL "" FORCE)
 set(ADA_BENCHMARKS OFF CACHE BOOL "" FORCE)
 set(ADA_TOOLS OFF CACHE BOOL "" FORCE)
-#[[ ADA_USE_SIMDUTF stays OFF for now: enabling it couples ada's CMake to the
-    simdutf target and only accelerates IDNA (a missed optimization, not a bug). ]]
-set(ADA_USE_SIMDUTF OFF CACHE BOOL "" FORCE)
+set(ADA_USE_SIMDUTF ON CACHE BOOL "" FORCE)
 sdb_update_module(${GIT_EXECUTABLE} "ada" ${CMAKE_CURRENT_SOURCE_DIR} "README.md")
 add_subdirectory(ada)
 
@@ -569,20 +635,6 @@ set(ENABLE_ROARING_TESTS OFF CACHE BOOL "" FORCE)
 set(ROARING_USE_CPM OFF CACHE BOOL "" FORCE)
 sdb_update_module(${GIT_EXECUTABLE} "croaring" ${CMAKE_CURRENT_SOURCE_DIR} "README.md")
 add_subdirectory(croaring)
-
-################################################################################
-### tests only library
-################################################################################
-
-add_subdirectory(tests)
-
-################################################################################
-## fast_float
-################################################################################
-
-set(FASTFLOAT_INSTALL OFF CACHE BOOL "" FORCE)
-sdb_update_module(${GIT_EXECUTABLE} "fast_float" ${CMAKE_CURRENT_SOURCE_DIR} "README.md")
-add_subdirectory(fast_float)
 
 ################################################################################
 ## fmt
@@ -666,11 +718,20 @@ set(ENABLE_UBSAN FALSE CACHE BOOL "" FORCE)
 set(ENABLE_THREAD_SANITIZER FALSE CACHE BOOL "" FORCE)
 set(EXPORT_DLL_SYMBOLS FALSE CACHE BOOL "" FORCE)
 set(DUCKDB_SKIP_INSTALL TRUE CACHE BOOL "" FORCE)
-set(LATEST_STORAGE TRUE CACHE BOOL "" FORCE)
+set(LATEST_STORAGE FALSE CACHE BOOL "" FORCE)
 # Suppress the per-extension "vcpkg.json present but VCPKG_BUILD not set" warning.
 set(VCPKG_BUILD ON CACHE BOOL "" FORCE)
 set(BUILD_EXTENSIONS
     "core_functions;parquet;tpch;tpcds;json;httpfs;avro;iceberg;postgres_scanner;autocomplete;icu;inet"
+    CACHE STRING
+    ""
+    FORCE
+)
+# Extensions whose build config lives NEXT TO the extension instead of as a
+# shim inside the duckdb fork (.github/config/extensions/): duckdb includes
+# these files after the BUILD_EXTENSIONS list is resolved.
+set(DUCKDB_EXTENSION_CONFIGS
+    "${CMAKE_CURRENT_SOURCE_DIR}/duckdb_clickhouse/extension_config.cmake"
     CACHE STRING
     ""
     FORCE
@@ -683,6 +744,11 @@ sdb_update_module(${GIT_EXECUTABLE} "duckdb_iceberg" ${CMAKE_CURRENT_SOURCE_DIR}
 sdb_update_module(${GIT_EXECUTABLE} "duckdb_postgres" ${CMAKE_CURRENT_SOURCE_DIR} "README.md")
 sdb_update_module(${GIT_EXECUTABLE} "duckdb_inet" ${CMAKE_CURRENT_SOURCE_DIR} "README.md")
 sdb_update_module(${GIT_EXECUTABLE} "database-connector" ${CMAKE_CURRENT_SOURCE_DIR} "README.md")
+
+# duckdb's in-tree extensions resolve their includes from directory scope (not from duckdb_static's
+# INTERFACE), so expose simdutf's header to the whole duckdb subtree here. The duckdb_static PUBLIC link
+# to simdutf (added below) is what pulls the compiled simdutf object code into the final binary.
+include_directories(SYSTEM ${CMAKE_CURRENT_SOURCE_DIR}/simdutf/include)
 
 add_subdirectory(duckdb)
 
@@ -711,9 +777,14 @@ target_link_libraries(
         avro_extension
         iceberg_extension
         postgres_scanner_extension
+        clickhouse_scanner_extension
         autocomplete_extension
         icu_extension
         inet_extension
+        # SIMD string-encoding routines (base64 + UTF-8/UTF-16/Latin-1). This
+        # one PUBLIC edge propagates the simdutf include to duckdb core and to
+        # every static extension (they each link duckdb_static).
+        simdutf
 )
 
 # !!! KEEP THIS LAST !!!

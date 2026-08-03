@@ -39,7 +39,6 @@ add_library(
     basics/zstd_context.cpp
 )
 
-set(FUNCTION2_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/third_party/function2")
 set(MAGIC_ENUM_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/third_party/magic_enum")
 
 target_include_directories(
@@ -47,7 +46,6 @@ target_include_directories(
     PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_BINARY_DIR} # auto-generated headers, like "basics/build.h"
-        ${FUNCTION2_INCLUDE_DIR}
         ${MAGIC_ENUM_INCLUDE_DIR}
 )
 
@@ -71,14 +69,13 @@ target_link_libraries(
         absl::status
         absl::statusor
         absl::strings
-        faiss
+        ${FAISS_LIB}
         fmt::fmt
         yaclib
         zlib
         icu
         lz4_static
         zstd::zstd # basics/zstd_context.cpp (reusable zstd contexts)
-        serene_build_id
         # The SDB_* logger hot path forwards directly to duckdb::Logger
         # virtuals; we need duckdb's headers (and the Logger vtable) at
         # link time. Pulled in PUBLICly so any target that uses
@@ -138,4 +135,3 @@ target_include_directories(serene SYSTEM PUBLIC ${OPENSSL_INCLUDE_DIR})
 add_dependencies(serene exitcodefiles)
 
 add_subdirectory(geo)
-add_subdirectory(build_id)

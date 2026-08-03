@@ -43,13 +43,12 @@
 
 #include "basics/assert.h"
 #include "iresearch/formats/column/col_writer.hpp"
-#include "iresearch/formats/column/internal/overflow_string_io.hpp"
 #include "pg/sql_exception_macro.h"
 
 namespace irs {
 namespace {
 
-constexpr auto kStorageVersion = duckdb::StorageVersion::V2_0_0;
+constexpr auto kStorageVersion = duckdb::StorageVersion::SERENEDB_V1;
 
 void CaptureSegment(duckdb::ColumnSegment& segment, duckdb::idx_t segment_size,
                     const uint8_t* bytes, IndexOutput& out,
@@ -61,6 +60,18 @@ void CaptureSegment(duckdb::ColumnSegment& segment, duckdb::idx_t segment_size,
   ColumnBlockMeta m{segment.GetStats().Copy()};
   m.tuple_count = tuple_count;
   m.codec = &segment.GetCompressionFunction();
+  if (m.statistics.IsConstant()) {
+    auto& cfg = duckdb::DBConfig::GetConfig(segment.GetDatabase());
+    if (auto fn = cfg.TryGetCompressionFunction(
+          duckdb::CompressionType::COMPRESSION_CONSTANT,
+          segment.GetType().InternalType())) {
+      m.codec = fn.get();
+      m.file_offset = 0;
+      m.byte_size = 0;
+      sink.push_back(std::move(m));
+      return;
+    }
+  }
   if (!bytes || segment_size == 0) {
     m.file_offset = 0;
     m.byte_size = 0;
@@ -204,12 +215,11 @@ void ColumnWriter::Compress(const duckdb::CompressionFunction& picked,
   auto& out = Out();
   auto& bm = db.GetBufferManager();
 
-  duckdb::ColumnDataCheckpointData::OverflowStringWriterFactory
-    overflow_factory;
+  duckdb::optional_ptr<duckdb::OverflowStringWriter> overflow_writer;
+  duckdb::optional_ptr<duckdb::ColumnStreamWriter> stream_writer;
   if (codec_type.InternalType() == duckdb::PhysicalType::VARCHAR) {
-    overflow_factory = [&out]() {
-      return duckdb::make_uniq<IndexOutputOverflowWriter>(out);
-    };
+    overflow_writer = &ctx;
+    stream_writer = &ctx;
   }
 
   auto capture = [&](duckdb::ColumnSegment& seg, duckdb::idx_t size,
@@ -242,7 +252,8 @@ void ColumnWriter::Compress(const duckdb::CompressionFunction& picked,
     codec_type,
     db,
     kStorageVersion,
-    std::move(overflow_factory),
+    overflow_writer,
+    stream_writer,
     std::move(flush_fn),
     std::move(flush_internal_fn),
     ctx,
@@ -386,10 +397,9 @@ void ColumnWriter::SealList(const duckdb::LogicalType& type,
   meta.write_list_running = running;
 
   duckdb::unique_ptr<duckdb::AnalyzeState> state;
-  auto fn = PickCodec(duckdb::LogicalType::UBIGINT, offset_chunks,
+  auto fn = PickCodec(type, offset_chunks,
                       duckdb::CompressionType::COMPRESSION_AUTO, state);
-  Compress(*fn, std::move(state), duckdb::LogicalType::UBIGINT, offset_chunks,
-           meta.data);
+  Compress(*fn, std::move(state), type, offset_chunks, meta.data);
 
   SealColumn(duckdb::ListType::GetChildType(type), elem_chunks, total_elems,
              /*skip_validity=*/false, forced, meta.children[0]);
@@ -483,7 +493,8 @@ void ColumnWriter::SealColumn(const duckdb::LogicalType& type,
     SealVariant(type, chunks, row_count, skip_validity, forced, meta);
     return;
   }
-  if (type.id() == duckdb::LogicalTypeId::STRUCT) {
+  if (type.id() == duckdb::LogicalTypeId::STRUCT ||
+      type.id() == duckdb::LogicalTypeId::UNION) {
     SealStruct(type, chunks, row_count, skip_validity, forced, meta);
     return;
   }

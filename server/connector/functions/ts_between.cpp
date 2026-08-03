@@ -100,7 +100,7 @@ void FromHalfRange(irs::BooleanFilter& parent, const FilterContext& ctx,
 
   const auto col_type = column_info.logical_type.id();
   const auto val_type = bound_val->type().id();
-  auto type_mismatch = [&]() {
+  auto type_mismatch = [&] {
     THROW_SQL_ERROR(
       ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
       ERR_MSG(label, " bound type ", bound_val->type().ToString(),
@@ -153,11 +153,10 @@ void FromHalfRange(irs::BooleanFilter& parent, const FilterContext& ctx,
     if (!analyzer.next()) {
       // Zero tokens (e.g. all-stopword input) -> the comparison can't
       // match anything in the term dictionary.
-      AddFilter<irs::Empty>(parent);
+      AddMaybeNegated<irs::Empty>(parent, ctx, column_info);
       return;
     }
-    auto& range = ctx.negated ? Negate<irs::ByRange>(parent)
-                              : AddFilter<irs::ByRange>(parent);
+    auto& range = AddMaybeNegated<irs::ByRange>(parent, ctx, column_info);
     *range.mutable_field_id() = PickPerKindFieldId(column_info, col_type);
     range.boost(ctx.boost);
     auto* options = range.mutable_options();
@@ -182,8 +181,7 @@ void FromHalfRange(irs::BooleanFilter& parent, const FilterContext& ctx,
   }
 
   if (col_type == duckdb::LogicalTypeId::BOOLEAN) {
-    auto& range = ctx.negated ? Negate<irs::ByRange>(parent)
-                              : AddFilter<irs::ByRange>(parent);
+    auto& range = AddMaybeNegated<irs::ByRange>(parent, ctx, column_info);
     *range.mutable_field_id() = PickPerKindFieldId(column_info, col_type);
     range.boost(ctx.boost);
     auto* options = range.mutable_options();
@@ -201,8 +199,7 @@ void FromHalfRange(irs::BooleanFilter& parent, const FilterContext& ctx,
     return;
   }
 
-  auto& range = ctx.negated ? Negate<irs::ByGranularRange>(parent)
-                            : AddFilter<irs::ByGranularRange>(parent);
+  auto& range = AddMaybeNegated<irs::ByGranularRange>(parent, ctx, column_info);
   *range.mutable_field_id() = PickPerKindFieldId(column_info, col_type);
   range.boost(ctx.boost);
   auto* options = range.mutable_options();
@@ -241,7 +238,7 @@ void FromBetween(irs::BooleanFilter& parent, const FilterContext& ctx,
   const auto val_type = val_sample->type().id();
 
   // Validate value type matches column type family.
-  auto type_mismatch = [&]() {
+  auto type_mismatch = [&] {
     THROW_SQL_ERROR(
       ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
       ERR_MSG("ts_between bound type ", val_sample->type().ToString(),
@@ -285,16 +282,14 @@ void FromBetween(irs::BooleanFilter& parent, const FilterContext& ctx,
 
   if (col_type == duckdb::LogicalTypeId::VARCHAR ||
       col_type == duckdb::LogicalTypeId::BLOB) {
-    auto& range = ctx.negated ? Negate<irs::ByRange>(parent)
-                              : AddFilter<irs::ByRange>(parent);
+    auto& range = AddMaybeNegated<irs::ByRange>(parent, ctx, column_info);
     *range.mutable_field_id() = PickPerKindFieldId(column_info, col_type);
     range.boost(ctx.boost);
     auto* options = range.mutable_options();
     options->scored_terms_limit = ctx.scored_terms_limit;
     FillByRangeOptionsVarchar(args, *options);
   } else if (col_type == duckdb::LogicalTypeId::BOOLEAN) {
-    auto& range = ctx.negated ? Negate<irs::ByRange>(parent)
-                              : AddFilter<irs::ByRange>(parent);
+    auto& range = AddMaybeNegated<irs::ByRange>(parent, ctx, column_info);
     *range.mutable_field_id() = PickPerKindFieldId(column_info, col_type);
     range.boost(ctx.boost);
     auto* options = range.mutable_options();
@@ -315,8 +310,8 @@ void FromBetween(irs::BooleanFilter& parent, const FilterContext& ctx,
   } else {
     // Numeric. Cast each bound to the column's logical type before
     // tokenising so the indexed and queried representations match.
-    auto& range = ctx.negated ? Negate<irs::ByGranularRange>(parent)
-                              : AddFilter<irs::ByGranularRange>(parent);
+    auto& range =
+      AddMaybeNegated<irs::ByGranularRange>(parent, ctx, column_info);
     *range.mutable_field_id() = PickPerKindFieldId(column_info, col_type);
     range.boost(ctx.boost);
     auto* range_opts = range.mutable_options();

@@ -28,6 +28,7 @@
 #include <duckdb/main/database.hpp>
 #include <duckdb/planner/binder.hpp>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "basics/containers/flat_hash_map.h"
@@ -35,6 +36,7 @@
 #include "basics/down_cast.h"
 #include "basics/static_strings.h"
 #include "catalog/catalog.h"
+#include "catalog/foreign_server.h"
 #include "catalog/object.h"
 #include "catalog/store/store.h"
 #include "catalog/table.h"
@@ -54,30 +56,18 @@ bool Has(duckdb::AccessVerb verb, duckdb::AccessVerb bit) {
   return (static_cast<uint8_t>(verb) & static_cast<uint8_t>(bit)) != 0;
 }
 
-catalog::AclMode AclModeOf(duckdb::AccessVerb bit) {
-  switch (bit) {
-    case duckdb::AccessVerb::INSERT:
-      return catalog::AclMode::Insert;
-    case duckdb::AccessVerb::SELECT:
-      return catalog::AclMode::Select;
-    case duckdb::AccessVerb::UPDATE:
-      return catalog::AclMode::Update;
-    case duckdb::AccessVerb::DELETE:
-      return catalog::AclMode::Delete;
-    case duckdb::AccessVerb::TRUNCATE:
-      return catalog::AclMode::Truncate;
-    default:
-      return catalog::AclMode::NoRights;
-  }
-}
-
 catalog::AclMode AsAclMode(duckdb::AccessVerb verb) {
+  static constexpr std::pair<duckdb::AccessVerb, catalog::AclMode> kVerbAcl[]{
+    {duckdb::AccessVerb::INSERT, catalog::AclMode::Insert},
+    {duckdb::AccessVerb::SELECT, catalog::AclMode::Select},
+    {duckdb::AccessVerb::UPDATE, catalog::AclMode::Update},
+    {duckdb::AccessVerb::DELETE, catalog::AclMode::Delete},
+    {duckdb::AccessVerb::TRUNCATE, catalog::AclMode::Truncate},
+  };
   catalog::AclMode mode = catalog::AclMode::NoRights;
-  for (auto bit : {duckdb::AccessVerb::INSERT, duckdb::AccessVerb::SELECT,
-                   duckdb::AccessVerb::UPDATE, duckdb::AccessVerb::DELETE,
-                   duckdb::AccessVerb::TRUNCATE}) {
+  for (const auto& [bit, acl] : kVerbAcl) {
     if (Has(verb, bit)) {
-      mode |= AclModeOf(bit);
+      mode |= acl;
     }
   }
   return mode;
@@ -137,6 +127,113 @@ ObjectId EffectiveRole(ObjectId caller, const duckdb::CatalogEntry* who) {
   return caller;
 }
 
+using AccessRequirements = duckdb::vector<duckdb::AccessRequirement>;
+
+// A foreign catalog is attached under its foreign server's name, so relations
+// behind it need ownership or USAGE on that server. Local catalogs are rejected
+// by IS_REMOTE before any lookup; a remote one with no server object is a raw
+// ATTACH and ungoverned. The resolve is instance-wide on purpose -- the
+// attachment is too, so a session in another database must not slip past -- and
+// it walks every database, hence the dedup per alias.
+void RequireForeignServerUsage(const catalog::Snapshot& snapshot,
+                               ObjectId caller,
+                               const AccessRequirements& reqs) {
+  containers::FlatHashSet<std::string_view> checked;
+  for (const auto& req : reqs) {
+    if (!req.table) {
+      continue;
+    }
+    const auto& parent = req.table->ParentCatalog();
+    if (!parent.Supports(duckdb::RemoteCapability::IS_REMOTE)) {
+      continue;
+    }
+    const std::string_view catalog = parent.GetName().GetIdentifierName();
+    if (!checked.insert(catalog).second) {
+      continue;
+    }
+    const auto server = snapshot.GetForeignServer(catalog);
+    if (!server) {
+      continue;
+    }
+    const auto& closure = snapshot.ClosureFor(caller);
+    if (!closure.Owns(*server) &&
+        !closure.Can(*server, catalog::AclMode::Usage)) {
+      THROW_SQL_ERROR(
+        ERR_CODE(ERRCODE_INSUFFICIENT_PRIVILEGE),
+        ERR_MSG("permission denied for foreign server ", server->GetName()));
+    }
+  }
+}
+
+// The store-side name of a table facade, composed exactly as the store composes
+// it. Never the reverse: a store name is not split back into its parts.
+std::string StoreNameOf(const duckdb::CatalogEntry& facade) {
+  return catalog::StoreTableName(
+    facade.ParentCatalog().GetName().GetIdentifierName(),
+    facade.ParentSchema().name.GetIdentifierName(),
+    facade.name.GetIdentifierName());
+}
+
+// The catalog object each requirement grants against, indexed like `reqs`.
+//
+// A DML plan scans the store-side table, whose entry is a plain DuckTableEntry
+// that SereneDBRelation cannot resolve -- so it lands here with no object and
+// its privileges would go unchecked. Every such orphan is matched to the table
+// facade bound alongside it, whose store name it carries verbatim.
+std::vector<const catalog::Object*> CollectRelations(
+  const AccessRequirements& reqs) {
+  std::vector<const catalog::Object*> objects(reqs.size(), nullptr);
+  std::vector<size_t> facades;
+  std::vector<size_t> orphans;
+  for (size_t i = 0; i < reqs.size(); ++i) {
+    const auto* entry = reqs[i].table;
+    if (!entry) {
+      continue;
+    }
+    objects[i] = SereneDBRelation(entry);
+    if (!objects[i]) {
+      if (IsStoreEntry(*entry)) {
+        orphans.push_back(i);
+      }
+    } else if (dynamic_cast<const connector::SereneDBTableEntry*>(entry)) {
+      facades.push_back(i);
+    }
+  }
+  // Statements that touch no store table -- everything but DML -- stop here,
+  // having composed no names.
+  if (orphans.empty()) {
+    return objects;
+  }
+  containers::FlatHashMap<std::string, const catalog::Object*> by_store_name;
+  by_store_name.reserve(facades.size());
+  for (const size_t i : facades) {
+    by_store_name.emplace(StoreNameOf(*reqs[i].table), objects[i]);
+  }
+  for (const size_t i : orphans) {
+    const auto it = by_store_name.find(reqs[i].table->name.GetIdentifierName());
+    if (it != by_store_name.end()) {
+      objects[i] = it->second;
+    }
+  }
+  return objects;
+}
+
+containers::FlatHashSet<uint64_t> CollectWriteTargets(
+  const AccessRequirements& reqs,
+  const std::vector<const catalog::Object*>& objects) {
+  containers::FlatHashSet<uint64_t> targets;
+  for (size_t i = 0; i < reqs.size(); ++i) {
+    const catalog::Object* obj = objects[i];
+    if (obj && obj->GetType() == catalog::ObjectType::Table &&
+        Has(reqs[i].verb,
+            duckdb::AccessVerb::INSERT | duckdb::AccessVerb::UPDATE |
+              duckdb::AccessVerb::DELETE | duckdb::AccessVerb::TRUNCATE)) {
+      targets.insert(obj->GetId().id());
+    }
+  }
+  return targets;
+}
+
 void CollectAndEnforce(duckdb::ClientContext& context, duckdb::Binder& binder) {
   auto state = context.registered_state->Get<connector::SereneDBClientState>(
     connector::kSereneDBClientStateKey);
@@ -150,54 +247,10 @@ void CollectAndEnforce(duckdb::ClientContext& context, duckdb::Binder& binder) {
   const auto& properties = binder.GetStatementProperties();
   const auto& reqs = properties.access_requirements;
 
-  std::vector<const catalog::Object*> objects;
-  objects.reserve(reqs.size());
-  bool store_orphans = false;
-  for (const auto& req : reqs) {
-    const catalog::Object* obj =
-      req.table ? SereneDBRelation(req.table) : nullptr;
-    objects.push_back(obj);
-    store_orphans |= !obj && req.table && IsStoreEntry(*req.table);
-  }
+  RequireForeignServerUsage(*snapshot, caller, reqs);
 
-  // DML records the plan's scan table -- the store-side entry, not the user
-  // facade. Map store entries back through the facades bound alongside them
-  // (forward-composed store name; never parsed).
-  if (store_orphans) {
-    containers::FlatHashMap<std::string, const catalog::Object*> facades;
-    for (size_t i = 0; i < reqs.size(); ++i) {
-      const auto* entry = reqs[i].table;
-      if (!objects[i] || !entry ||
-          !dynamic_cast<const connector::SereneDBTableEntry*>(entry)) {
-        continue;
-      }
-      facades.emplace(catalog::StoreTableName(
-                        entry->ParentCatalog().GetName().GetIdentifierName(),
-                        entry->ParentSchema().name.GetIdentifierName(),
-                        entry->name.GetIdentifierName()),
-                      objects[i]);
-    }
-    for (size_t i = 0; i < reqs.size(); ++i) {
-      if (objects[i] || !reqs[i].table || !IsStoreEntry(*reqs[i].table)) {
-        continue;
-      }
-      const auto it = facades.find(reqs[i].table->name.GetIdentifierName());
-      if (it != facades.end()) {
-        objects[i] = it->second;
-      }
-    }
-  }
-
-  containers::FlatHashSet<uint64_t> write_targets;
-  for (size_t i = 0; i < reqs.size(); ++i) {
-    const catalog::Object* obj = objects[i];
-    if (obj && obj->GetType() == catalog::ObjectType::Table &&
-        Has(reqs[i].verb,
-            duckdb::AccessVerb::INSERT | duckdb::AccessVerb::UPDATE |
-              duckdb::AccessVerb::DELETE | duckdb::AccessVerb::TRUNCATE)) {
-      write_targets.insert(obj->GetId().id());
-    }
-  }
+  const auto objects = CollectRelations(reqs);
+  const auto write_targets = CollectWriteTargets(reqs, objects);
 
   for (size_t i = 0; i < reqs.size(); ++i) {
     const auto& req = reqs[i];
@@ -223,7 +276,7 @@ void CollectAndEnforce(duckdb::ClientContext& context, duckdb::Binder& binder) {
       continue;
     }
 
-    if (obj->GetType() == catalog::ObjectType::PgSqlView) {
+    if (obj->GetType() == catalog::ObjectType::View) {
       if (!closure.Can(*obj, catalog::AclMode::Select)) {
         THROW_SQL_ERROR(ERR_CODE(ERRCODE_INSUFFICIENT_PRIVILEGE),
                         ERR_MSG("permission denied for view ", obj->GetName()));

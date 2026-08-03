@@ -20,17 +20,14 @@ add_library(
     duckdb_index_entry.cpp
     duckdb_index_scan_entry.cpp
     duckdb_table_function.cpp
-    duckdb_scan_base.cpp
     duckdb_search_full_scan.cpp
-    duckdb_search_table_scan.cpp
-    column_extract.cpp
     full_scanner.cpp
-    hit_batcher.cpp
     index_source_factory.cpp
     index_source_view.cpp
     inverted_store_index.cpp
     index_source_view_file.cpp
     index_source_view_table.cpp
+    index_source_external_lookup.cpp
     view_fast_path.cpp
     duckdb_copy_filesystem.cpp
     duckdb_physical_search_insert.cpp
@@ -39,6 +36,7 @@ add_library(
     duckdb_physical_ctas.cpp
     duckdb_tokenizer_function.cpp
     duckdb_rbac_function.cpp
+    duckdb_foreign_server_function.cpp
     duckdb_physical_create_index.cpp
     duckdb_index_utils.cpp
     duckdb_vacuum_function.cpp

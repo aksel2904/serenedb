@@ -49,6 +49,8 @@ namespace sdb::catalog {
 struct StoreTableColumn {
   std::string name;
   duckdb::LogicalType type;
+  duckdb::CompressionType compression =
+    duckdb::CompressionType::COMPRESSION_AUTO;
 };
 
 struct StoreForeignKey {
@@ -82,6 +84,11 @@ std::string DroppedStoreTableName(ObjectId table_id);
 // recovery never need the user-facing name and facade renames are
 // metadata-only.
 std::string StoreIndexName(ObjectId index_id);
+
+duckdb::optional_ptr<duckdb::TableCatalogEntry> GetStoreTableEntry(
+  duckdb::ClientContext& context, std::string_view database,
+  std::string_view schema, std::string_view table,
+  duckdb::OnEntryNotFound if_not_found);
 
 struct StoreIndexDef {
   enum class Kind : uint8_t {
@@ -156,7 +163,8 @@ class CatalogStore {
     // Adds a column. `type_sql` is the SQL type text; `default_sql` is the
     // DEFAULT expression text (empty for none) used to backfill existing rows.
     void AddStoreColumn(std::string table, std::string name,
-                        std::string type_sql, std::string default_sql);
+                        std::string type_sql, std::string default_sql,
+                        duckdb::CompressionType compression);
     // Changes a column's type. `using_sql` is the USING cast text (empty for
     // the implicit cast).
     void ChangeStoreColumnType(std::string table, std::string name,
@@ -219,6 +227,8 @@ class CatalogStore {
       StoreIndexDef store_index;
       std::string name_a;
       std::string name_b;
+      duckdb::CompressionType compression =
+        duckdb::CompressionType::COMPRESSION_AUTO;
     };
 
     WriteContext() = default;

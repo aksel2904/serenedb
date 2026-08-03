@@ -118,6 +118,8 @@ class Column final : public Object {
   duckdb::LogicalType type;
   std::shared_ptr<ColumnExpr> expr;
   GeneratedType generated_type = GeneratedType::kNone;
+  duckdb::CompressionType compression =
+    duckdb::CompressionType::COMPRESSION_AUTO;
   std::string comment;
 };
 
@@ -147,6 +149,8 @@ class CheckConstraint final : public Object {
   // returns that column's index. Otherwise returns std::nullopt.
   std::optional<size_t> IsNotNull(
     std::span<const Column> columns) const noexcept;
+
+  std::optional<std::string_view> NotNullColumnName() const noexcept;
 
   std::shared_ptr<ColumnExpr> expr;
 };

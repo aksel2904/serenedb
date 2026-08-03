@@ -1,5 +1,11 @@
 hash-threshold 100
 
+statement ok
+SET compaction_interval = 0
+
+statement ok
+SET refresh_interval = 0
+
 # ----------------------------------------------------------------------------
 # array_agg(DISTINCT col) over a keyword-analyzed inverted-index column is
 # served from the term dictionary: a keyword analyzer emits the whole value as
@@ -64,15 +70,11 @@ QUERY PLAN
 │ Groups: #0                               │
 │ ~3 rows                                  │
 ╰─────────────────────┬────────────────────╯
-╭─ PROJECTION ────────┴────────────────────╮
-│ Projections: #0                          │
-│ ~7 rows                                  │
-╰─────────────────────┬────────────────────╯
 ╭─ IRESEARCH_SCAN ────┴────────────────────╮
 │ Index: aa_idx                            │
 │ TsDict: cat                              │
 │ Projections: sdb_inverted_index_term$cat │
-│ ~7 rows                                  │
+│ ~6 rows                                  │
 ╰──────────────────────────────────────────╯
 
 query
@@ -108,16 +110,12 @@ QUERY PLAN
 │ Groups: #0                                 │
 │ ~3 rows                                    │
 ╰──────────────────────┬─────────────────────╯
-╭─ PROJECTION ─────────┴─────────────────────╮
-│ Projections: #0                            │
-│ ~7 rows                                    │
-╰──────────────────────┬─────────────────────╯
 ╭─ IRESEARCH_SCAN ─────┴─────────────────────╮
 │ Index: aa_idx                              │
 │ TsDict: plain                              │
 │ Projections:                               │
 │ sdb_inverted_index_term$plain              │
-│ ~7 rows                                    │
+│ ~6 rows                                    │
 ╰────────────────────────────────────────────╯
 
 query
@@ -141,10 +139,6 @@ QUERY PLAN
 │ Aggregates: array_agg(DISTINCT #0) │
 │ ~1 row                             │
 ╰──────────────────┬─────────────────╯
-╭─ PROJECTION ─────┴─────────────────╮
-│ Projections: body                  │
-│ ~7 rows                            │
-╰──────────────────┬─────────────────╯
 ╭─ IRESEARCH_SCAN ─┴─────────────────╮
 │ Index: aa_idx                      │
 │ Lookup: table                      │
@@ -160,10 +154,6 @@ QUERY PLAN
 ╭─ UNGROUPED_AGGREGATE ──────────────╮
 │ Aggregates: array_agg(DISTINCT #0) │
 │ ~1 row                             │
-╰──────────────────┬─────────────────╯
-╭─ PROJECTION ─────┴─────────────────╮
-│ Projections: opt                   │
-│ ~7 rows                            │
 ╰──────────────────┬─────────────────╯
 ╭─ IRESEARCH_SCAN ─┴─────────────────╮
 │ Index: aa_idx                      │
@@ -193,10 +183,6 @@ QUERY PLAN
 │ Aggregates: array_agg(#0) │
 │ ~1 row                    │
 ╰─────────────┬─────────────╯
-╭─ PROJECTION ┴─────────────╮
-│ Projections: cat          │
-│ ~7 rows                   │
-╰─────────────┬─────────────╯
 ╭─ IRESEARCH_SCAN ──────────╮
 │ Index: aa_idx             │
 │ Lookup: table             │
@@ -213,10 +199,6 @@ QUERY PLAN
 │ Aggregates: array_agg(DISTINCT #0), │
 │             count_star()            │
 │ ~1 row                              │
-╰──────────────────┬──────────────────╯
-╭─ PROJECTION ─────┴──────────────────╮
-│ Projections: cat                    │
-│ ~7 rows                             │
 ╰──────────────────┬──────────────────╯
 ╭─ IRESEARCH_SCAN ─┴──────────────────╮
 │ Index: aa_idx                       │
@@ -238,10 +220,6 @@ QUERY PLAN
 │ Groups: #0                           │
 │ Aggregates: array_agg(DISTINCT #1)   │
 │ ~4 rows                              │
-╰───────────────────┬──────────────────╯
-╭─ PROJECTION ──────┴──────────────────╮
-│ Projections: id, cat                 │
-│ ~7 rows                              │
 ╰───────────────────┬──────────────────╯
 ╭─ IRESEARCH_SCAN ──┴──────────────────╮
 │ Index: aa_idx                        │
@@ -270,13 +248,9 @@ QUERY PLAN
 │ Groups: #0                               │
 │ ~0 rows                                  │
 ╰─────────────────────┬────────────────────╯
-╭─ PROJECTION ────────┴────────────────────╮
-│ Projections: #0                          │
-│ ~1 row                                   │
-╰─────────────────────┬────────────────────╯
 ╭─ IRESEARCH_SCAN ────┴────────────────────╮
 │ Index: aa_idx                            │
-│ Filter:                                  │
+│ Index Filter:                            │
 │ ╭─ Starts With ──────╮                   │
 │ │ Field: cat(string) │                   │
 │ │ Prefix: r          │                   │
@@ -317,15 +291,11 @@ QUERY PLAN
 │ sdb_inverted_index_term$cat IS NOT NULL,   │
 │ sdb_inverted_index_term$plain,             │
 │ sdb_inverted_index_term$plain IS NOT NULL  │
-│ ~7 rows                                    │
+│ ~6 rows                                    │
 ╰──────────────────────┬─────────────────────╯
 ╭─ HASH_GROUP_BY ──────┴─────────────────────╮
 │ Groups: #0, #1                             │
-│ ~7 rows                                    │
-╰──────────────────────┬─────────────────────╯
-╭─ PROJECTION ─────────┴─────────────────────╮
-│ Projections: #0, #1                        │
-│ ~14 rows                                   │
+│ ~6 rows                                    │
 ╰──────────────────────┬─────────────────────╯
 ╭─ IRESEARCH_SCAN ─────┴─────────────────────╮
 │ Index: aa_idx                              │
@@ -333,7 +303,7 @@ QUERY PLAN
 │ Projections:                               │
 │ sdb_inverted_index_term$cat,               │
 │ sdb_inverted_index_term$plain              │
-│ ~14 rows                                   │
+│ ~12 rows                                   │
 ╰────────────────────────────────────────────╯
 
 query
@@ -371,15 +341,11 @@ QUERY PLAN
 │ Groups: #0                               │
 │ ~3 rows                                  │
 ╰─────────────────────┬────────────────────╯
-╭─ PROJECTION ────────┴────────────────────╮
-│ Projections: #0                          │
-│ ~7 rows                                  │
-╰─────────────────────┬────────────────────╯
 ╭─ IRESEARCH_SCAN ────┴────────────────────╮
 │ Index: aa_idx                            │
 │ TsDict: cat                              │
 │ Projections: sdb_inverted_index_term$cat │
-│ ~7 rows                                  │
+│ ~6 rows                                  │
 ╰──────────────────────────────────────────╯
 
 query
@@ -403,15 +369,11 @@ QUERY PLAN
 │ Groups: #0                               │
 │ ~3 rows                                  │
 ╰─────────────────────┬────────────────────╯
-╭─ PROJECTION ────────┴────────────────────╮
-│ Projections: #0                          │
-│ ~7 rows                                  │
-╰─────────────────────┬────────────────────╯
 ╭─ IRESEARCH_SCAN ────┴────────────────────╮
 │ Index: aa_idx                            │
 │ TsDict: cat                              │
 │ Projections: sdb_inverted_index_term$cat │
-│ ~7 rows                                  │
+│ ~6 rows                                  │
 ╰──────────────────────────────────────────╯
 
 query

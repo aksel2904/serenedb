@@ -108,6 +108,9 @@ set(IResearch_core_sources
     ./index/iterators.cpp
     ./index/merge_writer.cpp
     ./index/norm.cpp
+    ./index/hit_batcher.cpp
+    ./index/table_filter_iterator.cpp
+    ./index/column_extract.cpp
     ./index/postings.cpp
     ./index/segment_reader.cpp
     ./index/segment_reader_impl.cpp
@@ -129,7 +132,6 @@ set(IResearch_core_sources
     ./search/range_filter.cpp
     ./search/phrase_filter.cpp
     ./search/phrase_query.cpp
-    ./search/column_existence_filter.cpp
     ./search/same_position_filter.cpp
     ./search/automaton_filter.cpp
     ./search/wildcard_filter.cpp
@@ -197,27 +199,44 @@ find_package(BISON)
 
 set_directory_properties(PROPERTIES CLEAN_NO_CUSTOM "On")
 
-add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/parser/lucene_lexer.cpp
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    COMMAND
-        ${CMAKE_SOURCE_DIR}/scripts/generate_c.sh ${FLEX_EXECUTABLE}
-        libs/iresearch/include/iresearch/parser/lucene_lexer.cpp
-        libs/iresearch/include/iresearch/parser/lucene_lexer.l
-    MAIN_DEPENDENCY ${CMAKE_CURRENT_SOURCE_DIR}/parser/lucene_lexer.l
-    VERBATIM
-)
+if(FLEX_FOUND AND BISON_FOUND)
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/parser/lucene_lexer.cpp
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMAND
+            ${CMAKE_SOURCE_DIR}/scripts/generate_c.sh ${FLEX_EXECUTABLE}
+            libs/iresearch/include/iresearch/parser/lucene_lexer.cpp
+            libs/iresearch/include/iresearch/parser/lucene_lexer.l
+        MAIN_DEPENDENCY ${CMAKE_CURRENT_SOURCE_DIR}/parser/lucene_lexer.l
+        VERBATIM
+    )
 
-add_custom_command(
-    OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/parser/lucene_parser.cpp
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
-    COMMAND
-        ${CMAKE_SOURCE_DIR}/scripts/generate_c.sh ${BISON_EXECUTABLE}
-        libs/iresearch/include/iresearch/parser/lucene_parser.cpp
-        libs/iresearch/include/iresearch/parser/lucene_parser.y
-    MAIN_DEPENDENCY ${CMAKE_CURRENT_SOURCE_DIR}/parser/lucene_parser.y
-    VERBATIM
-)
+    add_custom_command(
+        OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/parser/lucene_parser.cpp
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMAND
+            ${CMAKE_SOURCE_DIR}/scripts/generate_c.sh ${BISON_EXECUTABLE}
+            libs/iresearch/include/iresearch/parser/lucene_parser.cpp
+            libs/iresearch/include/iresearch/parser/lucene_parser.y
+        MAIN_DEPENDENCY ${CMAKE_CURRENT_SOURCE_DIR}/parser/lucene_parser.y
+        VERBATIM
+    )
+else()
+    set(_missing_tools "")
+    if(NOT FLEX_FOUND)
+        list(APPEND _missing_tools "FLEX")
+    endif()
+    if(NOT BISON_FOUND)
+        list(APPEND _missing_tools "BISON")
+    endif()
+    string(JOIN " and " _missing_tools_str ${_missing_tools})
+    message(
+        STATUS
+        "${_missing_tools_str} not found; skipping grammar generation and using pre-generated parser/lucene_lexer.cpp and parser/lucene_parser.cpp"
+    )
+    unset(_missing_tools)
+    unset(_missing_tools_str)
+endif()
 
 if(uring_FOUND)
     list(APPEND IResearch_core_sources ./store/async_directory.cpp)
