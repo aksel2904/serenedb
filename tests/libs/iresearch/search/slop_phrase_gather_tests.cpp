@@ -23,11 +23,9 @@
 //
 // n == 2 phrases - fixed and variadic alike - route to the merge-join in
 // production and never reach gather; gPairJoinDisabled exposes the generic
-// gather + Run path, and the pair_join_equivalence_* tests assert
-// join-vs-generic equivalence over identical data. The seams exist only in
-// SDB_DEV builds, so those tests compile only under SDB_DEV. The
-// SlopOverlapMatcher tests at the end pin the n >= 3 same-position
-// (term-group) semantics of spm::Run and run in any build.
+// gather + Run path for the equivalence tests, which compile only under
+// SDB_DEV. The SlopOverlapMatcher tests at the end pin the n >= 3
+// same-position (term-group) semantics of spm::Run and run in any build.
 
 #include "filter_test_case_base.hpp"
 #include "iresearch/analysis/token_attributes.hpp"
@@ -47,9 +45,8 @@ namespace spm = irs::detail::slop;
 constexpr irs::field_id kField = tests::FieldIdFor("phrase_anl");
 
 // Routes n == 2 phrases through the generic gather + Run path for the
-// duration of the scope (the production default is the fused
-// merge-join, which bypasses gather entirely). Never leaks past the
-// scope.
+// duration of the scope (the production default is the fused merge-join,
+// which bypasses gather entirely).
 class PairJoinGuard {
  public:
   PairJoinGuard() noexcept { spm::gPairJoinDisabled = true; }
@@ -59,10 +56,9 @@ class PairJoinGuard {
   PairJoinGuard& operator=(const PairJoinGuard&) = delete;
 };
 
-// Routes the offset-enabled read-all gather through the scalar
-// per-position loop for the duration of the scope (the production
-// default is the bulk three-array ReadAll). Never leaks past the
-// scope.
+// Routes the offset-enabled read-all gather through the scalar per-position
+// loop for the duration of the scope (the production default is the bulk
+// three-array ReadAll).
 class OffsBulkScalarGuard {
  public:
   OffsBulkScalarGuard() noexcept { spm::gOffsBulkGatherDisabled = true; }
@@ -139,8 +135,7 @@ std::vector<OffsetMatch> CollectOffsets(const tests::PreparedFilter& prepared,
 class SlopGatherTestCase : public tests::FilterTestCaseBase {};
 
 // Pair-join equivalence: the n == 2 merge-join (production default) must
-// produce exactly the docs the generic gather + Run path does;
-// gPairJoinDisabled exposes the generic path.
+// produce exactly the docs the generic gather + Run path does.
 TEST_P(SlopGatherTestCase, pair_join_equivalence_fixed) {
   {
     tests::JsonDocGenerator gen(resource("phrase_sequential.json"),
@@ -214,10 +209,10 @@ TEST_P(SlopGatherTestCase, pair_join_equivalence_offsets) {
 }
 
 // Variadic pair-join equivalence: an n == 2 variadic phrase (a term set per
-// slot, here from prefix expansion) routes to the same merge-join through
-// MergedPosStream. Same join-vs-generic discipline as the fixed test.
-// Duplicate positions inside a slot (same-position synonyms) cannot occur
-// on this corpus; that case is pinned by the merged-stream fuzz oracle.
+// slot, here from prefix expansion) routes to the same merge-join; same
+// join-vs-generic discipline as the fixed test. Duplicate positions inside
+// a slot (same-position synonyms) cannot occur on this corpus; that case is
+// pinned by the merged-stream fuzz oracle.
 TEST_P(SlopGatherTestCase, pair_join_equivalence_variadic) {
   {
     tests::JsonDocGenerator gen(resource("phrase_sequential.json"),
@@ -275,11 +270,11 @@ TEST_P(SlopGatherTestCase, pair_join_equivalence_variadic) {
   }
 }
 
-// Offsets path through the variadic join: per-match offsets resolved by the
-// merged streams must be identical to the generic gather path's. Exact
-// comparison is safe here: with no same-position tokens in the corpus no
-// slot holds duplicate positions, the one case where the two paths may
-// legitimately source offsets from different equal-position terms.
+// Offsets path through the variadic join: per-match offsets must be
+// identical to the generic gather path's. Exact comparison is safe: with no
+// same-position tokens in the corpus no slot holds duplicate positions, the
+// one case where the two paths may legitimately source offsets from
+// different equal-position terms.
 TEST_P(SlopGatherTestCase, pair_join_equivalence_offsets_variadic) {
   {
     tests::JsonDocGenerator gen(resource("phrase_sequential.json"),
@@ -448,8 +443,6 @@ INSTANTIATE_TEST_SUITE_P(slop_gather_test, SlopGatherTestCase,
 // positions: foo {0}, bar {0}, qux {1} (the repeated foo slot reads foo's
 // postings too).
 
-// Small slots: anchor DFS over single-position slots.
-
 TEST(SlopOverlapMatcher, n3_distinct_terms_share_position) {
   spm::MatchScratch scratch;
   const std::vector<std::vector<irs::PosAttr::value_t>> slot_pos = {
@@ -490,7 +483,6 @@ TEST(SlopOverlapMatcher, n3_repeated_term_never_matches) {
 
 // Wide slot variant: the same group-aware uniqueness, but the third slot
 // spans 130 positions, so the DFS prunes over a much larger window volume.
-// Cheap extra coverage.
 
 TEST(SlopOverlapMatcher, n3_wide_slot_distinct_terms_share_position) {
   spm::MatchScratch scratch;
@@ -525,9 +517,8 @@ TEST(SlopOverlapMatcher, n3_wide_slot_repeated_term_never_matches) {
   EXPECT_FALSE(r.any);
 }
 
-// Guard: empty groups (variadic / opt-out) keeps strict uniqueness.
-// With no group info Run must fall back to per-position uniqueness, i.e. the
-// pre-fix behavior: two slots cannot share a position.
+// Guard: empty groups (direct-caller opt-out) keep strict uniqueness:
+// two slots cannot share a position.
 
 TEST(SlopOverlapMatcher, n3_empty_groups_enforces_position_uniqueness) {
   spm::MatchScratch scratch;
@@ -535,8 +526,7 @@ TEST(SlopOverlapMatcher, n3_empty_groups_enforces_position_uniqueness) {
     {0}, {0}, {1}};
   const std::vector<irs::PosAttr::value_t> expected_steps = {1, 1};
 
-  // No groups argument -> default empty -> strict uniqueness -> foo@0/bar@0
-  // collision dropped -> no match at any slop.
+  // Default empty groups: the foo@0/bar@0 collision is dropped at any slop.
 
   for (const irs::PosAttr::value_t slop : {0u, 1u, 5u}) {
     auto r = spm::Run(slot_pos, slop, expected_steps, scratch,

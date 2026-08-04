@@ -39,37 +39,20 @@
 
 // Sloppy phrase frequency over per-slot position lists.
 //
-// Matching: Run anchors at the rarest slot and, for each of its positions,
-// runs a pruned DFS (CountFromAnchor) over the remaining slots, rightward
-// then leftward, accumulating freq + best_distance. StepCost is directional,
-// so every transition is scored in phrase order against the slot's adjacent
-// partner. The DFS walks only the slop-reachable [lo, hi] slice of each slot
-// and prunes on running cost, so its work tracks the valid (and near-valid)
-// tuples; it never materializes a per-anchor window. Given a collector, the
-// same pass emits one EnumeratedMatch per valid tuple, so freq and the
-// enumerated count come from one walk and agree by construction.
+// Matching: Run anchors at the rarest slot and, per anchor position, counts
+// valid tuples with a pruned DFS (CountFromAnchor) over the slop-reachable
+// [lo, hi] slice of each remaining slot. Given a collector, the same walk
+// emits one EnumeratedMatch per valid tuple, so freq and the enumerated
+// count agree by construction.
 //
-// Gather: every slot is read in full via the bulk ReadAll decode. Windowed
-// gathering (seeking non-anchor slots into slop-reachable windows) buys
-// nothing in this format: intra-doc position seek is itself a sequential
-// decode (iterator_pos.hpp seek() walks every skipped position and its
-// attributes), so a window skips no decode work.
+// Gather: every slot is read in full; intra-doc position seek in this format
+// decodes sequentially (iterator_pos.hpp), so windowed gathering saves no
+// decode work.
 //
 // expected_step == 1 is the plain adjacent-term cost model (matches
 // Elasticsearch); expected_step > 1 adds per-slot positional gaps from
 // push_back(term, offs). Interval gaps (offs_min != offs_max) with slop are
 // rejected at prepare (phrase_filter.cpp).
-
-// Profiling aid: with -DSLOP_PROFILE, force the matcher (Run) and the
-// pair join (JoinPair) out of line so a profiler can split matching vs
-// position decode (iterator next/seek, already out of line). Each runs
-// once per candidate doc, so the perturbation is negligible. Never
-// defined in production.
-#ifdef SLOP_PROFILE
-#define SLOP_PROF_NOINLINE [[gnu::noinline]]
-#else
-#define SLOP_PROF_NOINLINE
-#endif
 
 namespace irs {
 
@@ -81,11 +64,9 @@ struct HasPosition;
 namespace detail::slop {
 
 // Step cost for one slot transition, over delta = pos[slot] - pos[partner]
-// in phrase order. For a regular adjacent term (expected == 1): adjacency
-// (delta == 1) is free, a forward gap costs delta - 1, same position costs
-// 1, and a reversal (delta <= -1) costs -delta + 1. For a requested gap
-// (expected > 1): hitting it costs 0, too far costs delta - expected, too
-// close costs expected - delta, and a reversal costs expected - delta + 1.
+// in phrase order: |delta - expected|, plus one extra move for a reversal
+// (delta < 0) - except at expected == 1, where |delta - 1| already covers
+// it.
 constexpr PosAttr::value_t StepCost(int64_t delta,
                                     PosAttr::value_t expected) noexcept {
   if (expected == 1) {
@@ -119,27 +100,17 @@ struct MatchResult {
   bool any = false;
 };
 
-// Scratch passed from the Frequency object into Run: the DFS chain and slot
-// visitation order, whose capacity is reused across anchor positions and
-// documents instead of reallocated per call.
+// DFS scratch (chain + visitation order); capacity reused across calls.
 struct MatchScratch {
   std::vector<PosAttr::value_t> chain;
   std::vector<uint32_t> order;
 };
 
-// Dev-only seams, compiled out of release builds: in a non-SDB_DEV build the
-// helpers are constant false and the alternate paths fold away.
-//
-// gPairJoinDisabled routes n == 2 through the generic gather + Run path
-// instead of the fused merge-join (JoinPair), so tests can assert
-// join-vs-generic equivalence over identical data.
-//
-// gOffsBulkGatherDisabled routes the offset-enabled gather through the scalar
-// per-position loop instead of the bulk ReadAll overload; the micro benchmark
-// sets it via a command-line flag for an in-binary A/B of the decode paths.
-//
-// Both are relaxed atomics so the reads stay data-race-free no matter which
-// thread toggles them; a relaxed load compiles to a plain load.
+// Dev-only seams; in a non-SDB_DEV build the helpers are constant false and
+// the alternate paths fold away. gPairJoinDisabled routes n == 2 through the
+// generic gather + Run path for the join-vs-generic equivalence tests.
+// gOffsBulkGatherDisabled routes the offset-enabled gather through the
+// scalar per-position loop for an in-binary A/B against the bulk ReadAll.
 #ifdef SDB_DEV
 inline std::atomic<bool> gPairJoinDisabled{false};
 inline std::atomic<bool> gOffsBulkGatherDisabled{false};
@@ -163,9 +134,8 @@ struct PosOffset {
   uint32_t end;
 };
 
-// A single valid pair emitted by JoinPair: positions with slot ids
-// (mirrors EnumeratedMatch) plus the already-resolved match offsets
-// (leftmost token's start, rightmost token's end).
+// A valid pair from JoinPair: the EnumeratedMatch fields plus the already
+// resolved match offsets.
 struct PairMatch {
   PosAttr::value_t leftmost;
   PosAttr::value_t rightmost;
@@ -175,9 +145,8 @@ struct PairMatch {
   uint32_t end_offset;
 };
 
-// Sliding partner-position buffer for JoinPair, reused across Match()
-// calls. buf_offs is parallel to buf_pos and filled only when the join
-// is instantiated with Offs.
+// Sliding partner-position buffer for JoinPair; buf_offs is parallel and
+// filled only with Offs.
 struct PairScratch {
   std::vector<PosAttr::value_t> buf_pos;
   std::vector<PosOffset> buf_offs;
@@ -232,23 +201,20 @@ class UninitU32Buf {
 // instead of gather + Run for two-slot phrases. Anchor positions are read
 // straight off their iterator; partner positions are decoded exactly once
 // into a sliding buffer bounded by the anchor window [pa - w, pa + w],
-// w = slop + expected (the coverage window). Candidates are then
-// exact-checked with StepCost, so the accept set equals Run's. Both bounds
-// are nondecreasing in pa, which is what makes the single forward pass and
-// the front-trimmed buffer sound.
+// w = slop + expected. Candidates are exact-checked with StepCost, so the
+// accept set equals Run's.
 //
-// anchor_is_slot0 picks the phrase-order delta sign; anchor should be the
-// rarer slot but either is correct. enforce_uniqueness mirrors Run: a pair
-// may not share one index position. With 'out' non-null (Offs && HasFreq) one
-// PairMatch per valid pair is appended, sorted by (leftmost, rightmost,
-// leftmost_slot, rightmost_slot) as Run's collector does. When !HasFreq the
-// join returns at the first valid pair.
+// anchor_is_slot0 picks the phrase-order delta sign. enforce_uniqueness
+// mirrors Run: a pair may not share one index position. With 'out' non-null
+// (Offs && HasFreq) one PairMatch per valid pair is appended, sorted by
+// (leftmost, rightmost, leftmost_slot, rightmost_slot) as Run's collector
+// does. When !HasFreq the join returns at the first valid pair.
 template<bool Offs, bool HasFreq, typename AnchorIt, typename PartnerIt>
-SLOP_PROF_NOINLINE MatchResult JoinPair(
-  AnchorIt& anchor, PartnerIt& partner, const OffsAttr* anchor_offs,
-  const OffsAttr* partner_offs, bool anchor_is_slot0, PosAttr::value_t slop,
-  PosAttr::value_t expected, bool enforce_uniqueness, PairScratch& scratch,
-  std::vector<PairMatch>* out) {
+MatchResult JoinPair(AnchorIt& anchor, PartnerIt& partner,
+                     const OffsAttr* anchor_offs, const OffsAttr* partner_offs,
+                     bool anchor_is_slot0, PosAttr::value_t slop,
+                     PosAttr::value_t expected, bool enforce_uniqueness,
+                     PairScratch& scratch, std::vector<PairMatch>* out) {
   if constexpr (!HasFreq) {
     // A collector implies a full count; early exit would truncate it.
     SDB_ASSERT(out == nullptr);
@@ -425,25 +391,16 @@ SLOP_PROF_NOINLINE MatchResult JoinPair(
 }
 
 // Merged position stream over one variadic slot's sub-iterators: a k-way
-// merge of the per-term position lists with duplicate positions collapsed,
-// exposing the next()/value()/seek() contract JoinPair expects from a single
-// slot. Duplicates must collapse because the gather path does the same
-// (finalize_slot's sort + unique keys on position alone): two terms of the
-// set at one position yield one slot position, hence one counted pair. Which
-// duplicate's offsets survive is unspecified in the gather path (unstable
-// sort); the stream deterministically keeps the first sub-iterator in visit
-// order.
+// merge of the per-term position lists, exposing the next()/value()/seek()
+// contract JoinPair expects from a single slot. Duplicate positions
+// collapse, mirroring the gather path (finalize_slot's sort + unique keys
+// on position alone). Offsets keep the first sub-iterator in visit order;
+// the gather path leaves this unspecified (unstable sort).
 //
 // Offsets are copied into stream-owned storage on every reposition: the
 // active sub-iterator changes as the merge advances, so no single sub's
-// OffsAttr pointer stays correct. JoinPair reads offsets immediately after
-// positioning, which the refresh-on-move exactly covers.
-//
-// Linear scans over the subs: a slot's term set is a handful of synonyms,
-// where a heap costs more than it saves.
-//
-// Templated on the sub-iterator type so the fuzz oracle can drive it over
-// mocks; production always uses the PosAttr default.
+// OffsAttr pointer stays correct.
+
 template<bool Offs, typename SubPos = PosAttr>
 class MergedPosStream {
  public:
@@ -480,9 +437,7 @@ class MergedPosStream {
       }
       // Consume every sub entry sitting on the current position; this is
       // where duplicates collapse into the one merged position already
-      // emitted. The inner loop also skips repeats within one sub - real
-      // postings are strictly increasing, but one compare buys not having
-      // to assume it.
+      // emitted. The inner loop also skips repeats within one sub.
       for (auto& s : _subs) {
         while (s.val == _cur) {
           AdvanceSub(s);
@@ -562,9 +517,8 @@ class MergedPosStream {
   OffsAttr _offs;
 };
 
-// A single enumerated valid tuple, recording leftmost and rightmost
-// position with their originating slot indices (used to look up
-// OffsAttr from per-slot materialized offset arrays).
+// A single enumerated valid tuple: leftmost and rightmost position with
+// their originating slot indices, for offset lookup in BuildMatches.
 struct EnumeratedMatch {
   PosAttr::value_t leftmost;
   PosAttr::value_t rightmost;
@@ -572,13 +526,11 @@ struct EnumeratedMatch {
   uint32_t rightmost_slot;
 };
 
-// Gate for the duplicate-position check: true when groups are absent
-// (variadic / opt-out; the check is then global) or when some group
-// holds two or more slots (the check is then scoped per group, see
-// CountFromAnchor). Elasticsearch semantics: uniqueness applies only between
-// slots of one group (a connectivity component of query term sets);
-// slots of different groups may share a position, the delta-0 step
-// costing 1 via StepCost, so excluded at slop 0.
+// Gate for the duplicate-position check: true with empty groups (direct
+// callers may opt out; the check is then global) or when some group holds
+// two or more slots (then scoped per group, see CountFromAnchor).
+// Distinct-group slots may share a position; the delta-0 step costs 1
+// (StepCost), so such tuples are excluded at slop 0.
 inline bool EnforceUniqueness(const std::vector<uint32_t>& groups) noexcept {
   if (groups.empty()) {
     return true;
@@ -593,14 +545,12 @@ inline bool EnforceUniqueness(const std::vector<uint32_t>& groups) noexcept {
   return false;
 }
 
-// Counts one anchor position's valid tuples into 'res' (freq +
-// best_distance); Run calls it per anchor position. With 'out' non-null the
-// completed chain is also emitted as one EnumeratedMatch per tuple, so
-// res.freq == out->size() by construction. early_exit stops at the first
-// tuple (never combined with 'out').
-// With enforce_uniqueness a candidate position is rejected when an
-// already-placed slot of the SAME group sits on it; empty groups widen
-// the check to all placed slots (strict global).
+// Counts one anchor position's valid tuples into 'res'. With 'out' non-null
+// each completed chain is also emitted as an EnumeratedMatch, so res.freq ==
+// out->size() by construction; early_exit stops at the first tuple.
+// With enforce_uniqueness a candidate is rejected when an already-placed
+// slot of the same group sits on its position; empty groups check against
+// all placed slots.
 inline void CountFromAnchor(
   const std::vector<std::vector<PosAttr::value_t>>& slots,
   PosAttr::value_t slop, const std::vector<PosAttr::value_t>& expected_steps,
@@ -639,8 +589,7 @@ inline void CountFromAnchor(
     std::numeric_limits<PosAttr::value_t>::max();
 
   const uint32_t slot = order[d];
-  // Phrase-adjacent partner and the pair's expected step. Rightward slots
-  // pair with slot-1, leftward with slot+1; `forward` picks the sign so the
+  // `forward` picks the phrase-adjacent partner and the delta sign, so the
   // delta is always in phrase order.
   const bool forward = slot > anchor;
   const uint32_t partner = forward ? slot - 1 : slot + 1;
@@ -652,7 +601,7 @@ inline void CountFromAnchor(
   const PosAttr::value_t span = budget + 1;
 
   // Loose [lo, hi] superset of positions whose StepCost can still fit the
-  // remaining budget; centred on pv + expected (forward) or pv - expected
+  // remaining budget; centered on pv + expected (forward) or pv - expected
   // (backward). The exact StepCost check below does the real pruning.
   PosAttr::value_t lo;
   PosAttr::value_t hi;
@@ -705,7 +654,7 @@ inline void CountFromAnchor(
   }
 }
 
-SLOP_PROF_NOINLINE inline MatchResult Run(
+inline MatchResult Run(
   const std::vector<std::vector<PosAttr::value_t>>& slot_pos,
   PosAttr::value_t slop, const std::vector<PosAttr::value_t>& expected_steps,
   MatchScratch& scratch, bool early_exit,
@@ -731,10 +680,8 @@ SLOP_PROF_NOINLINE inline MatchResult Run(
 
   const bool enforce_uniqueness = EnforceUniqueness(groups);
 
-  // Anchor at the rarest slot: iterating the fewest anchor positions
-  // minimizes window searches, and lets n >= 3 phrases lead from the rarest
-  // slot rather than slot 0 (a win on dense-slot0 phrases like "the european
-  // union"). Step cost sums over phrase-adjacent pairs regardless of which
+  // Anchor at the rarest slot: fewest anchor positions, fewest window
+  // searches. Step cost sums over phrase-adjacent pairs regardless of which
   // slot leads, so freq and best_distance are unchanged.
   uint32_t anchor = 0;
   for (uint32_t i = 1; i < n; ++i) {
@@ -785,8 +732,8 @@ SLOP_PROF_NOINLINE inline MatchResult Run(
 
 // Sloppy counterpart of FixedPhraseFrequency. Offs collects OffsAttr and
 // emits per-match offsets through PhrasePosition iteration. HasFreq computes
-// exact freq + best_distance; when false the matcher early-exits on the first
-// valid tuple and sets freq to 1 to signal a match. kHasBoost = HasFreq.
+// exact freq + best_distance; when false the matcher early-exits on the
+// first valid tuple and sets freq to 1 to signal a match.
 template<bool Offs, bool HasFreq>
 class SlopPhraseFrequency {
  public:
@@ -818,7 +765,6 @@ class SlopPhraseFrequency {
     }
 
     const size_t n = _pos.size();
-    // Reuse inner vector capacity across calls; n is fixed for the iterator.
     _slot_pos.resize(n);
 
     if (_term_groups.size() != n) {
@@ -840,16 +786,13 @@ class SlopPhraseFrequency {
       _slot_offs_end.resize(n);
     }
 
-    // Per-slot gather: read the whole posting into _slot_pos[i]
-    // (+ _slot_offs_start[i] / _slot_offs_end[i] when Offs).
     const auto gather_all = [&](size_t i) {
       auto& it = *_pos[i].first;
       auto& positions = _slot_pos[i];
       // Gather is the first consumer of positions for this doc, so the
-      // whole per-doc posting is still pending and DocFreq is exact.
-      // No clear() first: resize from the previous size skips the
-      // value-initialization that a resize from zero would do, and
-      // ReadAll overwrites the slot in full anyway.
+      // whole per-doc posting is still pending and DocFreq is exact. No
+      // clear() first: resize from the previous size skips value-init and
+      // ReadAll overwrites the slot in full.
       if constexpr (!Offs) {
         positions.resize(it.DocFreq());
         const auto count = it.ReadAll(positions.data());
@@ -929,11 +872,9 @@ class SlopPhraseFrequency {
     return {&_start_offset, &_end_offset};
   }
 
-  // Emits matches in successive NextPosition() calls. Pre-loads match
-  // #0 in BuildMatches(), so call N reads match #N-1 and pre-loads #N.
-  // Returns 1 while matches remain (PhrasePosition::_left stays 1),
-  // 0 after the last (PhrasePosition::_left drops to 0, next() returns
-  // false on the following call).
+  // Emits matches in successive calls: match #0 is pre-loaded by
+  // BuildMatches() / MatchPair(), so call N reads match #N-1 and pre-loads
+  // #N. Returns 1 while matches remain, 0 after the last.
   uint32_t NextPosition() {
     if constexpr (!Offs || !HasFreq) {
       // filter-only or no-offsets path: single emission
@@ -949,9 +890,8 @@ class SlopPhraseFrequency {
     }
   }
 
-  // n == 2 path: runs JoinPair over the two position iterators and maps its
-  // result onto the generic outputs (_phrase_freq, _best_distance, _matches).
-  // Anchor = rarer slot by per-doc DocFreq; ties keep slot 0, as Run does.
+  // n == 2 path: runs JoinPair over the two position iterators. Anchor =
+  // rarer slot by per-doc DocFreq; ties keep slot 0, as Run does.
   bool MatchPair() {
     const bool anchor_is_slot0 =
       _pos[0].first->DocFreq() <= _pos[1].first->DocFreq();
@@ -1037,7 +977,6 @@ class SlopPhraseFrequency {
   // Per-slot offsets, parallel to _slot_pos, stored as separate start/end
   std::vector<detail::slop::UninitU32Buf> _slot_offs_start;
   std::vector<detail::slop::UninitU32Buf> _slot_offs_end;
-  // Matcher scratch, kept off the allocator on the hot path.
   detail::slop::MatchScratch _match_scratch;
   // Valid tuples from the matcher pass, sorted by leftmost (Offs && HasFreq
   // only); source for BuildMatches.
@@ -1099,12 +1038,11 @@ class SlopVariadicPhraseFrequency {
     }
 
     // Two-slot phrases bypass gather + Run entirely: the fused merge-join
-    // consumes the merged per-slot position streams directly.
+    // consumes the slots' positions directly (see MatchPair).
     if (n == 2 && !detail::slop::PairJoinDisabled()) {
       return MatchPair();
     }
 
-    // Reuse inner vectors' capacity (see SlopPhraseFrequency::Match)
     _slot_pos.resize(n);
     for (auto& s : _slot_pos) {
       s.clear();
@@ -1116,9 +1054,8 @@ class SlopVariadicPhraseFrequency {
       }
     }
 
-    // finalize_slot sorts + dedups the per-sub-iterator scratch and
-    // moves it into _slot_pos[i] (+ _slot_offs[i] when offsets). Returns
-    // false on an empty slot (no possible match).
+    // Sorts + dedups the per-sub scratch into _slot_pos[i] (+ _slot_offs[i]
+    // when offsets). Returns false on an empty slot.
     const auto finalize_slot = [&](size_t i) -> bool {
       std::sort(_scratch_entries.begin(), _scratch_entries.end());
       auto last = std::unique(_scratch_entries.begin(), _scratch_entries.end());
@@ -1151,9 +1088,6 @@ class SlopVariadicPhraseFrequency {
       }
     }
 
-    // Uniqueness is scoped to slot groups: connectivity components of the
-    // per-segment query term sets, computed at prepare-collect and carried
-    // in TermInterval::term_group (Elasticsearch semantics).
     std::vector<detail::slop::EnumeratedMatch>* collect = nullptr;
     if constexpr (kHasOffsets && HasFreq) {
       collect = &_enumerated;
@@ -1244,8 +1178,7 @@ class SlopVariadicPhraseFrequency {
     detail::slop::MergedPosStream<kHasOffsets>* stream;
   };
 
-  // Registers one sub-iterator of the current document into the slot's
-  // merged stream (n == 2 join path).
+  // Registers one current-doc sub-iterator into the slot's merged stream.
   static bool BindOneSubIter(void* ctx, Adapter& adapter) {
     SDB_ASSERT(ctx);
     auto& c = *reinterpret_cast<BindCtx*>(ctx);
@@ -1268,8 +1201,6 @@ class SlopVariadicPhraseFrequency {
   };
 
   // Counts the current document's sub-iterators and captures the last one.
-  // A slot with exactly one sub feeds JoinPair its raw position iterator;
-  // the merged-stream layer only pays off when there is something to merge.
   static bool CaptureSoloSubIter(void* ctx, Adapter& adapter) {
     SDB_ASSERT(ctx);
     auto& c = *reinterpret_cast<SoloCtx*>(ctx);
@@ -1303,13 +1234,11 @@ class SlopVariadicPhraseFrequency {
     }
   }
 
-  // n == 2 path: feeds JoinPair with the two slots' positions and maps its
-  // result onto the generic outputs (_phrase_freq, _best_distance,
-  // _matches). When both slots hold a single sub-iterator in the current
-  // document (the common real-text case), the raw position iterators go
-  // straight into the join; otherwise each slot is merged first. Anchor =
-  // rarer slot by the disjunction's doc-level cost estimate (a compound
-  // iterator has no exact per-doc count); ties keep slot 0, as Run does.
+  // n == 2 path. Per slot: a single live sub-iterator in the current
+  // document (the common real-text case) feeds JoinPair raw, a multi-sub
+  // slot goes through its merged stream. Anchor = rarer slot by the
+  // disjunction's doc-level cost estimate (no exact per-doc count on a
+  // compound iterator); ties keep slot 0, as Run does.
   bool MatchPair() {
     std::array<SoloCtx, 2> solo;
     for (size_t i = 0; i < 2; ++i) {
@@ -1325,8 +1254,7 @@ class SlopVariadicPhraseFrequency {
     const size_t a = anchor_is_slot0 ? 0 : 1;
     const size_t p = a ^ 1;
 
-    // Solo slots go into the join raw; only multi-sub slots pay for the
-    // merged stream. A stream bound from count > 0 subs cannot be empty.
+    // A stream bound from count > 0 subs cannot be empty.
     for (size_t i = 0; i < 2; ++i) {
       if (solo[i].count == 1) {
         solo[i].pos->reset();
@@ -1442,7 +1370,6 @@ class SlopVariadicPhraseFrequency {
   std::vector<std::vector<PosAttr::value_t>> _slot_pos;
   std::vector<std::vector<OffsetPair>> _slot_offs;
   std::vector<PosEntry> _scratch_entries;
-  // Matcher scratch, kept off the allocator on the hot path.
   detail::slop::MatchScratch _match_scratch;
   // Valid tuples from the matcher pass, sorted by leftmost (kHasOffsets &&
   // HasFreq only).

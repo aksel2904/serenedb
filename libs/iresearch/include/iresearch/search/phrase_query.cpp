@@ -443,8 +443,7 @@ DocIterator::ptr VariadicPhraseQuery::ExecuteWithOffsets(
 
   SDB_ASSERT(this->slop == 0 || !has_intervals);
 
-  // Slop is meaningless for a single slot; the plain path below already
-  // has the degenerate (term-query-like) semantics ES uses for it.
+  // Single slot: slop is meaningless (see Execute).
   if (this->slop > 0 && phrase_size > 1) {
     using SlopIterator = PhraseIterator<
       Conjunction<ScoreAdapter>,
