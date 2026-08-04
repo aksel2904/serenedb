@@ -107,10 +107,14 @@ target_include_directories(
     PRIVATE ${CMAKE_SOURCE_DIR}/third_party/duckdb/third_party/utf8proc/include
 )
 
+target_link_libraries(
+    serenedb-bench-micro-sloppy_phrase_vs_disjunction
+    PRIVATE simdutf
+)
 target_include_directories(
     serenedb-bench-micro-sloppy_phrase_vs_disjunction
     SYSTEM
-    PRIVATE $<TARGET_PROPERTY:iresearch-utfcpp,INTERFACE_INCLUDE_DIRECTORIES>
+    PRIVATE ${CMAKE_SOURCE_DIR}/third_party/duckdb/third_party/utf8proc/include
 )
 
 target_include_directories(

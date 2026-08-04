@@ -41,7 +41,7 @@
 
 #include <absl/algorithm/container.h>
 #include <benchmark/benchmark.h>
-#include <utf8.h>
+#include <simdutf.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -68,6 +68,7 @@
 #include <vector>
 
 #include "basics/duckdb_engine.h"
+#include "utf8proc_wrapper.hpp"
 
 #ifdef SLOP_PROFILE
 #include <valgrind/callgrind.h>
@@ -213,9 +214,7 @@ class EuroparlBodyTemplate {
 template<typename OctetIterator>
 class BreakIterator {
  public:
-  using Utf8Iterator = utf8::unchecked::iterator<OctetIterator>;
-
-  BreakIterator(utf8::uint32_t delim, const OctetIterator& begin,
+  BreakIterator(uint32_t delim, const OctetIterator& begin,
                 const OctetIterator& end)
     : _delim{delim}, _wbegin{begin}, _wend{begin}, _end{end} {
     if (!Done()) {
@@ -243,20 +242,27 @@ class BreakIterator {
  private:
   void Next() {
     _wbegin = _wend;
-    _wend = std::find(_wbegin, _end, _delim);
-    if (_wend != _end) {
-      _res.assign(_wbegin.base(), _wend.base());
-      ++_wend;
-    } else {
-      _res.assign(_wbegin.base(), _end.base());
+    OctetIterator it = _wbegin;
+    while (it != _end) {
+      const OctetIterator prev = it;
+      int sz = 0;
+      const auto cp = duckdb::Utf8Proc::UTF8ToCodepoint(&*it, sz);
+      it += sz > 0 ? sz : 1;
+      if (static_cast<uint32_t>(cp) == _delim) {
+        _res.assign(_wbegin, prev);
+        _wend = it;
+        return;
+      }
     }
+    _wend = _end;
+    _res.assign(_wbegin, _end);
   }
 
-  utf8::uint32_t _delim;
+  uint32_t _delim;
   std::string _res;
-  Utf8Iterator _wbegin;
-  Utf8Iterator _wend;
-  Utf8Iterator _end;
+  OctetIterator _wbegin;
+  OctetIterator _wend;
+  OctetIterator _end;
 };
 
 class EuroparlReader {
@@ -271,7 +277,7 @@ class EuroparlReader {
     if (!std::getline(_ifs, _line)) {
       return nullptr;
     }
-    if (utf8::find_invalid(_line.begin(), _line.end()) != _line.end()) {
+    if (!simdutf::validate_utf8(_line.data(), _line.size())) {
       return nullptr;
     }
 
