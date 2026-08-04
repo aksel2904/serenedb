@@ -46,12 +46,6 @@ class PhrasePosition final : public PosAttr, public Frequency {
     std::tie(_start, _end) = this->GetOffsets();
   }
 
-  explicit PhrasePosition(std::vector<typename Frequency::TermPosition>&& pos,
-                          PosAttr::value_t max_slop) noexcept
-    : Frequency{std::move(pos), max_slop} {
-    std::tie(_start, _end) = this->GetOffsets();
-  }
-
   explicit PhrasePosition(
     std::vector<typename Frequency::TermPosition>&& pos,
     PosAttr::value_t max_slop,
