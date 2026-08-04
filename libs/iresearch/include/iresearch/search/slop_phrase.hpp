@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -129,18 +130,35 @@ struct MatchScratch {
   std::vector<uint32_t> order;
 };
 
-// Test seam for the n == 2 fused merge-join (JoinPair), fixed and variadic.
-// Production leaves this false; tests set it to route n == 2 through the
-// generic gather + Run path and assert join-vs-generic equivalence over
-// identical data (the join bypasses gather, so this is the only way to run
-// both).
-inline bool gPairJoinDisabled = false;
+// Dev-only seams, compiled out of release builds: in a non-SDB_DEV build the
+// helpers are constant false and the alternate paths fold away.
+//
+// gPairJoinDisabled routes n == 2 through the generic gather + Run path
+// instead of the fused merge-join (JoinPair), so tests can assert
+// join-vs-generic equivalence over identical data.
+//
+// gOffsBulkGatherDisabled routes the offset-enabled gather through the scalar
+// per-position loop instead of the bulk ReadAll overload; the micro benchmark
+// sets it via a command-line flag for an in-binary A/B of the decode paths.
+//
+// Both are relaxed atomics so the reads stay data-race-free no matter which
+// thread toggles them; a relaxed load compiles to a plain load.
+#ifdef SDB_DEV
+inline std::atomic<bool> gPairJoinDisabled{false};
+inline std::atomic<bool> gOffsBulkGatherDisabled{false};
 
-// Bench seam for the offset-enabled read-all gather. Production leaves this
-// false; the micro benchmark sets it (via a command-line flag) to route the
-// Offs gather through the scalar per-position loop instead of the bulk
-// ReadAll overload, giving an in-binary A/B of the two decode paths.
-inline bool gOffsBulkGatherDisabled = false;
+inline bool PairJoinDisabled() noexcept {
+  return gPairJoinDisabled.load(std::memory_order_relaxed);
+}
+
+inline bool OffsBulkGatherDisabled() noexcept {
+  return gOffsBulkGatherDisabled.load(std::memory_order_relaxed);
+}
+#else
+constexpr bool PairJoinDisabled() noexcept { return false; }
+
+constexpr bool OffsBulkGatherDisabled() noexcept { return false; }
+#endif
 
 // (start, end) offsets of one token occurrence.
 struct PosOffset {
@@ -816,7 +834,7 @@ class SlopPhraseFrequency {
 
     // Two-slot phrases bypass gather + Run entirely: the fused
     // merge-join consumes the position iterators directly.
-    if (n == 2 && !detail::slop::gPairJoinDisabled) {
+    if (n == 2 && !detail::slop::PairJoinDisabled()) {
       return MatchPair();
     }
 
@@ -842,7 +860,7 @@ class SlopPhraseFrequency {
       } else {
         auto& starts = _slot_offs_start[i];
         auto& ends = _slot_offs_end[i];
-        if (detail::slop::gOffsBulkGatherDisabled) [[unlikely]] {
+        if (detail::slop::OffsBulkGatherDisabled()) [[unlikely]] {
           positions.clear();
           starts.Clear();
           ends.Clear();
@@ -1085,7 +1103,7 @@ class SlopVariadicPhraseFrequency {
 
     // Two-slot phrases bypass gather + Run entirely: the fused merge-join
     // consumes the merged per-slot position streams directly.
-    if (n == 2 && !detail::slop::gPairJoinDisabled) {
+    if (n == 2 && !detail::slop::PairJoinDisabled()) {
       return MatchPair();
     }
 

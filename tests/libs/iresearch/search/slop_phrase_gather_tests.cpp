@@ -24,9 +24,10 @@
 // n == 2 phrases - fixed and variadic alike - route to the merge-join in
 // production and never reach gather; gPairJoinDisabled exposes the generic
 // gather + Run path, and the pair_join_equivalence_* tests assert
-// join-vs-generic equivalence over identical data. The SlopOverlapMatcher
-// tests at the end pin the n >= 3 same-position (term-group) semantics of
-// spm::Run.
+// join-vs-generic equivalence over identical data. The seams exist only in
+// SDB_DEV builds, so those tests compile only under SDB_DEV. The
+// SlopOverlapMatcher tests at the end pin the n >= 3 same-position
+// (term-group) semantics of spm::Run and run in any build.
 
 #include "filter_test_case_base.hpp"
 #include "iresearch/analysis/token_attributes.hpp"
@@ -40,6 +41,8 @@
 namespace {
 
 namespace spm = irs::detail::slop;
+
+#ifdef SDB_DEV
 
 constexpr irs::field_id kField = tests::FieldIdFor("phrase_anl");
 
@@ -127,7 +130,11 @@ std::vector<OffsetMatch> CollectOffsets(const tests::PreparedFilter& prepared,
   return out;
 }
 
+#endif  // SDB_DEV
+
 }  // namespace
+
+#ifdef SDB_DEV
 
 class SlopGatherTestCase : public tests::FilterTestCaseBase {};
 
@@ -427,6 +434,8 @@ INSTANTIATE_TEST_SUITE_P(slop_gather_test, SlopGatherTestCase,
                                             ::testing::Values(tests::FormatInfo{
                                               "1_5simd"})),
                          SlopGatherTestCase::to_string);
+
+#endif  // SDB_DEV
 
 // SlopOverlapMatcher: n >= 3 same-position matching, driving
 // detail::slop::Run directly with synthetic per-slot position lists and

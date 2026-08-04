@@ -1484,10 +1484,17 @@ int main(int argc, char** argv) {
   // --disable-offs-bulk-gather: route the offset gather through the scalar
   // per-position loop (in-binary A/B against the bulk ReadAll path). Must be
   // stripped from argv before benchmark::Initialize, which rejects unknown
-  // flags.
+  // flags. The seam exists only in SDB_DEV builds; anywhere else the flag
+  // fails loudly instead of silently measuring the bulk path twice.
   for (int i = 1; i < argc;) {
     if (std::string_view{argv[i]} == "--disable-offs-bulk-gather") {
+#ifdef SDB_DEV
       spm::gOffsBulkGatherDisabled = true;
+#else
+      std::fprintf(stderr,
+                   "--disable-offs-bulk-gather requires an SDB_DEV build\n");
+      return 1;
+#endif
       for (int j = i; j + 1 < argc; ++j) {
         argv[j] = argv[j + 1];
       }
