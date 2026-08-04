@@ -49,19 +49,16 @@
 // same pass emits one EnumeratedMatch per valid tuple, so freq and the
 // enumerated count come from one walk and agree by construction.
 //
-// Gather: every slot is read in full via the bulk ReadAll decode. A
-// windowed seek-gather alternative (read the rarest slot, seek the rest
-// into slop-reachable windows) was built and then removed: intra-doc
-// position seek is a sequential decode in this format (iterator_pos.hpp
-// seek() walks every skipped position and its attributes), so windowing
-// saves no decode work and only adds per-window overhead - measured
-// 1.2-11x slower than read-all across skew ratios 1-60, slop 1-50, on
-// shallow and multi-block postings alike. See the removal note in the PR.
+// Gather: every slot is read in full via the bulk ReadAll decode. Windowed
+// gathering (seeking non-anchor slots into slop-reachable windows) buys
+// nothing in this format: intra-doc position seek is itself a sequential
+// decode (iterator_pos.hpp seek() walks every skipped position and its
+// attributes), so a window skips no decode work.
 //
-// expected_step == 1 is the plain adjacent-term cost model (ES-verified);
-// expected_step > 1 adds per-slot positional gaps from push_back(term, offs).
-// Interval gaps (offs_min != offs_max) with slop are rejected upstream by
-// SDB_ENSURE.
+// expected_step == 1 is the plain adjacent-term cost model (matches
+// Elasticsearch); expected_step > 1 adds per-slot positional gaps from
+// push_back(term, offs). Interval gaps (offs_min != offs_max) with slop are
+// rejected at prepare (phrase_filter.cpp).
 
 // Profiling aid: with -DSLOP_PROFILE, force the matcher (Run) and the
 // pair join (JoinPair) out of line so a profiler can split matching vs
@@ -231,8 +228,8 @@ class UninitU32Buf {
   size_t _cap = 0;
 };
 
-// n == 2 fused merge-join over two forward-only position iterators, replacing
-// gather + Run for two-slot phrases. Anchor positions are read
+// n == 2 fused merge-join over two forward-only position iterators, used
+// instead of gather + Run for two-slot phrases. Anchor positions are read
 // straight off their iterator; partner positions are decoded exactly once
 // into a sliding buffer bounded by the anchor window [pa - w, pa + w],
 // w = slop + expected (the coverage window). Candidates are then
@@ -578,7 +575,7 @@ struct EnumeratedMatch {
 // Gate for the duplicate-position check: true when groups are absent
 // (variadic / opt-out; the check is then global) or when some group
 // holds two or more slots (the check is then scoped per group, see
-// CountFromAnchor). ES-verified rule: uniqueness applies only between
+// CountFromAnchor). Elasticsearch semantics: uniqueness applies only between
 // slots of one group (a connectivity component of query term sets);
 // slots of different groups may share a position, the delta-0 step
 // costing 1 via StepCost, so excluded at slop 0.
@@ -1156,7 +1153,7 @@ class SlopVariadicPhraseFrequency {
 
     // Uniqueness is scoped to slot groups: connectivity components of the
     // per-segment query term sets, computed at prepare-collect and carried
-    // in TermInterval::term_group (ES-verified rule).
+    // in TermInterval::term_group (Elasticsearch semantics).
     std::vector<detail::slop::EnumeratedMatch>* collect = nullptr;
     if constexpr (kHasOffsets && HasFreq) {
       collect = &_enumerated;

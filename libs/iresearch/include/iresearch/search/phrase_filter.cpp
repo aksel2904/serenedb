@@ -291,11 +291,12 @@ FixedPhraseQuery::positions_t MakeFixedPositions(
   return positions;
 }
 
-// Slot connectivity components over query term sets, per segment. The
-// ES-verified rule detects repeats over the terms of the QUERY, so literal
-// parts contribute their full query-level sets (a shared term absent from
-// the segment still connects its slots), while pattern parts have no
-// query-level set and contribute their per-segment expansion instead.
+// Slot connectivity components over query term sets, per segment. Repeats
+// are detected over the terms of the QUERY (Elasticsearch semantics), so
+// literal parts contribute their full query-level sets (a shared term
+// absent from the segment still connects its slots), while pattern parts
+// have no query-level set and contribute their per-segment expansion
+// instead.
 ManagedVector<uint32_t> ComputeTermGroups(
   const ByPhraseOptions& options,
   const std::vector<std::vector<bstring>>& part_terms,

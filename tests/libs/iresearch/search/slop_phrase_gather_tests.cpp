@@ -140,7 +140,7 @@ class SlopGatherTestCase : public tests::FilterTestCaseBase {};
 
 // Pair-join equivalence: the n == 2 merge-join (production default) must
 // produce exactly the docs the generic gather + Run path does;
-// gPairJoinDisabled exposes the legacy path.
+// gPairJoinDisabled exposes the generic path.
 TEST_P(SlopGatherTestCase, pair_join_equivalence_fixed) {
   {
     tests::JsonDocGenerator gen(resource("phrase_sequential.json"),
@@ -215,7 +215,7 @@ TEST_P(SlopGatherTestCase, pair_join_equivalence_offsets) {
 
 // Variadic pair-join equivalence: an n == 2 variadic phrase (a term set per
 // slot, here from prefix expansion) routes to the same merge-join through
-// MergedPosStream. Same join-vs-legacy discipline as the fixed test.
+// MergedPosStream. Same join-vs-generic discipline as the fixed test.
 // Duplicate positions inside a slot (same-position synonyms) cannot occur
 // on this corpus; that case is pinned by the merged-stream fuzz oracle.
 TEST_P(SlopGatherTestCase, pair_join_equivalence_variadic) {
