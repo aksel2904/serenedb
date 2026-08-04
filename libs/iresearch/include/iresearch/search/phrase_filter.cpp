@@ -42,6 +42,7 @@
 #include "iresearch/search/top_terms_selector.hpp"
 #include "iresearch/search/wildcard_filter.hpp"
 #include "iresearch/utils/automaton_utils.hpp"
+#include "pg/sql_exception_macro.h"
 
 namespace irs {
 namespace {
@@ -233,6 +234,15 @@ bool Valid(const TermReader* reader) noexcept {
   return reader != nullptr && (reader->meta().index_features &
                                FixedPhraseQuery::kRequiredFeatures) ==
                                 FixedPhraseQuery::kRequiredFeatures;
+}
+
+bool HasIntervalOffsets(const ByPhraseOptions& options) noexcept {
+  for (const auto& info : options) {
+    if (info.offs_min != info.offs_max) {
+      return true;
+    }
+  }
+  return false;
 }
 
 PhraseQueryKind GetKind(irs::field_id field, const ByPhraseOptions& options) {
@@ -508,7 +518,14 @@ QueryBuilder::ptr ByPhrase::PrepareSegment(const SubReader& segment,
                                            const PrepareContext& ctx) const {
   auto sub_ctx = ctx;
   sub_ctx.Boost(Boost());
-  switch (GetKind(field_id(), options())) {
+  const auto kind = GetKind(field_id(), options());
+  if (kind == PhraseQueryKind::kFixed || kind == PhraseQueryKind::kVariadic) {
+    // Rejected before any per-segment work; Execute relies on this via
+    // SDB_ASSERT (see phrase_query.cpp).
+    SDB_ENSURE(options().slop() == 0 || !HasIntervalOffsets(options()),
+               "slop and intervals are mutually exclusive");
+  }
+  switch (kind) {
     case PhraseQueryKind::kEmpty:
       return QueryBuilder::Empty();
     case PhraseQueryKind::kSingleWord:

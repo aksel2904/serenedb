@@ -106,8 +106,7 @@ DocIterator::ptr FixedPhraseQuery::Execute(const ExecutionContext& ctx,
       sdb::basics::downCast<FixedTermPositionImpl<false>>(pos), *position++);
   }
 
-  SDB_ENSURE(this->slop == 0 || !has_intervals,
-             "slop and intervals are mutually exclusive");
+  SDB_ASSERT(this->slop == 0 || !has_intervals);
 
   if (this->slop > 0) {
     auto expected_steps = BuildExpectedSteps(this->positions);
@@ -160,8 +159,7 @@ DocIterator::ptr FixedPhraseQuery::ExecuteWithOffsets(
     return DocIterator::empty();
   }
 
-  SDB_ENSURE(this->slop == 0 || !has_intervals,
-             "slop and intervals are mutually exclusive");
+  SDB_ASSERT(this->slop == 0 || !has_intervals);
 
   if (this->slop > 0) {
     auto* reader = phrase_state->reader;
@@ -364,8 +362,7 @@ DocIterator::ptr VariadicPhraseQuery::Execute(const ExecutionContext& ctx,
   }
   SDB_ASSERT(term_state == std::end(phrase_state->terms));
 
-  SDB_ENSURE(this->slop == 0 || !has_intervals,
-             "slop and intervals are mutually exclusive");
+  SDB_ASSERT(this->slop == 0 || !has_intervals);
 
   // Slop is meaningless for a single slot; the plain path below already
   // has the degenerate (term-query-like) semantics ES uses for it.
@@ -444,8 +441,7 @@ DocIterator::ptr VariadicPhraseQuery::ExecuteWithOffsets(
     return DocIterator::empty();
   }
 
-  SDB_ENSURE(this->slop == 0 || !has_intervals,
-             "slop and intervals are mutually exclusive");
+  SDB_ASSERT(this->slop == 0 || !has_intervals);
 
   // Slop is meaningless for a single slot; the plain path below already
   // has the degenerate (term-query-like) semantics ES uses for it.
