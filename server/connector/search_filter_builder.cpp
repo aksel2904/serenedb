@@ -1211,9 +1211,8 @@ bool TryDispatchBoostCast(irs::BooleanFilter& parent, const FilterContext& ctx,
 }
 
 // `(...)::slop(N)` -- records the phrase-slop budget in ctx and recurses.
-// Consumed only by FromPhrase; every other leaf rejects a non-zero slop
-// via RejectSlopOnNonPhrase. Cast-only shape: slop-modifier casts throw
-// at runtime, so they never fold into constants.
+// Cast-only shape: slop-modifier casts throw at runtime, so they never
+// fold into constants.
 bool TryDispatchSlopCast(irs::BooleanFilter& parent, const FilterContext& ctx,
                          const SearchColumnInfo& column_info,
                          const duckdb::Expression& peeled) {

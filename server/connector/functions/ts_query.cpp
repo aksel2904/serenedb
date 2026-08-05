@@ -454,7 +454,7 @@ void RegisterTSQueryTypes(duckdb::ExtensionLoader& loader) {
       return type;
     });
 
-  // `slop(<budget>)` parameterised type: parallel to tokenize/boost,
+  // `slop(<budget>)` parameterized type: parallel to tokenize/boost,
   // with a BIGINT modifier. The budget has no struct child to fold
   // into, so every slop-modifier cast throws at runtime (see the
   // HasSlopModifier guards in the cast binders); the surviving cast

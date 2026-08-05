@@ -131,6 +131,9 @@ a
 2
 6
 
+statement ok
+DEALLOCATE sp_slop;
+
 # ::slop on a scalar compound bucket: the argument renders through the
 # same structured-text path and the re-bound leaf consumes the budget.
 # List buckets cannot carry modifier-typed elements: there is no

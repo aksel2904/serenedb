@@ -332,9 +332,6 @@ std::optional<std::string> RenderCast(duckdb::ClientContext& context,
     return RenderTokenized(std::move(*child), tokenizer);
   }
   if (const auto slop = TryGetSlopModifier(target)) {
-    if (*slop < 0) {
-      return std::nullopt;
-    }
     auto child = RenderTSQueryExpression(context, cast.Child());
     if (!child) {
       return std::nullopt;

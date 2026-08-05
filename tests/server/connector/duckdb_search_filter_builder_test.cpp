@@ -6965,8 +6965,7 @@ TEST_F(SearchFilterBuilderTest, test_SlopModifierOnBareStringRejected) {
   // 'foo'::TSQUERY::slop(2): the string cast folds to a TSQUERY value,
   // the slop cast throws at runtime so it survives to the walker, and
   // the budget lands on a term leaf. Rejected -- a single literal has
-  // no term pairs to reorder. Before the tsquery rework the whole
-  // chain const-folded and the budget silently disappeared.
+  // no term pairs to reorder.
   std::vector<ColumnSpec> columns{
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;  // unused on the negative path
@@ -7158,9 +7157,8 @@ TEST_F(SearchFilterBuilderTest, test_SlopModifierOnTsqueryPhraseRejected) {
 
 TEST_F(SearchFilterBuilderTest, test_SlopModifierTokenizeChainOnBareString) {
   // 'quick fox'::tokenize('keyword')::slop(2): both modifier casts
-  // throw at runtime, so neither folds away (the pre-rework binder
-  // erased both over a bare literal). 'keyword' makes the inner text a
-  // single raw term, and slop on a term leaf is rejected.
+  // throw at runtime, so neither folds away. 'keyword' makes the inner
+  // text a single raw term, and slop on a term leaf is rejected.
   std::vector<ColumnSpec> columns{
     {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
   irs::And expected;  // unused on the negative path
