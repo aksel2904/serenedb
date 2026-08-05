@@ -104,6 +104,34 @@ a
 6
 
 # ----------------------------------------------------------------------
+# ::slop composes through the value path: the fold renders the leg back
+# into structured text and the re-bound phrase consumes the budget.
+# Row 1 discriminates slop=1 from the exact phrase.
+# ----------------------------------------------------------------------
+
+query
+SELECT a FROM sloppy_idx WHERE b @@ (ts_phrase('quick fox')::slop(1) || ts_phrase('slow grey')) ORDER BY a;
+----
+a
+1
+2
+5
+6
+
+# Structured text with ::slop arriving as a prepared parameter re-parses
+# through the whitelist.
+statement ok
+PREPARE sp_slop AS SELECT a FROM sloppy_idx WHERE b @@ $1 ORDER BY a;
+
+query
+EXECUTE sp_slop('ts_phrase(''quick fox'')::slop(1)');
+----
+a
+1
+2
+6
+
+# ----------------------------------------------------------------------
 # Exact gaps compose with the sloppy form: quick <exactly one word> fox.
 # ----------------------------------------------------------------------
 
@@ -134,6 +162,19 @@ SELECT a FROM sloppy_idx WHERE b @@ ts_sloppy_phrase('quick', 2, [1, 3], 'fox');
 # ::slop on a non-phrase leaf.
 statement error
 SELECT a FROM sloppy_idx WHERE b @@ ts_like('quick')::slop(2);
+
+# ::slop over NULL: casting a NULL constant retypes it without a cast
+# node, so the modifier dissolves with the NULL and the predicate
+# degrades to an empty match -- same NULL propagation as the function
+# form above.
+query
+SELECT a FROM sloppy_idx WHERE b @@ NULL::tsquery::slop(2) ORDER BY a;
+----
+a
+
+# Slop on a tsquery_phrase / ## part.
+statement error
+SELECT a FROM sloppy_idx WHERE b @@ tsquery_phrase(ts_phrase('quick')::slop(1), ts_phrase('fox'), 2);
 
 # ::slop applied twice.
 statement error

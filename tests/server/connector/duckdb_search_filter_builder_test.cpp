@@ -7097,6 +7097,52 @@ TEST_F(SearchFilterBuilderTest, test_SlopModifierOnPhraseSeqRejected) {
                "only valid on a phrase");
 }
 
+TEST_F(SearchFilterBuilderTest, test_SlopModifierInsideOr) {
+  // ts_phrase('a b')::slop(2) || ts_phrase('c d') -- the slop cast sits
+  // on one leg of a foldable combinator. The fold renders the leg back
+  // into structured text (RenderCast slop branch + whitelist), and the
+  // re-bound phrase leaf consumes the budget; the other leg stays exact.
+  std::vector<ColumnSpec> columns{
+    {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "category"}};
+  irs::And expected;
+  auto& or_filter = expected.add<irs::Or>();
+  AddSloppyPhraseFilter(or_filter, 1, {"a", "b"}, 2);
+  AddPhraseFilter(or_filter, 1, {"c", "d"});
+  AssertFilter(expected,
+               "SELECT * FROM foo WHERE category @@ "
+               "(ts_phrase('a b')::slop(2) || ts_phrase('c d'))",
+               columns, true, SegmentationAnalyzerProvider);
+}
+
+TEST_F(SearchFilterBuilderTest, test_SlopModifierOnTsqueryPhrasePart) {
+  // Slop on an argument of tsquery_phrase: per-part slop has no ES
+  // analog and the composite phrase cannot honor it. Same rule
+  // covers `##` legs (both go through EmitPhraseSeq).
+  std::vector<ColumnSpec> columns{
+    {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "b"}};
+  irs::And expected;  // unused on the negative path
+  AssertFilter(expected,
+               "SELECT * FROM foo WHERE b @@ "
+               "tsquery_phrase(ts_phrase('hello')::slop(1), "
+               "ts_phrase('world'), 3)",
+               columns, false, SegmentationAnalyzerProvider,
+               "must not carry a slop modifier");
+}
+
+TEST_F(SearchFilterBuilderTest, test_SlopModifierOnNullDeclined) {
+  // NULL::TSQUERY::slop(2) -- the NULL constant retypes through both
+  // casts without cast nodes, so `@@` sees a constant NULL argument and
+  // folds to SQL NULL at bind. The builder declines the predicate and
+  // row-level NULL semantics yield 0 rows (pinned in
+  // sloppy_phrase.test); the slop budget dissolves with the NULL.
+  std::vector<ColumnSpec> columns{
+    {.id = 1, .type = duckdb::LogicalType::VARCHAR, .name = "category"}};
+  irs::And expected;  // not claimed
+  AssertFilter(expected,
+               "SELECT * FROM foo WHERE category @@ NULL::TSQUERY::slop(2)",
+               columns, false, SegmentationAnalyzerProvider);
+}
+
 TEST_F(SearchFilterBuilderTest, test_SlopModifierOnTsqueryPhraseRejected) {
   // tsquery_phrase(...)::slop(2) -- same rule as `##`.
   std::vector<ColumnSpec> columns{

@@ -603,6 +603,18 @@ void EmitPhraseSeq(irs::BooleanFilter& parent, const FilterContext& ctx,
   // range gaps.
   for (size_t i = 0; i < seq.parts.size(); ++i) {
     const auto& part_expr_ref = UnwrapTSQueryCast(*seq.parts[i]);
+    // Per-part slop has no ES analog and the composite phrase cannot
+    // honor it; reject like the boost/tokenize part modifiers below
+    // instead of falling into the generic expression-class error.
+    if (part_expr_ref.GetExpressionClass() ==
+          duckdb::ExpressionClass::BOUND_CAST &&
+        TryGetSlopModifier(
+          part_expr_ref.Cast<duckdb::BoundCastExpression>().GetReturnType())) {
+      THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
+                      ERR_MSG("## part must not carry a slop modifier"),
+                      ERR_HINT("Use ts_phrase(...)::slop(N) or "
+                               "ts_sloppy_phrase(...) for a sloppy phrase."));
+    }
     const PhraseGap gap = i > 0 ? seq.gaps[i - 1] : PhraseGap{};
 
     TSQueryOp leaf_op;
