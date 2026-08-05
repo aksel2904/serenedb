@@ -110,7 +110,11 @@ inline bool IsExtended(char type) {
 // COPY direction over a stdin/stdout pipe. The patched parser rewrites STDIN /
 // STDOUT to /dev/stdin / /dev/stdout; a COPY to/from a real file classifies as
 // None (it runs through the normal Prepare/Execute path).
-enum class CopyDir : uint8_t { None, FromStdin, ToStdout };
+enum class CopyDir : uint8_t {
+  None,
+  FromStdin,
+  ToStdout,
+};
 
 struct CopyKind {
   CopyDir dir = CopyDir::None;
@@ -2208,33 +2212,7 @@ void PgWireSession<Kind>::DescribeStatement(Statement& stmt) {
     WriteEmptyFrame(this->_send, PQ_MSG_NO_DATA);
     return;
   }
-  const auto* types = &prepared.GetTypes();
-  const auto* names = &prepared.GetNames();
-  ClosingPending pending;
-  duckdb::vector<duckdb::Identifier> pending_names;
-  if (!prepared.named_param_map.empty() &&
-      std::ranges::any_of(*types, [](const duckdb::LogicalType& type) {
-        return type.id() == duckdb::LogicalTypeId::UNKNOWN ||
-               type.id() == duckdb::LogicalTypeId::INVALID;
-      })) {
-    duckdb::vector<duckdb::Value> dummy;
-    dummy.reserve(param_count);
-    for (size_t i = 0; i < param_count; ++i) {
-      auto type = ResolveExpectedType(prepared.data->value_map, i);
-      duckdb::Value value{"1"};
-      if (!value.DefaultTryCastAs(type)) {
-        value = duckdb::Value{type};
-      }
-      dummy.emplace_back(std::move(value));
-    }
-    pending = PendingQueryEnsured(prepared, dummy, nullptr);
-    if (!pending->HasError()) {
-      types = &pending->types;
-      pending_names = duckdb::StringsToIdentifiers(pending->names);
-      names = &pending_names;
-    }
-  }
-  WriteRowDescription(this->_send, *types, *names, {});
+  WriteResolvedRowDescription(prepared, nullptr, {});
 }
 
 template<SocketKind Kind>
@@ -2254,8 +2232,49 @@ void PgWireSession<Kind>::DescribePortal(Portal& portal) {
   if (_txn_state->StatusByte() == 'E') {
     ThrowAbortedTransaction();
   }
+  WriteResolvedRowDescription(prepared, &portal.bind_info.param_values,
+                              portal.bind_info.output_formats);
+}
+
+// A parameterized template may carry unresolved output types (duckdb defers
+// full binding until the parameter types are known); probe-plan to describe
+// the real columns, falling back to the template. `params` are the portal's
+// bound values, or null for a statement-level Describe -- the probe then
+// synthesizes type-derived placeholders.
+template<SocketKind Kind>
+void PgWireSession<Kind>::WriteResolvedRowDescription(
+  duckdb::PreparedStatement& prepared, duckdb::vector<duckdb::Value>* params,
+  std::span<const sdb::pg::VarFormat> formats) {
+  const auto unresolved = [](const duckdb::LogicalType& type) {
+    return type.id() == duckdb::LogicalTypeId::UNKNOWN ||
+           type.id() == duckdb::LogicalTypeId::INVALID;
+  };
+  if (!prepared.named_param_map.empty() &&
+      std::ranges::any_of(prepared.GetTypes(), unresolved)) {
+    duckdb::vector<duckdb::Value> placeholders;
+    if (!params) {
+      const auto param_count = prepared.named_param_map.size();
+      placeholders.reserve(param_count);
+      for (size_t i = 0; i < param_count; ++i) {
+        auto type = ResolveExpectedType(prepared.data->value_map, i);
+        duckdb::Value value{"1"};
+        if (!value.DefaultTryCastAs(type)) {
+          value = duckdb::Value{type};
+        }
+        placeholders.emplace_back(std::move(value));
+      }
+      params = &placeholders;
+    }
+    ClosingPending pending = PendingQueryEnsured(prepared, *params, nullptr);
+    if (!pending->HasError()) {
+      WriteRowDescription(this->_send, pending->types,
+                          duckdb::StringsToIdentifiers(pending->names),
+                          formats);
+      return;
+    }
+  }
   WriteRowDescription(this->_send, prepared.GetTypes(), prepared.GetNames(),
-                      portal.bind_info.output_formats);
+                      formats);
 }
 
 template<SocketKind Kind>
@@ -2520,6 +2539,14 @@ yaclib::Task<> PgWireSession<Kind>::Run() {
     }
     metrics::Sub(metrics::Gauge::PgConnections);
   };
+  // Detach-then-Unregister on every exit path, while _conn is still alive, so
+  // a racing Cancel/Terminate can never touch a torn-down context or session.
+  absl::Cleanup cancel_guard = [this] {
+    _cancel_token->Detach();
+    if (_cancel && _cancel_key) {
+      _cancel->Unregister(_cancel_key);
+    }
+  };
   // The writer drains committed bytes (incl. startup/auth replies) on a raw
   // `this`, concurrently with everything below; joined before this frame ends.
   auto writer = this->SendWriter();
@@ -2763,13 +2790,6 @@ auto PgWireSession<Kind>::NegotiateStartup(StartupRequest& startup)
 
 template<SocketKind Kind>
 yaclib::Future<> PgWireSession<Kind>::SpawnSession() {
-  // The cancel token is registered before the spawn so BackendKeyData can be
-  // sent in the startup burst; the ClientContext is attached to it duck-side
-  // after SetupConnection.
-  _cancel_token = std::make_shared<CancelToken>();
-  if (_cancel) {
-    _cancel_key = _cancel->Register(_cancel_token);
-  }
   this->_task = duckdb::make_shared_ptr<CpuResumer>(
     duckdb::TaskScheduler::GetScheduler(DuckDBEngine::Instance().instance()),
     *this->_ioexec);
@@ -2806,14 +2826,6 @@ yaclib::Future<> PgWireSession<Kind>::SessionMain() {
   // From here every resume is a fresh Execute() frame on a duck worker.
   absl::Cleanup finish_guard = [this] { this->_task->Finish(); };
   {
-    // Detach-then-Unregister on every exit path, while _conn is still alive,
-    // so a racing CancelRequest can never touch a torn-down context.
-    absl::Cleanup cancel_guard = [this] {
-      _cancel_token->Detach();
-      if (_cancel && _cancel_key) {
-        _cancel->Unregister(_cancel_key);
-      }
-    };
     if (SetupConnection()) {
       {
         absl::MutexLock lock{&_cancel_token->mu};

@@ -20,6 +20,7 @@
 
 #include "connector/inverted_store_index.h"
 
+#include <absl/algorithm/container.h>
 #include <absl/cleanup/cleanup.h>
 
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
@@ -30,18 +31,20 @@
 #include <duckdb/storage/storage_manager.hpp>
 #include <duckdb/storage/table/append_state.hpp>
 #include <duckdb/storage/table_io_manager.hpp>
+#include <iterator>
 #include <string>
 #include <vector>
 
 #include "basics/assert.h"
 #include "basics/down_cast.h"
 #include "basics/log.h"
+#include "basics/primary_key.hpp"
 #include "catalog/catalog.h"
 #include "catalog/inverted_index.h"
 #include "catalog/table.h"
 #include "connector/duckdb_client_state.h"
 #include "connector/duckdb_index_utils.h"
-#include "connector/primary_key.hpp"
+#include "connector/index_expression.hpp"
 #include "connector/search_sink_writer.hpp"
 #include "pg/connection_context.h"
 #include "search/inverted_index_storage.h"
@@ -73,6 +76,52 @@ std::string RowIdKey(duckdb::row_t row) {
   return key;
 }
 
+struct FilteredChunk {
+  duckdb::DataChunk chunk;
+  duckdb::Vector row_ids;
+  duckdb::idx_t count = 0;
+
+  explicit FilteredChunk(const duckdb::Vector& rows)
+    : row_ids(rows.GetType(), nullptr, 0) {}
+};
+
+duckdb::unique_ptr<FilteredChunk> CalcFilter(
+  const duckdb::Expression* predicate, duckdb::DataChunk& chunk,
+  duckdb::Vector& row_ids, ObjectId table_id,
+  std::span<const catalog::Column::Id> col_ids,
+  duckdb::ClientContext& context) {
+  if (!predicate) {
+    return nullptr;
+  }
+  SDB_ASSERT(predicate->GetReturnType() == duckdb::LogicalType::BOOLEAN);
+  auto result =
+    EvaluateExprOverChunk(*predicate, chunk, table_id, col_ids, context);
+  const auto total = chunk.size();
+  duckdb::UnifiedVectorFormat fmt;
+  result.ToUnifiedFormat(total, fmt);
+  const auto* values = duckdb::UnifiedVectorFormat::GetData<bool>(fmt);
+  duckdb::SelectionVector sel(total);
+  duckdb::idx_t kept = 0;
+  for (duckdb::idx_t i = 0; i < total; ++i) {
+    const auto idx = fmt.sel->get_index(i);
+    if (fmt.validity.RowIsValid(idx) && values[idx]) {
+      sel.set_index(kept++, i);
+    }
+  }
+  if (kept == total) {
+    return nullptr;
+  }
+  auto filtered = duckdb::make_uniq<FilteredChunk>(row_ids);
+  filtered->count = kept;
+  if (kept != 0) {
+    filtered->chunk.InitializeEmpty(chunk.GetTypes());
+    filtered->chunk.Reference(chunk);
+    filtered->chunk.Slice(sel, kept);
+    filtered->row_ids.Slice(row_ids, sel, kept);
+  }
+  return filtered;
+}
+
 }  // namespace
 
 struct InvertedStoreIndex::ReplaySession {
@@ -82,6 +131,8 @@ struct InvertedStoreIndex::ReplaySession {
   std::shared_ptr<const catalog::Table> table;
   std::vector<duckdb::idx_t> ref_positions;
   std::vector<catalog::Column::Id> ref_col_ids;
+  std::vector<catalog::Column::Id> all_col_ids;
+  duckdb::unique_ptr<duckdb::Expression> predicate_expr;
   duckdb::Connection expr_conn;
   irs::IndexWriter::Transaction trx;
   std::unique_ptr<DuckDBSearchSinkInsertWriter> insert_writer;
@@ -150,7 +201,7 @@ void InvertedStoreIndex::OnReplayRange(duckdb::idx_t commit_offset) {
 
 void InvertedStoreIndex::ReplayAppend(duckdb::DataChunk& chunk,
                                       duckdb::Vector& row_ids) {
-  const auto count = chunk.size();
+  auto count = chunk.size();
   if (count == 0) {
     return;
   }
@@ -161,14 +212,18 @@ void InvertedStoreIndex::ReplayAppend(duckdb::DataChunk& chunk,
   }
   auto& inverted = *session.index;
   if (!session.insert_writer) {
-    auto chunk_column_ids = TableChunkColumnIds(*session.table);
+    session.all_col_ids = TableChunkColumnIds(*session.table);
     for (duckdb::idx_t pos = 0;
-         pos < chunk.ColumnCount() && pos < chunk_column_ids.size(); ++pos) {
-      if (!inverted.ReferencesColumn(chunk_column_ids[pos])) {
+         pos < chunk.ColumnCount() && pos < session.all_col_ids.size(); ++pos) {
+      if (!inverted.ReferencesColumn(session.all_col_ids[pos])) {
         continue;
       }
       session.ref_positions.push_back(pos);
-      session.ref_col_ids.push_back(chunk_column_ids[pos]);
+      session.ref_col_ids.push_back(session.all_col_ids[pos]);
+    }
+    if (inverted.Predicate()) {
+      session.predicate_expr = DeserializeBoundExpression(
+        inverted.Predicate()->serialized_expr, *session.expr_conn.context);
     }
     session.insert_writer = std::make_unique<DuckDBSearchSinkInsertWriter>(
       session.trx, MakeTokenizerProvider(session.snapshot, inverted),
@@ -178,8 +233,20 @@ void InvertedStoreIndex::ReplayAppend(duckdb::DataChunk& chunk,
                .column = inverted.GetOptions().pk_column});
   }
 
+  auto filtered =
+    CalcFilter(session.predicate_expr.get(), chunk, row_ids, _table_id,
+               session.all_col_ids, *session.expr_conn.context);
+  if (filtered && filtered->count == 0) {
+    session.trx.AdvanceQueries(1);
+    ++session.total_ops;
+    return;
+  }
+  auto& feed_chunk = filtered ? filtered->chunk : chunk;
+  auto& feed_rows = filtered ? filtered->row_ids : row_ids;
+  count = filtered ? filtered->count : count;
+
   duckdb::UnifiedVectorFormat row_fmt;
-  row_ids.ToUnifiedFormat(count, row_fmt);
+  feed_rows.ToUnifiedFormat(count, row_fmt);
   std::vector<std::string> keys(count);
   std::vector<std::string_view> key_views(count);
   for (duckdb::idx_t i = 0; i < count; ++i) {
@@ -190,7 +257,7 @@ void InvertedStoreIndex::ReplayAppend(duckdb::DataChunk& chunk,
   }
 
   auto& ins = *session.insert_writer;
-  ins.Init(count, PkChunk{.keys = key_views, .column = &row_ids});
+  ins.Init(count, PkChunk{.keys = key_views, .column = &feed_rows});
   for (duckdb::idx_t k = 0; k < session.ref_positions.size(); ++k) {
     auto col_id = session.ref_col_ids[k];
     const auto* col = session.table->ColumnById(col_id);
@@ -198,11 +265,11 @@ void InvertedStoreIndex::ReplayAppend(duckdb::DataChunk& chunk,
       continue;
     }
     const ColumnDescriptor desc{col_id, col->type};
-    ins.SwitchColumn(desc, chunk.data[session.ref_positions[k]], count);
+    ins.SwitchColumn(desc, feed_chunk.data[session.ref_positions[k]], count);
   }
   if (auto indexed_exprs = ins.IndexedExpressions(); !indexed_exprs.empty()) {
-    EvaluateAndWriteIndexedExpressions(ins, indexed_exprs, chunk, _table_id,
-                                       session.ref_col_ids,
+    EvaluateAndWriteIndexedExpressions(ins, indexed_exprs, feed_chunk,
+                                       _table_id, session.ref_col_ids,
                                        *session.expr_conn.context, count);
   }
   ins.Finish();
@@ -276,15 +343,15 @@ duckdb::ErrorData InvertedStoreIndex::AppendImpl(duckdb::DataChunk& chunk,
 duckdb::ErrorData InvertedStoreIndex::AppendRows(
   ConnectionContext& conn, duckdb::DataChunk& chunk, duckdb::Vector& row_ids,
   std::span<const catalog::Column::Id> chunk_column_ids) {
-  const auto count = chunk.size();
-  if (count == 0) {
+  if (chunk.size() == 0) {
     return {};
   }
   duckdb::Connection expr_conn(*conn.GetClientContext().db);
   expr_conn.BeginTransaction();
   absl::Cleanup rollback_expr_conn = [&] { expr_conn.Rollback(); };
+  const catalog::ExpressionData* predicate = nullptr;
   auto writer = CreateInvertedIndexWriter<DuckDBWriteKind::Insert>(
-    _table_id, _index_id, conn, expr_conn.context.get());
+    _table_id, _index_id, conn, expr_conn.context.get(), &predicate);
   if (!writer) {
     return {};
   }
@@ -294,8 +361,22 @@ duckdb::ErrorData InvertedStoreIndex::AppendRows(
     return {};
   }
 
+  duckdb::unique_ptr<duckdb::Expression> pred;
+  if (predicate) {
+    pred = DeserializeBoundExpression(predicate->serialized_expr,
+                                      *expr_conn.context);
+  }
+  auto filtered = CalcFilter(pred.get(), chunk, row_ids, _table_id,
+                             chunk_column_ids, *expr_conn.context);
+  if (filtered && filtered->count == 0) {
+    return {};
+  }
+  auto& feed_chunk = filtered ? filtered->chunk : chunk;
+  auto& feed_rows = filtered ? filtered->row_ids : row_ids;
+  const auto count = filtered ? filtered->count : chunk.size();
+
   duckdb::UnifiedVectorFormat row_fmt;
-  row_ids.ToUnifiedFormat(count, row_fmt);
+  feed_rows.ToUnifiedFormat(count, row_fmt);
   std::vector<std::string> keys(count);
   std::vector<std::string_view> key_views(count);
   for (duckdb::idx_t i = 0; i < count; ++i) {
@@ -305,22 +386,22 @@ duckdb::ErrorData InvertedStoreIndex::AppendRows(
     key_views[i] = keys[i];
   }
 
-  writer->Init(count, PkChunk{.keys = key_views, .column = &row_ids});
+  writer->Init(count, PkChunk{.keys = key_views, .column = &feed_rows});
   for (duckdb::idx_t pos = 0;
-       pos < chunk.ColumnCount() && pos < chunk_column_ids.size(); ++pos) {
+       pos < feed_chunk.ColumnCount() && pos < chunk_column_ids.size(); ++pos) {
     auto col_id = chunk_column_ids[pos];
     const auto* col = table->ColumnById(col_id);
     if (!col) {
       continue;
     }
     const ColumnDescriptor desc{col_id, col->type};
-    writer->SwitchColumn(desc, chunk.data[pos], count);
+    writer->SwitchColumn(desc, feed_chunk.data[pos], count);
   }
   if (auto indexed_exprs = writer->IndexedExpressions();
       !indexed_exprs.empty()) {
-    EvaluateAndWriteIndexedExpressions(*writer, indexed_exprs, chunk, _table_id,
-                                       chunk_column_ids, *expr_conn.context,
-                                       count);
+    EvaluateAndWriteIndexedExpressions(*writer, indexed_exprs, feed_chunk,
+                                       _table_id, chunk_column_ids,
+                                       *expr_conn.context, count);
   }
   writer->Finish();
   conn.RegisterSearchFlush();
@@ -361,24 +442,50 @@ void InvertedStoreIndex::Delete(duckdb::IndexLock&, duckdb::DataChunk& chunk,
     ReplayDelete(chunk, row_ids);
     return;
   }
-  auto writer = CreateInvertedIndexWriter<DuckDBWriteKind::Delete>(
-    _table_id, _index_id, *conn);
-  if (!writer) {
+  std::shared_ptr<search::InvertedIndexStorage> storage;
+  if (auto inverted =
+        conn->CatalogSnapshot()->GetObject<catalog::InvertedIndex>(_index_id)) {
+    storage = inverted->GetData();
+  }
+  duckdb::UnifiedVectorFormat fmt;
+  row_ids.ToUnifiedFormat(count, fmt);
+  const auto* data = duckdb::UnifiedVectorFormat::GetData<duckdb::row_t>(fmt);
+  auto write_rows = [&](size_t n, auto&& row_at) {
+    auto writer = CreateInvertedIndexWriter<DuckDBWriteKind::Delete>(
+      _table_id, _index_id, *conn);
+    if (!writer) {
+      return;
+    }
+    writer->Init(n, {});
+    std::string key;
+    for (size_t i = 0; i < n; ++i) {
+      key.clear();
+      primary_key::AppendSigned(key, row_at(i));
+      writer->DeleteRow(key);
+    }
+    writer->Finish();
+    conn->RegisterSearchFlush();
+  };
+  if (storage && storage->IsDeleteLogOpen()) {
+    const auto log_begin = storage->DeleteLogRowidBegin();
+    const auto log_end = storage->DeleteLogRowidEnd();
+    std::vector<int64_t> native;
+    std::vector<int64_t> logged;
+    native.reserve(count);
+    logged.reserve(count);
+    for (duckdb::idx_t i = 0; i < count; ++i) {
+      const int64_t row = data[fmt.sel->get_index(i)];
+      (row < log_begin || row >= log_end ? native : logged).push_back(row);
+    }
+    if (!logged.empty() && !storage->AppendDeleteLog(std::move(logged))) {
+      absl::c_move(logged, std::back_inserter(native));
+    }
+    if (!native.empty()) {
+      write_rows(native.size(), [&](size_t i) { return native[i]; });
+    }
     return;
   }
-  duckdb::UnifiedVectorFormat row_fmt;
-  row_ids.ToUnifiedFormat(count, row_fmt);
-  writer->Init(count, {});
-  std::string key;
-  for (duckdb::idx_t i = 0; i < count; ++i) {
-    auto row = duckdb::UnifiedVectorFormat::GetData<duckdb::row_t>(
-      row_fmt)[row_fmt.sel->get_index(i)];
-    key.clear();
-    primary_key::AppendSigned(key, static_cast<int64_t>(row));
-    writer->DeleteRow(key);
-  }
-  writer->Finish();
-  conn->RegisterSearchFlush();
+  write_rows(count, [&](size_t i) { return data[fmt.sel->get_index(i)]; });
 }
 
 idx_t InvertedStoreIndex::TryDelete(

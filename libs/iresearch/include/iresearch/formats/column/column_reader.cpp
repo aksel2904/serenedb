@@ -56,7 +56,6 @@
 #include "iresearch/formats/column/array_column_reader.hpp"
 #include "iresearch/formats/column/col_reader.hpp"
 #include "iresearch/formats/column/internal/gather_arms.hpp"
-#include "iresearch/formats/column/internal/overflow_string_io.hpp"
 #include "iresearch/formats/column/list_column_reader.hpp"
 #include "iresearch/formats/column/struct_column_reader.hpp"
 #include "iresearch/formats/column/variant_column_reader.hpp"
@@ -139,22 +138,18 @@ ColumnMeta DeserializeColumnMeta(duckdb::Deserializer& d) {
   ColumnMeta meta;
   meta.id = static_cast<field_id>(d.ReadProperty<uint64_t>(0, "id"));
   meta.type = d.ReadProperty<duckdb::LogicalType>(1, "type");
-  const bool is_list_like = meta.type.id() == duckdb::LogicalTypeId::LIST ||
-                            meta.type.id() == duckdb::LogicalTypeId::MAP;
-  const duckdb::LogicalType data_stats_type =
-    is_list_like ? duckdb::LogicalType::UBIGINT : meta.type;
-  const auto data_physical = meta.type.InternalType();
-  d.Set<const duckdb::LogicalType&>(data_stats_type);
+  const auto stats_physical = meta.type.InternalType();
+  d.Set<const duckdb::LogicalType&>(meta.type);
   d.ReadList(
     2, "data", [&](duckdb::Deserializer::List& list, duckdb::idx_t /*j*/) {
       list.ReadObject([&](duckdb::Deserializer& so) {
-        meta.data.push_back(DeserializeColumnBlockMeta(so, data_physical));
+        meta.data.push_back(DeserializeColumnBlockMeta(so, stats_physical));
       });
     });
   d.Unset<const duckdb::LogicalType>();
-  const duckdb::LogicalType validity_type{duckdb::LogicalTypeId::VALIDITY};
-  const auto validity_physical = validity_type.InternalType();
-  d.Set<const duckdb::LogicalType&>(validity_type);
+  const duckdb::LogicalType validity_logical = duckdb::LogicalTypeId::VALIDITY;
+  const auto validity_physical = validity_logical.InternalType();
+  d.Set<const duckdb::LogicalType&>(validity_logical);
   d.ReadList(3, "validity",
              [&](duckdb::Deserializer::List& list, duckdb::idx_t /*j*/) {
                list.ReadObject([&](duckdb::Deserializer& so) {
@@ -235,6 +230,15 @@ bool ColumnReader::NullsInData() const noexcept {
 void ColumnReader::FinishStats(duckdb::BaseStatistics stats) {
   if (_validity) {
     stats.Merge(_validity->MergedStatistics());
+  } else if (_row_count > 0 && !_children.empty()) {
+    // A nested parent rebuilds its stats from CreateEmpty (its own blocks are
+    // plumbing, e.g. list offsets), so the null flags only come from the
+    // validity child -- and its absence means the writer counted every row
+    // valid (ColumnWriter::SealValidity). Scalars need none of this: their
+    // data block stats already carry the flags.
+    SDB_ASSERT(!stats.CanHaveNull(),
+               "column without a validity payload carries null-bearing stats");
+    stats.SetHasNoNull();
   }
   _stats = stats.ToUnique();
 }
@@ -303,9 +307,10 @@ std::unique_ptr<duckdb::ColumnSegment> ColumnReader::Open(
     /*block_id=*/0, /*offset=*/0, byte_size, /*segment_state=*/nullptr);
   if (_type.InternalType() == duckdb::PhysicalType::VARCHAR) {
     if (auto seg_state = segment->GetSegmentState()) {
-      seg_state->Cast<duckdb::UncompressedStringSegmentState>()
-        .overflow_reader =
-        duckdb::make_uniq<IndexInputOverflowReader>(ctx.In());
+      auto& str_state =
+        seg_state->Cast<duckdb::UncompressedStringSegmentState>();
+      str_state.overflow_reader = &ctx;
+      str_state.stream_reader = &ctx;
     }
   }
   return segment;
@@ -502,6 +507,114 @@ void ColumnReader::GatherDense(ScanState& s, uint64_t anchor,
   out.Slice(sel, hits);
 }
 
+duckdb::idx_t ColumnReader::GatherFilter(
+  ScanState& s, uint64_t anchor, duckdb::idx_t span,
+  duckdb::SelectionVector& sel, duckdb::idx_t sel_count,
+  const duckdb::TableFilter& filter, duckdb::TableFilterState& filter_state,
+  NullCheckKind null_check, duckdb::Vector& result) const {
+  const uint64_t cur = ColumnReader::GatherCursor(s);
+  SDB_ASSERT(anchor >= cur, "GatherFilter requires ascending rows");
+  if (anchor > cur) {
+    ColumnReader::Skip(s, anchor - cur);
+  }
+  BeginScanVector(s);
+  auto& seg = *s.segments.back();
+  const auto& codec = seg.GetCompressionFunction();
+  duckdb::idx_t approved = sel_count;
+  // The codec filter operates on one segment; a span that crosses the block
+  // boundary (blocks are not vector-aligned, e.g. dictionary-full splits on
+  // string columns) takes the decode path below -- ScanVector walks segments.
+  const bool within_segment =
+    (s.window.end - s.window.begin) - s.st.offset_in_column >= span;
+  const bool self_valid =
+    codec.validity == duckdb::CompressionValidity::NO_VALIDITY_REQUIRED;
+  // The codec filter needs the data segment alone to be validity-complete for
+  // the span: either the codec self-describes nulls (dict_fsst evaluates its
+  // dictionary once and filters rows by code), or the span's validity block is
+  // the all-valid EMPTY codec (rle evaluates its run values once and filters
+  // rows by run flag). Bare null checks keep the validity-only arm below, and
+  // null-bearing spans keep the decode arm.
+  const bool codec_filter =
+    within_segment && codec.filter &&
+    (self_valid || (null_check == NullCheckKind::None &&
+                    ValiditySpanAllValid(s, anchor, span)));
+  if (codec_filter) {
+    if (!self_valid) {
+      result.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
+      // The codec filter's evaluation reads the mask: reset it if an earlier
+      // null-bearing window dirtied it. A buffer-less mask is already
+      // all-valid.
+      auto& mask = duckdb::FlatVector::ValidityMutable(result);
+      if (!mask.AllValid()) {
+        mask.SetAllValid(span);
+      }
+    }
+    seg.Filter(s.st, span, result, sel, approved, filter, filter_state);
+    s.st.offset_in_column += span;
+    s.st.internal_index = s.st.offset_in_column;
+    // Codecs are picked per block: a later block of the same column may need
+    // the validity child (decode path below), whose cursor only moves
+    // relatively -- keep it in step with the data cursor.
+    if (_validity) {
+      SDB_ASSERT(!s.child_states.empty());
+      _validity->SkipRows(s.child_states[0], span);
+    }
+  } else if (within_segment && null_check != NullCheckKind::None &&
+             !self_valid) {
+    // Bare IS [NOT] NULL: the validity child alone answers it -- skip the
+    // data decode entirely (the data cursor still advances to stay in step).
+    SkipRows(s, span);
+    result.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
+    auto& mask = duckdb::FlatVector::ValidityMutable(result);
+    mask.SetAllValid(span);
+    if (_validity) {
+      SDB_ASSERT(!s.child_states.empty());
+      _validity->ScanVector(s.child_states[0], result, span,
+                            duckdb::ScanVectorType::SCAN_FLAT_VECTOR);
+    }
+    const bool want_valid = null_check == NullCheckKind::IsNotNull;
+    duckdb::idx_t kept = 0;
+    for (duckdb::idx_t k = 0; k < sel_count; ++k) {
+      const auto idx = sel.get_index(k);
+      if (mask.RowIsValid(idx) == want_valid) {
+        sel.set_index(kept++, idx);
+      }
+    }
+    approved = kept;
+  } else {
+    // Decode the span into `scratch`, then narrow the selection natively.
+    // When the span's validity block is the all-valid EMPTY codec, decoding
+    // the validity child would AND-combine nothing: scan the data alone and
+    // keep the validity cursor in step.
+    const bool all_valid = ValiditySpanAllValid(s, anchor, span);
+    result.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
+    duckdb::FlatVector::ValidityMutable(result).SetAllValid(span);
+    if (all_valid) {
+      ScanVector(s, result, span, duckdb::ScanVectorType::SCAN_FLAT_VECTOR);
+      if (_validity) {
+        SDB_ASSERT(!s.child_states.empty());
+        _validity->SkipRows(s.child_states[0], span);
+      }
+    } else {
+      ColumnReader::ScanCount(s, result, span, 0);
+    }
+    duckdb::ColumnSegment::FilterSelection(sel, result, filter_state, span,
+                                           approved);
+  }
+  return approved;
+}
+
+bool ColumnReader::ValiditySpanAllValid(ScanState& s, uint64_t anchor,
+                                        duckdb::idx_t span) const {
+  if (!_validity) {
+    return true;
+  }
+  SDB_ASSERT(!s.child_states.empty());
+  const auto w = _validity->Locate(anchor, s.child_states[0].window);
+  return anchor + span <= w.end && _validity->_segments[w.block].codec->type ==
+                                     duckdb::CompressionType::COMPRESSION_EMPTY;
+}
+
 void ColumnReader::SkipRows(ScanState& s, duckdb::idx_t count) const {
   duckdb::idx_t remaining = count;
   while (remaining > 0) {
@@ -549,6 +662,7 @@ std::unique_ptr<ColumnReader> ColumnReader::Make(ColumnMeta&& meta) {
                                                   std::move(validity),
                                                   std::move(meta.variant_rgs));
       break;
+    case duckdb::LogicalTypeId::UNION:
     case duckdb::LogicalTypeId::STRUCT:
       col = std::make_unique<StructColumnReader>(meta.id, std::move(meta.type),
                                                  std::move(validity),

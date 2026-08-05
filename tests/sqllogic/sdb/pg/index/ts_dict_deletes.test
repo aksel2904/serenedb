@@ -1,5 +1,11 @@
 hash-threshold 100
 
+statement ok
+SET compaction_interval = 0
+
+statement ok
+SET refresh_interval = 0
+
 # Deleted documents are per-segment masks until compaction rewrites the
 # segment. The term-dict scan drops terms with no live documents and
 # ts_dict_count() counts live documents only; ts_dict_freq() stays a raw
@@ -61,22 +67,18 @@ FROM dd_idx ORDER BY term
 QUERY PLAN
 ╭─ ORDER_BY ──────────────────────────────────────────╮
 │ Order By: dd_idx.cat)) ASC                          │
-│ ~2 rows                                             │
+│ ~1 row                                              │
 ╰──────────────────────────┬──────────────────────────╯
 ╭─ PROJECTION ─────────────┴──────────────────────────╮
 │ Projections:                                        │
 │ sdb_inverted_index_term$cat,                        │
 │ CAST(sdb_inverted_index_term_count$cat AS INTEGER)  │
-│ ~2 rows                                             │
+│ ~1 row                                              │
 ╰──────────────────────────┬──────────────────────────╯
 ╭─ HASH_GROUP_BY ──────────┴──────────────────────────╮
 │ Groups: #0                                          │
 │ Aggregates: sum(#1)                                 │
-│ ~2 rows                                             │
-╰──────────────────────────┬──────────────────────────╯
-╭─ PROJECTION ─────────────┴──────────────────────────╮
-│ Projections: #0, #1                                 │
-│ ~4 rows                                             │
+│ ~1 row                                              │
 ╰──────────────────────────┬──────────────────────────╯
 ╭─ IRESEARCH_SCAN ─────────┴──────────────────────────╮
 │ Index: dd_idx                                       │
@@ -84,7 +86,7 @@ QUERY PLAN
 │ Projections:                                        │
 │ sdb_inverted_index_term$cat,                        │
 │ sdb_inverted_index_term_count$cat                   │
-│ ~4 rows                                             │
+│ ~3 rows                                             │
 ╰─────────────────────────────────────────────────────╯
 
 query
@@ -105,21 +107,17 @@ QUERY PLAN
 │ Projections:                             │
 │ sdb_inverted_index_term$cat,             │
 │ sdb_inverted_index_term$cat IS NOT NULL  │
-│ ~2 rows                                  │
+│ ~1 row                                   │
 ╰─────────────────────┬────────────────────╯
 ╭─ HASH_GROUP_BY ─────┴────────────────────╮
 │ Groups: #0                               │
-│ ~2 rows                                  │
-╰─────────────────────┬────────────────────╯
-╭─ PROJECTION ────────┴────────────────────╮
-│ Projections: #0                          │
-│ ~4 rows                                  │
+│ ~1 row                                   │
 ╰─────────────────────┬────────────────────╯
 ╭─ IRESEARCH_SCAN ────┴────────────────────╮
 │ Index: dd_idx                            │
 │ TsDict: cat                              │
 │ Projections: sdb_inverted_index_term$cat │
-│ ~4 rows                                  │
+│ ~3 rows                                  │
 ╰──────────────────────────────────────────╯
 
 # 'blue' and 'date' live only in row 4: after its deletion they must not be

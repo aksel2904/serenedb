@@ -26,6 +26,8 @@
 #include <algorithm>
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/table_catalog_entry.hpp>
+#include <duckdb/catalog/entry_lookup_info.hpp>
+#include <duckdb/common/enum_util.hpp>
 #include <duckdb/common/enums/database_modification_type.hpp>
 #include <duckdb/common/exception/binder_exception.hpp>
 #include <duckdb/common/serializer/memory_stream.hpp>
@@ -35,6 +37,7 @@
 #include <duckdb/common/types/vector.hpp>
 #include <duckdb/common/vector/unified_vector_format.hpp>
 #include <duckdb/function/table_function.hpp>
+#include <duckdb/main/database_manager.hpp>
 #include <duckdb/main/extension/extension_loader.hpp>
 #include <duckdb/parser/column_definition.hpp>
 #include <duckdb/parser/constraints/check_constraint.hpp>
@@ -243,6 +246,22 @@ std::string StoreIndexName(ObjectId index_id) {
   return absl::StrCat("sdb_idx_", index_id.id());
 }
 
+duckdb::optional_ptr<duckdb::TableCatalogEntry> GetStoreTableEntry(
+  duckdb::ClientContext& context, std::string_view database,
+  std::string_view schema, std::string_view table,
+  duckdb::OnEntryNotFound if_not_found) {
+  const duckdb::EntryLookupInfo lookup(
+    duckdb::CatalogType::TABLE_ENTRY,
+    duckdb::QualifiedName(
+      duckdb::Identifier{kStoreDatabaseName}, duckdb::Identifier{"main"},
+      duckdb::Identifier{StoreTableName(database, schema, table)}));
+  auto entry = duckdb::Catalog::GetEntry(context, lookup, if_not_found);
+  if (!entry) {
+    return nullptr;
+  }
+  return &entry->Cast<duckdb::TableCatalogEntry>();
+}
+
 StoreTableDef MakeStoreTableDef(std::string_view database,
                                 std::string_view schema, const Table& table) {
   StoreTableDef def;
@@ -256,7 +275,8 @@ StoreTableDef MakeStoreTableDef(std::string_view database,
       continue;
     }
     mirror_pos[i] = def.columns.size();
-    def.columns.push_back({std::string{col.GetName()}, col.type});
+    def.columns.push_back(
+      {std::string{col.GetName()}, col.type, col.compression});
   }
   for (const auto& constraint : table.CheckConstraints()) {
     if (auto idx = constraint.IsNotNull(cols)) {
@@ -414,10 +434,9 @@ void CatalogStore::WriteContext::DropStoreColumn(std::string table,
   });
 }
 
-void CatalogStore::WriteContext::AddStoreColumn(std::string table,
-                                                std::string name,
-                                                std::string type_sql,
-                                                std::string default_sql) {
+void CatalogStore::WriteContext::AddStoreColumn(
+  std::string table, std::string name, std::string type_sql,
+  std::string default_sql, duckdb::CompressionType compression) {
   _entries.push_back({
     .op = Op::AddStoreColumn,
     .def = std::move(default_sql),
@@ -427,6 +446,7 @@ void CatalogStore::WriteContext::AddStoreColumn(std::string table,
       },
     .name_a = std::move(name),
     .name_b = std::move(type_sql),
+    .compression = compression,
   });
 }
 
@@ -580,9 +600,23 @@ void CatalogStore::Initialize(std::string_view database_directory) {
     _conn = DuckDBEngine::Instance().CreateConnection();
     _seq_conn = DuckDBEngine::Instance().CreateConnection();
 
+    // HIDDEN keeps the store out of catalog enumeration (SHOW TABLES,
+    // duckdb_tables/databases, GetAllSchemas); qualified name lookups
+    // ("__sdb_store".main.x) still resolve.
     ExecOrFatal(
       *_conn, absl::StrCat("ATTACH '", absl::StrReplaceAll(file, {{"'", "''"}}),
-                           "' AS \"", kStoreAlias, "\""));
+                           "' AS \"", kStoreAlias,
+                           "\" (HIDDEN true, STORAGE_VERSION 'serenedb_v1')"));
+
+    // DuckDB always has a main database, so an unused in-memory "memory" one
+    // exists until something is attached; the store supersedes it. The default
+    // has to move first -- DETACH refuses the default database, and detaching
+    // does not repoint it, so a connection with no search path would resolve a
+    // name that is gone.
+    auto& context = *_conn->context;
+    duckdb::DatabaseManager::Get(context).SetDefaultDatabase(
+      context, std::string{kStoreAlias});
+    ExecOrFatal(*_conn, "DETACH \"memory\"");
     ExecOrFatal(*_conn,
                 absl::StrCat("CREATE TABLE IF NOT EXISTS ", kCatalogTable,
                              " (parent_id UBIGINT, type UTINYINT, id UBIGINT, "
@@ -902,6 +936,11 @@ absl::Status CatalogStore::ExecuteEntries(
             absl::StrCat("ALTER TABLE \"", kStoreAlias, "\".main.",
                          QuotedIdent(entry.store_table.name), " ADD COLUMN ",
                          QuotedIdent(entry.name_a), " ", entry.name_b);
+          if (entry.compression != duckdb::CompressionType::COMPRESSION_AUTO) {
+            absl::StrAppend(&base, " USING COMPRESSION ",
+                            duckdb::EnumUtil::ToChars<duckdb::CompressionType>(
+                              entry.compression));
+          }
           std::string sql = base;
           if (!entry.def.empty()) {
             absl::StrAppend(&sql, " DEFAULT ", entry.def);
@@ -965,8 +1004,9 @@ absl::Status CatalogStore::ExecuteCreateStoreTableImpl(const StoreTableDef& def,
     duckdb::Identifier{kStoreAlias}, duckdb::Identifier{"main"},
     duckdb::Identifier{def.name}});
   for (const auto& col : def.columns) {
-    info->columns.AddColumn(
-      duckdb::ColumnDefinition{duckdb::Identifier{col.name}, col.type});
+    duckdb::ColumnDefinition cd{duckdb::Identifier{col.name}, col.type};
+    cd.SetCompressionType(col.compression);
+    info->columns.AddColumn(std::move(cd));
   }
   for (auto idx : def.not_null) {
     info->constraints.push_back(

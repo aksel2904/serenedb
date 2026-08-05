@@ -42,11 +42,17 @@
 #include "iresearch/search/top_terms_selector.hpp"
 #include "iresearch/search/wildcard_filter.hpp"
 #include "iresearch/utils/automaton_utils.hpp"
+#include "pg/sql_exception_macro.h"
 
 namespace irs {
 namespace {
 
-enum class PhraseQueryKind { kEmpty, kSingleWord, kFixed, kVariadic };
+enum class PhraseQueryKind {
+  kEmpty,
+  kSingleWord,
+  kFixed,
+  kVariadic,
+};
 
 // A phrase with a single non-term part (prefix/wildcard/range/...) reduces to
 // that part's own filter: position matching is a no-op for one word.
@@ -230,6 +236,15 @@ bool Valid(const TermReader* reader) noexcept {
                                 FixedPhraseQuery::kRequiredFeatures;
 }
 
+bool HasIntervalOffsets(const ByPhraseOptions& options) noexcept {
+  for (const auto& info : options) {
+    if (info.offs_min != info.offs_max) {
+      return true;
+    }
+  }
+  return false;
+}
+
 PhraseQueryKind GetKind(irs::field_id field, const ByPhraseOptions& options) {
   if (!irs::field_limits::valid(field) || options.empty()) {
     return PhraseQueryKind::kEmpty;
@@ -276,11 +291,12 @@ FixedPhraseQuery::positions_t MakeFixedPositions(
   return positions;
 }
 
-// Slot connectivity components over query term sets, per segment. The
-// ES-verified rule detects repeats over the terms of the QUERY, so literal
-// parts contribute their full query-level sets (a shared term absent from
-// the segment still connects its slots), while pattern parts have no
-// query-level set and contribute their per-segment expansion instead.
+// Slot connectivity components over query term sets, per segment. Repeats
+// are detected over the terms of the QUERY (Elasticsearch semantics), so
+// literal parts contribute their full query-level sets (a shared term
+// absent from the segment still connects its slots), while pattern parts
+// have no query-level set and contribute their per-segment expansion
+// instead.
 ManagedVector<uint32_t> ComputeTermGroups(
   const ByPhraseOptions& options,
   const std::vector<std::vector<bstring>>& part_terms,
@@ -503,7 +519,14 @@ QueryBuilder::ptr ByPhrase::PrepareSegment(const SubReader& segment,
                                            const PrepareContext& ctx) const {
   auto sub_ctx = ctx;
   sub_ctx.Boost(Boost());
-  switch (GetKind(field_id(), options())) {
+  const auto kind = GetKind(field_id(), options());
+  if (kind == PhraseQueryKind::kFixed || kind == PhraseQueryKind::kVariadic) {
+    // Rejected before any per-segment work; Execute relies on this via
+    // SDB_ASSERT (see phrase_query.cpp).
+    SDB_ENSURE(options().slop() == 0 || !HasIntervalOffsets(options()),
+               "slop and intervals are mutually exclusive");
+  }
+  switch (kind) {
     case PhraseQueryKind::kEmpty:
       return QueryBuilder::Empty();
     case PhraseQueryKind::kSingleWord:

@@ -30,6 +30,7 @@
 #include <duckdb/catalog/catalog_search_path.hpp>
 #include <duckdb/catalog/entry_lookup_info.hpp>
 #include <duckdb/common/vector_operations/generic_executor.hpp>
+#include <duckdb/common/vector_operations/variadic_executor.hpp>
 #include <duckdb/execution/operator/helper/physical_set.hpp>
 #include <duckdb/function/scalar_function.hpp>
 #include <duckdb/main/client_context.hpp>
@@ -40,6 +41,7 @@
 #include <duckdb/parser/parsed_data/create_scalar_function_info.hpp>
 #include <duckdb/planner/expression/bound_constant_expression.hpp>
 #include <duckdb/storage/data_table.hpp>
+#include <duckdb/storage/database_size.hpp>
 #include <optional>
 #include <ranges>
 
@@ -53,10 +55,11 @@
 #include "catalog/store/store.h"
 #include "catalog/table.h"
 #include "catalog/virtual_table.h"
+#include "connector/duckdb_catalog.h"
 #include "connector/duckdb_client_state.h"
 #include "connector/duckdb_system_table_entry.h"
 #include "connector/pg_logical_types.h"
-#include "network/pg/cancel_registry.h"
+#include "network/cancel_registry.h"
 #include "pg/connection_context.h"
 #include "pg/errcodes.h"
 #include "pg/pg_types.h"
@@ -157,13 +160,14 @@ void PgBackendPidFunction(duckdb::DataChunk& args,
                    duckdb::count_t(args.size()));
 }
 
-// Cancel each requested backend's running query by pid -> BOOLEAN per row (true
-// if the pid matched a live backend). Shared by pg_cancel_backend and
-// pg_terminate_backend. Authorised by being a session (single superuser), so it
-// matches on the pid half of the cancel key alone, no secret.
+// Cancel (or, with `terminate`, terminate) each requested backend by pid ->
+// BOOLEAN per row (true if the pid matched a live backend). Shared by
+// pg_cancel_backend and pg_terminate_backend. Authorised by being a session
+// (single superuser), so it matches on the pid half of the cancel key alone,
+// no secret.
 void CancelBackendsByPid(duckdb::DataChunk& args,
-                         duckdb::ExpressionState& state,
-                         duckdb::Vector& result) {
+                         duckdb::ExpressionState& state, duckdb::Vector& result,
+                         bool terminate) {
   auto& conn_ctx = GetSereneDBContext(state.GetContext());
   auto* registry = conn_ctx.GetCancelRegistry();
   duckdb::UnifiedVectorFormat pids;
@@ -171,7 +175,7 @@ void CancelBackendsByPid(duckdb::DataChunk& args,
   const auto* pid = duckdb::UnifiedVectorFormat::GetData<int32_t>(pids);
   auto* out = duckdb::FlatVector::GetDataMutable<bool>(result);
   auto& validity = duckdb::FlatVector::ValidityMutable(result);
-  using CancelResult = network::pg::CancelRegistry::CancelResult;
+  using CancelResult = network::CancelRegistry::CancelResult;
   for (duckdb::idx_t i = 0; i < args.size(); ++i) {
     const auto idx = pids.sel->get_index(i);
     if (!pids.validity.RowIsValid(idx)) {
@@ -179,8 +183,8 @@ void CancelBackendsByPid(duckdb::DataChunk& args,
       continue;
     }
     const auto target = static_cast<uint32_t>(pid[idx]);
-    const auto outcome =
-      registry ? registry->CancelByPid(target) : CancelResult::NotFound;
+    const auto outcome = registry ? registry->CancelByPid(target, terminate)
+                                  : CancelResult::NotFound;
     out[i] = outcome == CancelResult::Cancelled;
     if (outcome == CancelResult::Ambiguous) {
       // The pid is the high half of a random key, not a unique OS pid; two
@@ -201,22 +205,15 @@ void CancelBackendsByPid(duckdb::DataChunk& args,
 void PgCancelBackendFunction(duckdb::DataChunk& args,
                              duckdb::ExpressionState& state,
                              duckdb::Vector& result) {
-  CancelBackendsByPid(args, state, result);
+  CancelBackendsByPid(args, state, result, /*terminate=*/false);
 }
 
-// pg_terminate_backend(pid) -> bool: SereneDB cannot drop another session's
-// connection, only interrupt its current query, so this degrades to a cancel
-// and warns. Returns whether the backend was found (its query signalled).
+// pg_terminate_backend(pid) -> bool: interrupt the target backend's current
+// query and stop its session (the connection closes).
 void PgTerminateBackendFunction(duckdb::DataChunk& args,
                                 duckdb::ExpressionState& state,
                                 duckdb::Vector& result) {
-  GetSereneDBContext(state.GetContext())
-    .AddNotice(sdb::pg::SqlErrorData{
-      .errcode = ERRCODE_WARNING,
-      .errmsg = "terminating connections is not supported; "
-                "pg_terminate_backend only cancels the backend's current "
-                "query"});
-  CancelBackendsByPid(args, state, result);
+  CancelBackendsByPid(args, state, result, /*terminate=*/true);
 }
 
 // set_config(name, value, is_local) -> text
@@ -325,6 +322,19 @@ duckdb::unique_ptr<duckdb::Expression> BindPgTypeof(
   return duckdb::make_uniq<duckdb::BoundConstantExpression>(std::move(val));
 }
 
+void ToRegtypeFunction(duckdb::DataChunk& args, duckdb::ExpressionState&,
+                       duckdb::Vector& result) {
+  duckdb::UnaryExecutor::Execute<duckdb::string_t, int64_t>(
+    args.data[0], result, args.size(),
+    [&](duckdb::string_t name) -> duckdb::optional<int64_t> {
+      auto oid = pg::RegtypeIn(name.GetString());
+      if (oid == pg::kInvalidOid) {
+        return duckdb::nullopt;
+      }
+      return static_cast<int64_t>(oid);
+    });
+}
+
 // format_type(oid, typmod) -> text
 // TODO(Pasha) Account typmod?
 // Keyed on the oid only (UnaryExecutor): psql calls format_type(oid, NULL),
@@ -350,65 +360,6 @@ void FormatTypeFunction(duckdb::DataChunk& args, duckdb::ExpressionState& state,
 // --- Size functions ---
 // Ported from server/pg/functions/size.cpp
 
-// Store-table row count as the size proxy: the native engine keeps no
-// cheap per-table byte size (one shared file), and PG callers mostly test
-// emptiness. TODO(M2): commit-time byte accounting.
-int64_t StoreTableSizeProxy(duckdb::ClientContext& context,
-                            const catalog::Snapshot& snapshot,
-                            const catalog::Object& rel) {
-  auto table = snapshot.GetObject<catalog::Table>(rel.GetId());
-  if (!table || table->GetEngine() != catalog::TableEngine::Transactional ||
-      table->Tombstoned()) {
-    return 0;
-  }
-  auto schema = snapshot.GetObject<catalog::Schema>(table->GetParentId());
-  if (!schema) {
-    return 0;
-  }
-  auto database = snapshot.GetDatabase(schema->GetParentId());
-  if (!database) {
-    return 0;
-  }
-  auto store_name = catalog::StoreTableName(
-    database->GetName(), schema->GetName(), table->GetName());
-  duckdb::EntryLookupInfo lookup(
-    duckdb::CatalogType::TABLE_ENTRY,
-    duckdb::QualifiedName(duckdb::Identifier{catalog::kStoreDatabaseName},
-                          "main", duckdb::Identifier{store_name}));
-  auto entry = duckdb::Catalog::GetEntry(context, lookup,
-                                         duckdb::OnEntryNotFound::RETURN_NULL);
-  if (!entry) {
-    return 0;
-  }
-  return static_cast<int64_t>(
-    entry->Cast<duckdb::TableCatalogEntry>().GetStorage().GetTotalRows());
-}
-
-// Helper: get fork size for a relation OID.
-int64_t StoreSchemaSize(duckdb::ClientContext& context,
-                        const catalog::Snapshot& snapshot, ObjectId database_id,
-                        std::string_view schema_name) {
-  int64_t total = 0;
-  for (auto& rel : snapshot.GetRelations(database_id, schema_name)) {
-    if (rel->GetType() != catalog::ObjectType::Table) {
-      continue;
-    }
-    total += StoreTableSizeProxy(context, snapshot, *rel);
-  }
-  return total;
-}
-
-int64_t StoreDatabaseSize(duckdb::ClientContext& context,
-                          const catalog::Snapshot& snapshot,
-                          ObjectId database_id) {
-  int64_t total = 0;
-  for (auto& schema : snapshot.GetSchemas(database_id)) {
-    total += StoreSchemaSize(context, snapshot, database_id, schema->GetName());
-  }
-  return total;
-}
-
-// Ported from server/pg/functions/size.cpp GetRelationForkSize.
 int64_t GetRelationForkSize(duckdb::ClientContext& context,
                             const catalog::Snapshot& snapshot, uint64_t oid,
                             std::string_view fork, bool table_only = false) {
@@ -425,29 +376,64 @@ int64_t GetRelationForkSize(duckdb::ClientContext& context,
     return 0;
   }
   switch (rel->GetType()) {
-    case catalog::ObjectType::Table:
-      return StoreTableSizeProxy(context, snapshot, *rel);
-    case catalog::ObjectType::SecondaryIndex: {
-      // Native ART indexes live inside the store file; report the table
-      // row count as the proxy.
-      auto index = snapshot.GetObject<catalog::SecondaryIndex>(rel->GetId());
-      if (!index) {
+    case catalog::ObjectType::Table: {
+      auto table = snapshot.GetObject<catalog::Table>(rel->GetId());
+      if (!table || table->Tombstoned()) {
         return 0;
       }
-      auto table = snapshot.GetObject(index->GetRelationId());
-      return table ? StoreTableSizeProxy(context, snapshot, *table) : 0;
+      if (table->GetEngine() == catalog::TableEngine::Search) {
+        return SearchTableBytes(*table);
+      }
+      return StoreTableDataSize(context, snapshot, *table).bytes;
+    }
+    case catalog::ObjectType::SecondaryIndex: {
+      auto index = snapshot.GetObject<catalog::SecondaryIndex>(rel->GetId());
+      return index ? SecondaryIndexBytes(context, snapshot, *index) : 0;
     }
     case catalog::ObjectType::InvertedIndex: {
-      auto storage =
-        basics::downCast<const catalog::InvertedIndex>(*rel).GetData();
-      if (!storage) {
-        return 0;
-      }
-      return static_cast<int64_t>(storage->GetStats().indexSize);
+      auto index = snapshot.GetObject<catalog::InvertedIndex>(rel->GetId());
+      return index ? InvertedIndexBytes(*index) : 0;
     }
     default:
       return 0;
   }
+}
+
+int64_t GetRelationTotalSize(duckdb::ClientContext& context,
+                             const catalog::Snapshot& snapshot, uint64_t oid) {
+  auto rel = snapshot.GetObject(ObjectId{oid});
+  if (!rel) {
+    THROW_SQL_ERROR(ERR_CODE(ERRCODE_UNDEFINED_TABLE),
+                    ERR_MSG("relation with OID ", oid, " does not exist"));
+  }
+  if (rel->GetType() != catalog::ObjectType::Table) {
+    return GetRelationForkSize(context, snapshot, oid, "main");
+  }
+  auto table = snapshot.GetObject<catalog::Table>(rel->GetId());
+  if (!table || table->Tombstoned()) {
+    return 0;
+  }
+  int64_t total = table->GetEngine() == catalog::TableEngine::Search
+                    ? SearchTableBytes(*table)
+                    : StoreTableDataSize(context, snapshot, *table).bytes;
+  return total + TableIndexesTotalBytes(context, snapshot, *table);
+}
+
+int64_t GetTableIndexesSize(duckdb::ClientContext& context,
+                            const catalog::Snapshot& snapshot, uint64_t oid) {
+  auto rel = snapshot.GetObject(ObjectId{oid});
+  if (!rel) {
+    THROW_SQL_ERROR(ERR_CODE(ERRCODE_UNDEFINED_TABLE),
+                    ERR_MSG("relation with OID ", oid, " does not exist"));
+  }
+  if (rel->GetType() != catalog::ObjectType::Table) {
+    return 0;
+  }
+  auto table = snapshot.GetObject<catalog::Table>(rel->GetId());
+  if (!table || table->Tombstoned()) {
+    return 0;
+  }
+  return TableIndexesTotalBytes(context, snapshot, *table);
 }
 
 // pg_database_size(name) -> bigint
@@ -466,7 +452,8 @@ void PgDatabaseSizeNameFunction(duckdb::DataChunk& args,
         THROW_SQL_ERROR(ERR_CODE(ERRCODE_UNDEFINED_DATABASE),
                         ERR_MSG("database \"", db_name, "\" does not exist"));
       }
-      return StoreDatabaseSize(context, *snapshot, database->GetId());
+      return static_cast<int64_t>(
+        DatabaseStorageSize(context, *snapshot, database->GetId()).bytes);
     });
 }
 
@@ -493,7 +480,8 @@ void PgDatabaseSizeOidFunction(duckdb::DataChunk& args,
         THROW_SQL_ERROR(ERR_CODE(ERRCODE_UNDEFINED_DATABASE),
                         ERR_MSG("database with OID ", oid, " does not exist"));
       }
-      return StoreDatabaseSize(context, *snapshot, database->GetId());
+      return static_cast<int64_t>(
+        DatabaseStorageSize(context, *snapshot, database->GetId()).bytes);
     });
 }
 
@@ -514,7 +502,9 @@ void PgSchemaSizeNameFunction(duckdb::DataChunk& args,
         THROW_SQL_ERROR(ERR_CODE(ERRCODE_UNDEFINED_SCHEMA),
                         ERR_MSG("schema \"", schema_name, "\" does not exist"));
       }
-      return StoreSchemaSize(context, *snapshot, database_id, schema_name);
+      return static_cast<int64_t>(
+        DatabaseStorageSize(context, *snapshot, database_id, schema_name)
+          .bytes);
     });
 }
 
@@ -534,8 +524,10 @@ void PgSchemaSizeOidFunction(duckdb::DataChunk& args,
         THROW_SQL_ERROR(ERR_CODE(ERRCODE_UNDEFINED_SCHEMA),
                         ERR_MSG("schema with OID ", oid, " does not exist"));
       }
-      return StoreSchemaSize(context, *snapshot, schema->GetParentId(),
-                             schema->GetName());
+      return static_cast<int64_t>(DatabaseStorageSize(context, *snapshot,
+                                                      schema->GetParentId(),
+                                                      schema->GetName())
+                                    .bytes);
     });
 }
 
@@ -730,70 +722,39 @@ void HasTablePrivilegeOid2Function(duckdb::DataChunk& args,
   auto& conn_ctx = GetSereneDBContext(state.GetContext());
   auto snapshot = GlobalSnapshot();
   auto current = snapshot->GetRole(conn_ctx.user());
-  duckdb::UnifiedVectorFormat tdata, pdata;
-  args.data[0].ToUnifiedFormat(args.size(), tdata);
-  args.data[1].ToUnifiedFormat(args.size(), pdata);
-  const auto* toid = duckdb::UnifiedVectorFormat::GetData<int64_t>(tdata);
-  const auto* priv =
-    duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(pdata);
-  result.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
-  auto* out = duckdb::FlatVector::GetDataMutable<bool>(result);
-  auto& validity = duckdb::FlatVector::ValidityMutable(result);
-  for (duckdb::idx_t i = 0; i < args.size(); i++) {
-    auto ti = tdata.sel->get_index(i);
-    auto pi = pdata.sel->get_index(i);
-    if (!tdata.validity.RowIsValid(ti) || !pdata.validity.RowIsValid(pi) ||
-        !current) {
-      validity.SetInvalid(i);
-      continue;
-    }
-    bool is_null = false;
-    bool r = HasTablePrivilegeByOidImpl(
-      *snapshot, current->GetId(), ObjectId{static_cast<uint64_t>(toid[ti])},
-      {priv[pi].GetData(), priv[pi].GetSize()}, is_null);
-    if (is_null) {
-      validity.SetInvalid(i);
-    } else {
-      out[i] = r;
-    }
-  }
+  duckdb::VariadicExecutor::Execute<bool, int64_t, duckdb::string_t>(
+    args, result,
+    [&](int64_t toid, duckdb::string_t priv) -> duckdb::optional<bool> {
+      if (!current) {
+        return duckdb::nullopt;
+      }
+      bool is_null = false;
+      bool r = HasTablePrivilegeByOidImpl(
+        *snapshot, current->GetId(), ObjectId{static_cast<uint64_t>(toid)},
+        {priv.GetData(), priv.GetSize()}, is_null);
+      return is_null ? duckdb::nullopt : duckdb::optional<bool>{r};
+    });
 }
 
 void HasTablePrivilegeOid3Function(duckdb::DataChunk& args,
                                    duckdb::ExpressionState& state,
                                    duckdb::Vector& result) {
   auto snapshot = GlobalSnapshot();
-  duckdb::UnifiedVectorFormat rdata, tdata, pdata;
-  args.data[0].ToUnifiedFormat(args.size(), rdata);
-  args.data[1].ToUnifiedFormat(args.size(), tdata);
-  args.data[2].ToUnifiedFormat(args.size(), pdata);
-  const auto* roid = duckdb::UnifiedVectorFormat::GetData<int64_t>(rdata);
-  const auto* toid = duckdb::UnifiedVectorFormat::GetData<int64_t>(tdata);
-  const auto* priv =
-    duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(pdata);
-  result.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
-  auto* out = duckdb::FlatVector::GetDataMutable<bool>(result);
-  auto& validity = duckdb::FlatVector::ValidityMutable(result);
-  for (duckdb::idx_t i = 0; i < args.size(); i++) {
-    auto ri = rdata.sel->get_index(i);
-    auto ti = tdata.sel->get_index(i);
-    auto pi = pdata.sel->get_index(i);
-    if (!rdata.validity.RowIsValid(ri) || !tdata.validity.RowIsValid(ti) ||
-        !pdata.validity.RowIsValid(pi)) {
-      validity.SetInvalid(i);
-      continue;
-    }
-    bool is_null = false;
-    bool r = HasTablePrivilegeByOidImpl(
-      *snapshot, ObjectId{static_cast<uint64_t>(roid[ri])},
-      ObjectId{static_cast<uint64_t>(toid[ti])},
-      {priv[pi].GetData(), priv[pi].GetSize()}, is_null);
-    if (is_null) {
-      validity.SetInvalid(i);
-    } else {
-      out[i] = r;
-    }
-  }
+  duckdb::VariadicExecutor::Execute<bool, int64_t, int64_t, duckdb::string_t>(
+    args, result,
+    [&](int64_t roid, int64_t toid,
+        duckdb::string_t priv) -> duckdb::optional<bool> {
+      bool is_null = false;
+      bool r = HasTablePrivilegeByOidImpl(
+        *snapshot, ObjectId{static_cast<uint64_t>(roid)},
+        ObjectId{static_cast<uint64_t>(toid)}, {priv.GetData(), priv.GetSize()},
+        is_null);
+      if (is_null) {
+        return duckdb::nullopt;
+      } else {
+        return r;
+      }
+    });
 }
 
 void HasTablePrivilegeOidName3Function(duckdb::DataChunk& args,
@@ -802,91 +763,59 @@ void HasTablePrivilegeOidName3Function(duckdb::DataChunk& args,
   auto& conn_ctx = GetSereneDBContext(state.GetContext());
   auto snapshot = GlobalSnapshot();
   const auto current_schema = conn_ctx.GetCurrentSchema();
-  duckdb::UnifiedVectorFormat rdata, tdata, pdata;
-  args.data[0].ToUnifiedFormat(args.size(), rdata);
-  args.data[1].ToUnifiedFormat(args.size(), tdata);
-  args.data[2].ToUnifiedFormat(args.size(), pdata);
-  const auto* roid = duckdb::UnifiedVectorFormat::GetData<int64_t>(rdata);
-  const auto* tname =
-    duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(tdata);
-  const auto* priv =
-    duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(pdata);
-  result.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
-  auto* out = duckdb::FlatVector::GetDataMutable<bool>(result);
-  auto& validity = duckdb::FlatVector::ValidityMutable(result);
-  for (duckdb::idx_t i = 0; i < args.size(); i++) {
-    auto ri = rdata.sel->get_index(i);
-    auto ti = tdata.sel->get_index(i);
-    auto pi = pdata.sel->get_index(i);
-    if (!rdata.validity.RowIsValid(ri) || !tdata.validity.RowIsValid(ti) ||
-        !pdata.validity.RowIsValid(pi)) {
-      validity.SetInvalid(i);
-      continue;
-    }
-    const auto name = pg::ParseObjectName(
-      {tname[ti].GetData(), tname[ti].GetSize()}, current_schema);
-    auto table =
-      snapshot->GetTable(catalog::NoAccessCheck(), conn_ctx.GetDatabaseId(),
-                         name.schema, name.relation);
-    const ObjectId role{static_cast<uint64_t>(roid[ri])};
-    const std::string_view priv_text{priv[pi].GetData(), priv[pi].GetSize()};
-    try {
-      if (table) {
-        out[i] = HasAnyObjectPrivilegeText(
-          *snapshot, role, *table, catalog::ObjectType::Table, priv_text);
-      } else if (const auto* sys = ResolveSystemRelation(conn_ctx, name)) {
-        const auto obj = SystemRelationAsObject(*sys);
-        out[i] = HasAnyObjectPrivilegeText(
-          *snapshot, role, obj, catalog::ObjectType::Table, priv_text);
-      } else {
-        ThrowRelationNotFound(name.relation);
+  duckdb::VariadicExecutor::Execute<bool, int64_t, duckdb::string_t,
+                                    duckdb::string_t>(
+    args, result,
+    [&](int64_t roid, duckdb::string_t tname,
+        duckdb::string_t priv) -> duckdb::optional<bool> {
+      const auto name =
+        pg::ParseObjectName({tname.GetData(), tname.GetSize()}, current_schema);
+      auto table =
+        snapshot->GetTable(catalog::NoAccessCheck(), conn_ctx.GetDatabaseId(),
+                           name.schema, name.relation);
+      const ObjectId role{static_cast<uint64_t>(roid)};
+      const std::string_view priv_text{priv.GetData(), priv.GetSize()};
+      try {
+        if (table) {
+          return HasAnyObjectPrivilegeText(
+            *snapshot, role, *table, catalog::ObjectType::Table, priv_text);
+        } else if (const auto* sys = ResolveSystemRelation(conn_ctx, name)) {
+          const auto obj = SystemRelationAsObject(*sys);
+          return HasAnyObjectPrivilegeText(
+            *snapshot, role, obj, catalog::ObjectType::Table, priv_text);
+        } else {
+          ThrowRelationNotFound(name.relation);
+        }
+      } catch (const SqlException& e) {
+        ThrowInvalidPrivilege(e);
       }
-    } catch (const SqlException& e) {
-      ThrowInvalidPrivilege(e);
-    }
-  }
+    });
 }
 
 void HasTablePrivilegeNameOid3Function(duckdb::DataChunk& args,
                                        duckdb::ExpressionState& state,
                                        duckdb::Vector& result) {
   auto snapshot = GlobalSnapshot();
-  duckdb::UnifiedVectorFormat rdata, tdata, pdata;
-  args.data[0].ToUnifiedFormat(args.size(), rdata);
-  args.data[1].ToUnifiedFormat(args.size(), tdata);
-  args.data[2].ToUnifiedFormat(args.size(), pdata);
-  const auto* rname =
-    duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(rdata);
-  const auto* toid = duckdb::UnifiedVectorFormat::GetData<int64_t>(tdata);
-  const auto* priv =
-    duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(pdata);
-  result.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
-  auto* out = duckdb::FlatVector::GetDataMutable<bool>(result);
-  auto& validity = duckdb::FlatVector::ValidityMutable(result);
-  for (duckdb::idx_t i = 0; i < args.size(); i++) {
-    auto ri = rdata.sel->get_index(i);
-    auto ti = tdata.sel->get_index(i);
-    auto pi = pdata.sel->get_index(i);
-    if (!rdata.validity.RowIsValid(ri) || !tdata.validity.RowIsValid(ti) ||
-        !pdata.validity.RowIsValid(pi)) {
-      validity.SetInvalid(i);
-      continue;
-    }
-    auto role_id = ResolveRoleOrPublic(
-      *snapshot, {rname[ri].GetData(), rname[ri].GetSize()});
-    if (!role_id) {
-      ThrowRoleNotFound({rname[ri].GetData(), rname[ri].GetSize()});
-    }
-    bool is_null = false;
-    bool r = HasTablePrivilegeByOidImpl(
-      *snapshot, *role_id, ObjectId{static_cast<uint64_t>(toid[ti])},
-      {priv[pi].GetData(), priv[pi].GetSize()}, is_null);
-    if (is_null) {
-      validity.SetInvalid(i);
-    } else {
-      out[i] = r;
-    }
-  }
+  duckdb::VariadicExecutor::Execute<bool, duckdb::string_t, int64_t,
+                                    duckdb::string_t>(
+    args, result,
+    [&](duckdb::string_t rname, int64_t toid,
+        duckdb::string_t priv) -> duckdb::optional<bool> {
+      auto role_id =
+        ResolveRoleOrPublic(*snapshot, {rname.GetData(), rname.GetSize()});
+      if (!role_id) {
+        ThrowRoleNotFound({rname.GetData(), rname.GetSize()});
+      }
+      bool is_null = false;
+      bool r = HasTablePrivilegeByOidImpl(
+        *snapshot, *role_id, ObjectId{static_cast<uint64_t>(toid)},
+        {priv.GetData(), priv.GetSize()}, is_null);
+      if (is_null) {
+        return duckdb::nullopt;
+      } else {
+        return r;
+      }
+    });
 }
 
 const char* ObjectClassWord(catalog::ObjectType type) {
@@ -895,7 +824,7 @@ const char* ObjectClassWord(catalog::ObjectType type) {
       return "schema";
     case catalog::ObjectType::Sequence:
       return "relation";
-    case catalog::ObjectType::PgSqlFunction:
+    case catalog::ObjectType::Function:
       return "function";
     case catalog::ObjectType::Database:
       return "database";
@@ -915,14 +844,14 @@ std::shared_ptr<catalog::Object> ResolveObjectByName(
     return snapshot.GetSchema(db_id, obj_name);
   }
   const auto current_schema = conn_ctx.GetCurrentSchema();
-  if (type == catalog::ObjectType::PgSqlFunction) {
+  if (type == catalog::ObjectType::Function) {
     const auto bare = obj_name.substr(0, obj_name.find('('));
     const auto name =
       pg::ParseObjectName(absl::StripAsciiWhitespace(bare), current_schema);
     return snapshot.GetFunction(catalog::NoAccessCheck(), db_id, name.schema,
                                 name.relation);
   }
-  if (type == catalog::ObjectType::PgSqlType) {
+  if (type == catalog::ObjectType::Type) {
     const auto name = pg::ParseObjectName(obj_name, current_schema);
     return snapshot.GetType(catalog::NoAccessCheck(), db_id, name.schema,
                             name.relation);
@@ -957,8 +886,8 @@ bool HasObjectPrivilegeByName(const catalog::Snapshot& snapshot,
     // functions, USAGE on types and (for the owner/PUBLIC defaults) sequences,
     // so serenedb reports an unresolved object of these classes as held rather
     // than erroring on a name it cannot resolve.
-    if (type == catalog::ObjectType::PgSqlFunction ||
-        type == catalog::ObjectType::PgSqlType ||
+    if (type == catalog::ObjectType::Function ||
+        type == catalog::ObjectType::Type ||
         type == catalog::ObjectType::Sequence) {
       return true;
     }
@@ -1060,34 +989,20 @@ void HasObjectPrivilegeOid2Function(duckdb::DataChunk& args,
   auto& conn_ctx = GetSereneDBContext(state.GetContext());
   auto snapshot = GlobalSnapshot();
   auto current = snapshot->GetRole(conn_ctx.user());
-  duckdb::UnifiedVectorFormat odata, pdata;
-  args.data[0].ToUnifiedFormat(args.size(), odata);
-  args.data[1].ToUnifiedFormat(args.size(), pdata);
-  const auto* ooid = duckdb::UnifiedVectorFormat::GetData<int64_t>(odata);
-  const auto* priv =
-    duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(pdata);
-  result.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
-  auto* out = duckdb::FlatVector::GetDataMutable<bool>(result);
-  auto& validity = duckdb::FlatVector::ValidityMutable(result);
-  for (duckdb::idx_t i = 0; i < args.size(); i++) {
-    auto oi = odata.sel->get_index(i);
-    auto pi = pdata.sel->get_index(i);
-    if (!odata.validity.RowIsValid(oi) || !pdata.validity.RowIsValid(pi) ||
-        !current) {
-      validity.SetInvalid(i);
-      continue;
-    }
-    bool is_null = false;
-    bool r = HasObjectPrivilegeByOidImpl(
-      *snapshot, kType, current->GetId(),
-      ObjectId{static_cast<uint64_t>(ooid[oi])},
-      {priv[pi].GetData(), priv[pi].GetSize()}, is_null);
-    if (is_null) {
-      validity.SetInvalid(i);
-    } else {
-      out[i] = r;
-    }
-  }
+  duckdb::VariadicExecutor::Execute<bool, int64_t, duckdb::string_t>(
+    args, result,
+    [&](int64_t ooid, duckdb::string_t priv) -> duckdb::optional<bool> {
+      bool is_null = false;
+      bool r =
+        HasObjectPrivilegeByOidImpl(*snapshot, kType, current->GetId(),
+                                    ObjectId{static_cast<uint64_t>(ooid)},
+                                    {priv.GetData(), priv.GetSize()}, is_null);
+      if (is_null) {
+        return duckdb::nullopt;
+      } else {
+        return r;
+      }
+    });
 }
 
 template<catalog::ObjectType kType>
@@ -1095,37 +1010,21 @@ void HasObjectPrivilegeOid3Function(duckdb::DataChunk& args,
                                     duckdb::ExpressionState& state,
                                     duckdb::Vector& result) {
   auto snapshot = GlobalSnapshot();
-  duckdb::UnifiedVectorFormat rdata, odata, pdata;
-  args.data[0].ToUnifiedFormat(args.size(), rdata);
-  args.data[1].ToUnifiedFormat(args.size(), odata);
-  args.data[2].ToUnifiedFormat(args.size(), pdata);
-  const auto* roid = duckdb::UnifiedVectorFormat::GetData<int64_t>(rdata);
-  const auto* ooid = duckdb::UnifiedVectorFormat::GetData<int64_t>(odata);
-  const auto* priv =
-    duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(pdata);
-  result.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
-  auto* out = duckdb::FlatVector::GetDataMutable<bool>(result);
-  auto& validity = duckdb::FlatVector::ValidityMutable(result);
-  for (duckdb::idx_t i = 0; i < args.size(); i++) {
-    auto ri = rdata.sel->get_index(i);
-    auto oi = odata.sel->get_index(i);
-    auto pi = pdata.sel->get_index(i);
-    if (!rdata.validity.RowIsValid(ri) || !odata.validity.RowIsValid(oi) ||
-        !pdata.validity.RowIsValid(pi)) {
-      validity.SetInvalid(i);
-      continue;
-    }
-    bool is_null = false;
-    bool r = HasObjectPrivilegeByOidImpl(
-      *snapshot, kType, ObjectId{static_cast<uint64_t>(roid[ri])},
-      ObjectId{static_cast<uint64_t>(ooid[oi])},
-      {priv[pi].GetData(), priv[pi].GetSize()}, is_null);
-    if (is_null) {
-      validity.SetInvalid(i);
-    } else {
-      out[i] = r;
-    }
-  }
+  duckdb::VariadicExecutor::Execute<bool, int64_t, int64_t, duckdb::string_t>(
+    args, result,
+    [&](int64_t roid, int64_t ooid,
+        duckdb::string_t priv) -> duckdb::optional<bool> {
+      bool is_null = false;
+      bool r = HasObjectPrivilegeByOidImpl(
+        *snapshot, kType, ObjectId{static_cast<uint64_t>(roid)},
+        ObjectId{static_cast<uint64_t>(ooid)}, {priv.GetData(), priv.GetSize()},
+        is_null);
+      if (is_null) {
+        return duckdb::nullopt;
+      } else {
+        return r;
+      }
+    });
 }
 
 template<catalog::ObjectType kType>
@@ -1134,32 +1033,15 @@ void HasObjectPrivilegeOidName3Function(duckdb::DataChunk& args,
                                         duckdb::Vector& result) {
   auto& conn_ctx = GetSereneDBContext(state.GetContext());
   auto snapshot = GlobalSnapshot();
-  duckdb::UnifiedVectorFormat rdata, odata, pdata;
-  args.data[0].ToUnifiedFormat(args.size(), rdata);
-  args.data[1].ToUnifiedFormat(args.size(), odata);
-  args.data[2].ToUnifiedFormat(args.size(), pdata);
-  const auto* roid = duckdb::UnifiedVectorFormat::GetData<int64_t>(rdata);
-  const auto* obj =
-    duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(odata);
-  const auto* priv =
-    duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(pdata);
-  result.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
-  auto* out = duckdb::FlatVector::GetDataMutable<bool>(result);
-  auto& validity = duckdb::FlatVector::ValidityMutable(result);
-  for (duckdb::idx_t i = 0; i < args.size(); i++) {
-    auto ri = rdata.sel->get_index(i);
-    auto oi = odata.sel->get_index(i);
-    auto pi = pdata.sel->get_index(i);
-    if (!rdata.validity.RowIsValid(ri) || !odata.validity.RowIsValid(oi) ||
-        !pdata.validity.RowIsValid(pi)) {
-      validity.SetInvalid(i);
-      continue;
-    }
-    out[i] = HasObjectPrivilegeByName(*snapshot, conn_ctx, kType,
-                                      ObjectId{static_cast<uint64_t>(roid[ri])},
-                                      {obj[oi].GetData(), obj[oi].GetSize()},
-                                      {priv[pi].GetData(), priv[pi].GetSize()});
-  }
+  duckdb::VariadicExecutor::Execute<bool, int64_t, duckdb::string_t,
+                                    duckdb::string_t>(
+    args, result,
+    [&](int64_t roid, duckdb::string_t obj,
+        duckdb::string_t priv) -> duckdb::optional<bool> {
+      return HasObjectPrivilegeByName(
+        *snapshot, conn_ctx, kType, ObjectId{static_cast<uint64_t>(roid)},
+        {obj.GetData(), obj.GetSize()}, {priv.GetData(), priv.GetSize()});
+    });
 }
 
 struct RolePrivMask {
@@ -1425,49 +1307,34 @@ void HasColumnPrivilegeNameName4Function(duckdb::DataChunk& args,
   auto& conn_ctx = GetSereneDBContext(state.GetContext());
   auto snapshot = GlobalSnapshot();
   const auto current_schema = conn_ctx.GetCurrentSchema();
-  duckdb::UnifiedVectorFormat ud, td, cd, pd;
-  args.data[0].ToUnifiedFormat(args.size(), ud);
-  args.data[1].ToUnifiedFormat(args.size(), td);
-  args.data[2].ToUnifiedFormat(args.size(), cd);
-  args.data[3].ToUnifiedFormat(args.size(), pd);
-  const auto* u = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(ud);
-  const auto* t = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(td);
-  const auto* c = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(cd);
-  const auto* p = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(pd);
-  result.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
-  auto* out = duckdb::FlatVector::GetDataMutable<bool>(result);
-  auto& validity = duckdb::FlatVector::ValidityMutable(result);
-  for (duckdb::idx_t i = 0; i < args.size(); i++) {
-    auto ui = ud.sel->get_index(i), ti = td.sel->get_index(i);
-    auto ci = cd.sel->get_index(i), pi = pd.sel->get_index(i);
-    if (!ud.validity.RowIsValid(ui) || !td.validity.RowIsValid(ti) ||
-        !cd.validity.RowIsValid(ci) || !pd.validity.RowIsValid(pi)) {
-      validity.SetInvalid(i);
-      continue;
-    }
-    auto role = snapshot->GetRole({u[ui].GetData(), u[ui].GetSize()});
-    if (!role) {
-      ThrowRoleNotFound({u[ui].GetData(), u[ui].GetSize()});
-    }
-    const auto name =
-      pg::ParseObjectName({t[ti].GetData(), t[ti].GetSize()}, current_schema);
-    auto table =
-      snapshot->GetTable(catalog::NoAccessCheck(), conn_ctx.GetDatabaseId(),
-                         name.schema, name.relation);
-    const std::string_view col{c[ci].GetData(), c[ci].GetSize()};
-    const std::string_view priv{p[pi].GetData(), p[pi].GetSize()};
-    try {
-      if (table) {
-        out[i] =
-          HasColumnPrivByName(*snapshot, role->GetId(), *table, col, priv);
-      } else {
-        out[i] = SystemRelationColumnPriv(conn_ctx, *snapshot, role->GetId(),
-                                          name, col, priv);
+  duckdb::VariadicExecutor::Execute<bool, duckdb::string_t, duckdb::string_t,
+                                    duckdb::string_t, duckdb::string_t>(
+    args, result,
+    [&](duckdb::string_t u, duckdb::string_t t, duckdb::string_t c,
+        duckdb::string_t p) -> duckdb::optional<bool> {
+      auto role = snapshot->GetRole({u.GetData(), u.GetSize()});
+      if (!role) {
+        ThrowRoleNotFound({u.GetData(), u.GetSize()});
       }
-    } catch (const SqlException& e) {
-      ThrowInvalidPrivilege(e);
-    }
-  }
+      const auto name =
+        pg::ParseObjectName({t.GetData(), t.GetSize()}, current_schema);
+      auto table =
+        snapshot->GetTable(catalog::NoAccessCheck(), conn_ctx.GetDatabaseId(),
+                           name.schema, name.relation);
+      const std::string_view col{c.GetData(), c.GetSize()};
+      const std::string_view priv{p.GetData(), p.GetSize()};
+      try {
+        if (table) {
+          return HasColumnPrivByName(*snapshot, role->GetId(), *table, col,
+                                     priv);
+        } else {
+          return SystemRelationColumnPriv(conn_ctx, *snapshot, role->GetId(),
+                                          name, col, priv);
+        }
+      } catch (const SqlException& e) {
+        ThrowInvalidPrivilege(e);
+      }
+    });
 }
 
 void HasColumnPrivilegeName3Function(duckdb::DataChunk& args,
@@ -1477,43 +1344,30 @@ void HasColumnPrivilegeName3Function(duckdb::DataChunk& args,
   auto snapshot = GlobalSnapshot();
   auto current = snapshot->GetRole(conn_ctx.user());
   const auto current_schema = conn_ctx.GetCurrentSchema();
-  duckdb::UnifiedVectorFormat td, cd, pd;
-  args.data[0].ToUnifiedFormat(args.size(), td);
-  args.data[1].ToUnifiedFormat(args.size(), cd);
-  args.data[2].ToUnifiedFormat(args.size(), pd);
-  const auto* t = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(td);
-  const auto* c = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(cd);
-  const auto* p = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(pd);
-  result.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
-  auto* out = duckdb::FlatVector::GetDataMutable<bool>(result);
-  auto& validity = duckdb::FlatVector::ValidityMutable(result);
-  for (duckdb::idx_t i = 0; i < args.size(); i++) {
-    auto ti = td.sel->get_index(i), ci = cd.sel->get_index(i);
-    auto pi = pd.sel->get_index(i);
-    if (!td.validity.RowIsValid(ti) || !cd.validity.RowIsValid(ci) ||
-        !pd.validity.RowIsValid(pi) || !current) {
-      validity.SetInvalid(i);
-      continue;
-    }
-    const auto name =
-      pg::ParseObjectName({t[ti].GetData(), t[ti].GetSize()}, current_schema);
-    auto table =
-      snapshot->GetTable(catalog::NoAccessCheck(), conn_ctx.GetDatabaseId(),
-                         name.schema, name.relation);
-    const std::string_view col{c[ci].GetData(), c[ci].GetSize()};
-    const std::string_view priv{p[pi].GetData(), p[pi].GetSize()};
-    try {
-      if (table) {
-        out[i] =
-          HasColumnPrivByName(*snapshot, current->GetId(), *table, col, priv);
-      } else {
-        out[i] = SystemRelationColumnPriv(conn_ctx, *snapshot, current->GetId(),
+  duckdb::VariadicExecutor::Execute<bool, duckdb::string_t, duckdb::string_t,
+                                    duckdb::string_t>(
+    args, result,
+    [&](duckdb::string_t t, duckdb::string_t c,
+        duckdb::string_t p) -> duckdb::optional<bool> {
+      const auto name =
+        pg::ParseObjectName({t.GetData(), t.GetSize()}, current_schema);
+      auto table =
+        snapshot->GetTable(catalog::NoAccessCheck(), conn_ctx.GetDatabaseId(),
+                           name.schema, name.relation);
+      const std::string_view col{c.GetData(), c.GetSize()};
+      const std::string_view priv{p.GetData(), p.GetSize()};
+      try {
+        if (table) {
+          return HasColumnPrivByName(*snapshot, current->GetId(), *table, col,
+                                     priv);
+        } else {
+          return SystemRelationColumnPriv(conn_ctx, *snapshot, current->GetId(),
                                           name, col, priv);
+        }
+      } catch (const SqlException& e) {
+        ThrowInvalidPrivilege(e);
       }
-    } catch (const SqlException& e) {
-      ThrowInvalidPrivilege(e);
-    }
-  }
+    });
 }
 
 void HasColumnPrivilegeOidAttnum3Function(duckdb::DataChunk& args,
@@ -1522,38 +1376,22 @@ void HasColumnPrivilegeOidAttnum3Function(duckdb::DataChunk& args,
   auto& conn_ctx = GetSereneDBContext(state.GetContext());
   auto snapshot = GlobalSnapshot();
   auto current = snapshot->GetRole(conn_ctx.user());
-  duckdb::UnifiedVectorFormat td, cd, pd;
-  args.data[0].ToUnifiedFormat(args.size(), td);
-  args.data[1].ToUnifiedFormat(args.size(), cd);
-  args.data[2].ToUnifiedFormat(args.size(), pd);
-  const auto* toid = duckdb::UnifiedVectorFormat::GetData<int64_t>(td);
-  const auto* attnum = duckdb::UnifiedVectorFormat::GetData<int32_t>(cd);
-  const auto* p = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(pd);
-  result.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
-  auto* out = duckdb::FlatVector::GetDataMutable<bool>(result);
-  auto& validity = duckdb::FlatVector::ValidityMutable(result);
-  for (duckdb::idx_t i = 0; i < args.size(); i++) {
-    auto ti = td.sel->get_index(i), ci = cd.sel->get_index(i);
-    auto pi = pd.sel->get_index(i);
-    if (!td.validity.RowIsValid(ti) || !cd.validity.RowIsValid(ci) ||
-        !pd.validity.RowIsValid(pi) || !current) {
-      validity.SetInvalid(i);
-      continue;
-    }
-    auto table = snapshot->GetObject<catalog::Table>(
-      ObjectId{static_cast<uint64_t>(toid[ti])});
-    if (!table || !AttnumExists(*table, attnum[ci])) {
-      validity.SetInvalid(i);
-      continue;
-    }
-    try {
-      out[i] =
-        HasColumnPrivByAttnum(*snapshot, current->GetId(), *table, attnum[ci],
-                              {p[pi].GetData(), p[pi].GetSize()});
-    } catch (const SqlException& e) {
-      ThrowInvalidPrivilege(e);
-    }
-  }
+  duckdb::VariadicExecutor::Execute<bool, int64_t, int32_t, duckdb::string_t>(
+    args, result,
+    [&](int64_t toid, int32_t attnum,
+        duckdb::string_t p) -> duckdb::optional<bool> {
+      auto table = snapshot->GetObject<catalog::Table>(
+        ObjectId{static_cast<uint64_t>(toid)});
+      if (!table || !AttnumExists(*table, attnum)) {
+        return duckdb::nullopt;
+      }
+      try {
+        return HasColumnPrivByAttnum(*snapshot, current->GetId(), *table,
+                                     attnum, {p.GetData(), p.GetSize()});
+      } catch (const SqlException& e) {
+        ThrowInvalidPrivilege(e);
+      }
+    });
 }
 
 // Column privilege by (role, table-by-name, attnum, priv), with the same
@@ -1594,44 +1432,28 @@ void HasColumnPrivilegeNameAttnum4Function(duckdb::DataChunk& args,
   auto& conn_ctx = GetSereneDBContext(state.GetContext());
   auto snapshot = GlobalSnapshot();
   const auto current_schema = conn_ctx.GetCurrentSchema();
-  duckdb::UnifiedVectorFormat ud, td, cd, pd;
-  args.data[0].ToUnifiedFormat(args.size(), ud);
-  args.data[1].ToUnifiedFormat(args.size(), td);
-  args.data[2].ToUnifiedFormat(args.size(), cd);
-  args.data[3].ToUnifiedFormat(args.size(), pd);
-  const auto* u = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(ud);
-  const auto* t = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(td);
-  const auto* attnum = duckdb::UnifiedVectorFormat::GetData<int16_t>(cd);
-  const auto* p = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(pd);
-  result.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
-  auto* out = duckdb::FlatVector::GetDataMutable<bool>(result);
-  auto& validity = duckdb::FlatVector::ValidityMutable(result);
-  for (duckdb::idx_t i = 0; i < args.size(); i++) {
-    auto ui = ud.sel->get_index(i), ti = td.sel->get_index(i);
-    auto ci = cd.sel->get_index(i), pi = pd.sel->get_index(i);
-    if (!ud.validity.RowIsValid(ui) || !td.validity.RowIsValid(ti) ||
-        !cd.validity.RowIsValid(ci) || !pd.validity.RowIsValid(pi)) {
-      validity.SetInvalid(i);
-      continue;
-    }
-    auto role = snapshot->GetRole({u[ui].GetData(), u[ui].GetSize()});
-    if (!role) {
-      ThrowRoleNotFound({u[ui].GetData(), u[ui].GetSize()});
-    }
-    try {
-      auto r = ColumnPrivByNameTableAttnum(
-        conn_ctx, *snapshot, role->GetId(), current_schema,
-        {t[ti].GetData(), t[ti].GetSize()}, attnum[ci],
-        {p[pi].GetData(), p[pi].GetSize()});
-      if (r) {
-        out[i] = *r;
-      } else {
-        validity.SetInvalid(i);
+  duckdb::VariadicExecutor::Execute<bool, duckdb::string_t, duckdb::string_t,
+                                    int16_t, duckdb::string_t>(
+    args, result,
+    [&](duckdb::string_t u, duckdb::string_t t, int16_t attnum,
+        duckdb::string_t p) -> duckdb::optional<bool> {
+      auto role = snapshot->GetRole({u.GetData(), u.GetSize()});
+      if (!role) {
+        ThrowRoleNotFound({u.GetData(), u.GetSize()});
       }
-    } catch (const SqlException& e) {
-      ThrowInvalidPrivilege(e);
-    }
-  }
+      try {
+        auto r = ColumnPrivByNameTableAttnum(
+          conn_ctx, *snapshot, role->GetId(), current_schema,
+          {t.GetData(), t.GetSize()}, attnum, {p.GetData(), p.GetSize()});
+        if (r) {
+          return *r;
+        } else {
+          return duckdb::nullopt;
+        }
+      } catch (const SqlException& e) {
+        ThrowInvalidPrivilege(e);
+      }
+    });
 }
 
 void HasColumnPrivilegeOidNameAttnum4Function(duckdb::DataChunk& args,
@@ -1640,80 +1462,49 @@ void HasColumnPrivilegeOidNameAttnum4Function(duckdb::DataChunk& args,
   auto& conn_ctx = GetSereneDBContext(state.GetContext());
   auto snapshot = GlobalSnapshot();
   const auto current_schema = conn_ctx.GetCurrentSchema();
-  duckdb::UnifiedVectorFormat ud, td, cd, pd;
-  args.data[0].ToUnifiedFormat(args.size(), ud);
-  args.data[1].ToUnifiedFormat(args.size(), td);
-  args.data[2].ToUnifiedFormat(args.size(), cd);
-  args.data[3].ToUnifiedFormat(args.size(), pd);
-  const auto* roid = duckdb::UnifiedVectorFormat::GetData<int64_t>(ud);
-  const auto* t = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(td);
-  const auto* attnum = duckdb::UnifiedVectorFormat::GetData<int16_t>(cd);
-  const auto* p = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(pd);
-  result.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
-  auto* out = duckdb::FlatVector::GetDataMutable<bool>(result);
-  auto& validity = duckdb::FlatVector::ValidityMutable(result);
-  for (duckdb::idx_t i = 0; i < args.size(); i++) {
-    auto ui = ud.sel->get_index(i), ti = td.sel->get_index(i);
-    auto ci = cd.sel->get_index(i), pi = pd.sel->get_index(i);
-    if (!ud.validity.RowIsValid(ui) || !td.validity.RowIsValid(ti) ||
-        !cd.validity.RowIsValid(ci) || !pd.validity.RowIsValid(pi)) {
-      validity.SetInvalid(i);
-      continue;
-    }
-    try {
-      auto r = ColumnPrivByNameTableAttnum(
-        conn_ctx, *snapshot, ObjectId{static_cast<uint64_t>(roid[ui])},
-        current_schema, {t[ti].GetData(), t[ti].GetSize()}, attnum[ci],
-        {p[pi].GetData(), p[pi].GetSize()});
-      if (r) {
-        out[i] = *r;
-      } else {
-        validity.SetInvalid(i);
+  duckdb::VariadicExecutor::Execute<bool, int64_t, duckdb::string_t, int16_t,
+                                    duckdb::string_t>(
+    args, result,
+    [&](int64_t roid, duckdb::string_t t, int16_t attnum,
+        duckdb::string_t p) -> duckdb::optional<bool> {
+      try {
+        auto r = ColumnPrivByNameTableAttnum(
+          conn_ctx, *snapshot, ObjectId{static_cast<uint64_t>(roid)},
+          current_schema, {t.GetData(), t.GetSize()}, attnum,
+          {p.GetData(), p.GetSize()});
+        if (r) {
+          return *r;
+        } else {
+          return duckdb::nullopt;
+        }
+      } catch (const SqlException& e) {
+        ThrowInvalidPrivilege(e);
       }
-    } catch (const SqlException& e) {
-      ThrowInvalidPrivilege(e);
-    }
-  }
+    });
 }
 
 void HasColumnPrivilegeOidOidAttnum4Function(duckdb::DataChunk& args,
                                              duckdb::ExpressionState& state,
                                              duckdb::Vector& result) {
   auto snapshot = GlobalSnapshot();
-  duckdb::UnifiedVectorFormat ud, td, cd, pd;
-  args.data[0].ToUnifiedFormat(args.size(), ud);
-  args.data[1].ToUnifiedFormat(args.size(), td);
-  args.data[2].ToUnifiedFormat(args.size(), cd);
-  args.data[3].ToUnifiedFormat(args.size(), pd);
-  const auto* roid = duckdb::UnifiedVectorFormat::GetData<int64_t>(ud);
-  const auto* toid = duckdb::UnifiedVectorFormat::GetData<int64_t>(td);
-  const auto* attnum = duckdb::UnifiedVectorFormat::GetData<int16_t>(cd);
-  const auto* p = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(pd);
-  result.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
-  auto* out = duckdb::FlatVector::GetDataMutable<bool>(result);
-  auto& validity = duckdb::FlatVector::ValidityMutable(result);
-  for (duckdb::idx_t i = 0; i < args.size(); i++) {
-    auto ui = ud.sel->get_index(i), ti = td.sel->get_index(i);
-    auto ci = cd.sel->get_index(i), pi = pd.sel->get_index(i);
-    if (!ud.validity.RowIsValid(ui) || !td.validity.RowIsValid(ti) ||
-        !cd.validity.RowIsValid(ci) || !pd.validity.RowIsValid(pi)) {
-      validity.SetInvalid(i);
-      continue;
-    }
-    auto table = snapshot->GetObject<catalog::Table>(
-      ObjectId{static_cast<uint64_t>(toid[ti])});
-    if (!table || !AttnumExists(*table, attnum[ci])) {
-      validity.SetInvalid(i);
-      continue;
-    }
-    try {
-      out[i] = HasColumnPrivByAttnum(
-        *snapshot, ObjectId{static_cast<uint64_t>(roid[ui])}, *table,
-        attnum[ci], {p[pi].GetData(), p[pi].GetSize()});
-    } catch (const SqlException& e) {
-      ThrowInvalidPrivilege(e);
-    }
-  }
+  duckdb::VariadicExecutor::Execute<bool, int64_t, int64_t, int16_t,
+                                    duckdb::string_t>(
+    args, result,
+    [&](int64_t roid, int64_t toid, int16_t attnum,
+        duckdb::string_t p) -> duckdb::optional<bool> {
+      auto table = snapshot->GetObject<catalog::Table>(
+        ObjectId{static_cast<uint64_t>(toid)});
+      if (!table || !AttnumExists(*table, attnum)) {
+        return duckdb::nullopt;
+      }
+      try {
+        return HasColumnPrivByAttnum(
+          *snapshot, ObjectId{static_cast<uint64_t>(roid)}, *table, attnum,
+          {p.GetData(), p.GetSize()});
+      } catch (const SqlException& e) {
+        ThrowInvalidPrivilege(e);
+      }
+    });
 }
 
 void HasAnyColumnPrivilegeName3Function(duckdb::DataChunk& args,
@@ -1722,48 +1513,35 @@ void HasAnyColumnPrivilegeName3Function(duckdb::DataChunk& args,
   auto& conn_ctx = GetSereneDBContext(state.GetContext());
   auto snapshot = GlobalSnapshot();
   const auto current_schema = conn_ctx.GetCurrentSchema();
-  duckdb::UnifiedVectorFormat ud, td, pd;
-  args.data[0].ToUnifiedFormat(args.size(), ud);
-  args.data[1].ToUnifiedFormat(args.size(), td);
-  args.data[2].ToUnifiedFormat(args.size(), pd);
-  const auto* u = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(ud);
-  const auto* t = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(td);
-  const auto* p = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(pd);
-  result.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
-  auto* out = duckdb::FlatVector::GetDataMutable<bool>(result);
-  auto& validity = duckdb::FlatVector::ValidityMutable(result);
-  for (duckdb::idx_t i = 0; i < args.size(); i++) {
-    auto ui = ud.sel->get_index(i), ti = td.sel->get_index(i);
-    auto pi = pd.sel->get_index(i);
-    if (!ud.validity.RowIsValid(ui) || !td.validity.RowIsValid(ti) ||
-        !pd.validity.RowIsValid(pi)) {
-      validity.SetInvalid(i);
-      continue;
-    }
-    auto role = snapshot->GetRole({u[ui].GetData(), u[ui].GetSize()});
-    if (!role) {
-      ThrowRoleNotFound({u[ui].GetData(), u[ui].GetSize()});
-    }
-    const auto name =
-      pg::ParseObjectName({t[ti].GetData(), t[ti].GetSize()}, current_schema);
-    auto table =
-      snapshot->GetTable(catalog::NoAccessCheck(), conn_ctx.GetDatabaseId(),
-                         name.schema, name.relation);
-    try {
-      if (table) {
-        out[i] = HasAnyTablePrivilegeText(*snapshot, role->GetId(), *table,
-                                          {p[pi].GetData(), p[pi].GetSize()});
-      } else if (const auto* sys = ResolveSystemRelation(conn_ctx, name)) {
-        const auto obj = SystemRelationAsObject(*sys);
-        out[i] = HasAnyTablePrivilegeText(*snapshot, role->GetId(), obj,
-                                          {p[pi].GetData(), p[pi].GetSize()});
-      } else {
-        ThrowRelationNotFound(name.relation);
+  duckdb::VariadicExecutor::Execute<bool, duckdb::string_t, duckdb::string_t,
+                                    duckdb::string_t>(
+    args, result,
+    [&](duckdb::string_t u, duckdb::string_t t,
+        duckdb::string_t p) -> duckdb::optional<bool> {
+      auto role = snapshot->GetRole({u.GetData(), u.GetSize()});
+      if (!role) {
+        ThrowRoleNotFound({u.GetData(), u.GetSize()});
       }
-    } catch (const SqlException& e) {
-      ThrowInvalidPrivilege(e);
-    }
-  }
+      const auto name =
+        pg::ParseObjectName({t.GetData(), t.GetSize()}, current_schema);
+      auto table =
+        snapshot->GetTable(catalog::NoAccessCheck(), conn_ctx.GetDatabaseId(),
+                           name.schema, name.relation);
+      try {
+        if (table) {
+          return HasAnyTablePrivilegeText(*snapshot, role->GetId(), *table,
+                                          {p.GetData(), p.GetSize()});
+        } else if (const auto* sys = ResolveSystemRelation(conn_ctx, name)) {
+          const auto obj = SystemRelationAsObject(*sys);
+          return HasAnyTablePrivilegeText(*snapshot, role->GetId(), obj,
+                                          {p.GetData(), p.GetSize()});
+        } else {
+          ThrowRelationNotFound(name.relation);
+        }
+      } catch (const SqlException& e) {
+        ThrowInvalidPrivilege(e);
+      }
+    });
 }
 
 void HasAnyColumnPrivilegeOid2Function(duckdb::DataChunk& args,
@@ -1772,34 +1550,21 @@ void HasAnyColumnPrivilegeOid2Function(duckdb::DataChunk& args,
   auto& conn_ctx = GetSereneDBContext(state.GetContext());
   auto snapshot = GlobalSnapshot();
   auto current = snapshot->GetRole(conn_ctx.user());
-  duckdb::UnifiedVectorFormat td, pd;
-  args.data[0].ToUnifiedFormat(args.size(), td);
-  args.data[1].ToUnifiedFormat(args.size(), pd);
-  const auto* toid = duckdb::UnifiedVectorFormat::GetData<int64_t>(td);
-  const auto* p = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(pd);
-  result.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
-  auto* out = duckdb::FlatVector::GetDataMutable<bool>(result);
-  auto& validity = duckdb::FlatVector::ValidityMutable(result);
-  for (duckdb::idx_t i = 0; i < args.size(); i++) {
-    auto ti = td.sel->get_index(i), pi = pd.sel->get_index(i);
-    if (!td.validity.RowIsValid(ti) || !pd.validity.RowIsValid(pi) ||
-        !current) {
-      validity.SetInvalid(i);
-      continue;
-    }
-    auto table = snapshot->GetObject<catalog::Table>(
-      ObjectId{static_cast<uint64_t>(toid[ti])});
-    if (!table) {
-      validity.SetInvalid(i);
-      continue;
-    }
-    try {
-      out[i] = HasAnyTablePrivilegeText(*snapshot, current->GetId(), *table,
-                                        {p[pi].GetData(), p[pi].GetSize()});
-    } catch (const SqlException& e) {
-      ThrowInvalidPrivilege(e);
-    }
-  }
+  duckdb::VariadicExecutor::Execute<bool, int64_t, duckdb::string_t>(
+    args, result,
+    [&](int64_t toid, duckdb::string_t p) -> duckdb::optional<bool> {
+      auto table = snapshot->GetObject<catalog::Table>(
+        ObjectId{static_cast<uint64_t>(toid)});
+      if (!table) {
+        return duckdb::nullopt;
+      }
+      try {
+        return HasAnyTablePrivilegeText(*snapshot, current->GetId(), *table,
+                                        {p.GetData(), p.GetSize()});
+      } catch (const SqlException& e) {
+        ThrowInvalidPrivilege(e);
+      }
+    });
 }
 
 void HasAnyColumnPrivilegeName2Function(duckdb::DataChunk& args,
@@ -1809,41 +1574,29 @@ void HasAnyColumnPrivilegeName2Function(duckdb::DataChunk& args,
   auto snapshot = GlobalSnapshot();
   auto current = snapshot->GetRole(conn_ctx.user());
   const auto current_schema = conn_ctx.GetCurrentSchema();
-  duckdb::UnifiedVectorFormat td, pd;
-  args.data[0].ToUnifiedFormat(args.size(), td);
-  args.data[1].ToUnifiedFormat(args.size(), pd);
-  const auto* t = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(td);
-  const auto* p = duckdb::UnifiedVectorFormat::GetData<duckdb::string_t>(pd);
-  result.SetVectorType(duckdb::VectorType::FLAT_VECTOR);
-  auto* out = duckdb::FlatVector::GetDataMutable<bool>(result);
-  auto& validity = duckdb::FlatVector::ValidityMutable(result);
-  for (duckdb::idx_t i = 0; i < args.size(); i++) {
-    auto ti = td.sel->get_index(i), pi = pd.sel->get_index(i);
-    if (!td.validity.RowIsValid(ti) || !pd.validity.RowIsValid(pi) ||
-        !current) {
-      validity.SetInvalid(i);
-      continue;
-    }
-    const auto name =
-      pg::ParseObjectName({t[ti].GetData(), t[ti].GetSize()}, current_schema);
-    auto table =
-      snapshot->GetTable(catalog::NoAccessCheck(), conn_ctx.GetDatabaseId(),
-                         name.schema, name.relation);
-    try {
-      if (table) {
-        out[i] = HasAnyTablePrivilegeText(*snapshot, current->GetId(), *table,
-                                          {p[pi].GetData(), p[pi].GetSize()});
-      } else if (const auto* sys = ResolveSystemRelation(conn_ctx, name)) {
-        const auto obj = SystemRelationAsObject(*sys);
-        out[i] = HasAnyTablePrivilegeText(*snapshot, current->GetId(), obj,
-                                          {p[pi].GetData(), p[pi].GetSize()});
-      } else {
-        ThrowRelationNotFound(name.relation);
+  duckdb::VariadicExecutor::Execute<bool, duckdb::string_t, duckdb::string_t>(
+    args, result,
+    [&](duckdb::string_t t, duckdb::string_t p) -> duckdb::optional<bool> {
+      const auto name =
+        pg::ParseObjectName({t.GetData(), t.GetSize()}, current_schema);
+      auto table =
+        snapshot->GetTable(catalog::NoAccessCheck(), conn_ctx.GetDatabaseId(),
+                           name.schema, name.relation);
+      try {
+        if (table) {
+          return HasAnyTablePrivilegeText(*snapshot, current->GetId(), *table,
+                                          {p.GetData(), p.GetSize()});
+        } else if (const auto* sys = ResolveSystemRelation(conn_ctx, name)) {
+          const auto obj = SystemRelationAsObject(*sys);
+          return HasAnyTablePrivilegeText(*snapshot, current->GetId(), obj,
+                                          {p.GetData(), p.GetSize()});
+        } else {
+          ThrowRelationNotFound(name.relation);
+        }
+      } catch (const SqlException& e) {
+        ThrowInvalidPrivilege(e);
       }
-    } catch (const SqlException& e) {
-      ThrowInvalidPrivilege(e);
-    }
-  }
+    });
 }
 
 }  // namespace
@@ -2033,22 +1786,26 @@ void RegisterPgSystemFunctions(duckdb::DatabaseInstance& db) {
       auto snap = ctx.CatalogSnapshot();
       duckdb::UnaryExecutor::Execute<int64_t, int64_t>(
         args.data[0], result, args.size(), [&](int64_t oid) -> int64_t {
-          return GetRelationForkSize(state.GetContext(), *snap,
-                                     static_cast<uint64_t>(oid), "main");
+          return GetRelationTotalSize(state.GetContext(), *snap,
+                                      static_cast<uint64_t>(oid));
         });
     }});
 
   // pg_indexes_size(regclass)
-  loader.RegisterFunction(
-    duckdb::ScalarFunction{"pg_indexes_size",
-                           {pg::REGCLASS()},
-                           duckdb::LogicalType::BIGINT,
-                           [](duckdb::DataChunk& args, duckdb::ExpressionState&,
-                              duckdb::Vector& result) {
-                             duckdb::UnaryExecutor::Execute<int64_t, int64_t>(
-                               args.data[0], result, args.size(),
-                               [](int64_t) -> int64_t { return 0; });
-                           }});
+  loader.RegisterFunction(duckdb::ScalarFunction{
+    "pg_indexes_size",
+    {pg::REGCLASS()},
+    duckdb::LogicalType::BIGINT,
+    [](duckdb::DataChunk& args, duckdb::ExpressionState& state,
+       duckdb::Vector& result) {
+      auto& ctx = GetSereneDBContext(state.GetContext());
+      auto snap = ctx.CatalogSnapshot();
+      duckdb::UnaryExecutor::Execute<int64_t, int64_t>(
+        args.data[0], result, args.size(), [&](int64_t oid) -> int64_t {
+          return GetTableIndexesSize(state.GetContext(), *snap,
+                                     static_cast<uint64_t>(oid));
+        });
+    }});
 
   // Stub functions that throw "not supported"
   auto not_supported = [](duckdb::DataChunk&, duckdb::ExpressionState&,
@@ -2062,6 +1819,21 @@ void RegisterPgSystemFunctions(duckdb::DatabaseInstance& db) {
                                                  {pg::XID8()},
                                                  duckdb::LogicalType::VARCHAR,
                                                  not_supported});
+
+  {
+    duckdb::ScalarFunction to_regtype_fn{
+      "to_regtype",
+      {duckdb::LogicalType::VARCHAR},
+      pg::REGTYPE(),
+      ToRegtypeFunction,
+    };
+    to_regtype_fn.SetNullHandling(
+      duckdb::FunctionNullHandling::SPECIAL_HANDLING);
+    duckdb::CreateScalarFunctionInfo info{std::move(to_regtype_fn)};
+    info.SetSchema("pg_catalog");
+    info.on_conflict = duckdb::OnCreateConflict::REPLACE_ON_CONFLICT;
+    loader.RegisterFunction(std::move(info));
+  }
 
   {
     duckdb::ScalarFunction format_type_fn{
@@ -2201,11 +1973,11 @@ void RegisterPgSystemFunctions(duckdb::DatabaseInstance& db) {
     "has_schema_privilege");
   register_object_priv.operator()<catalog::ObjectType::Sequence>(
     "has_sequence_privilege");
-  register_object_priv.operator()<catalog::ObjectType::PgSqlFunction>(
+  register_object_priv.operator()<catalog::ObjectType::Function>(
     "has_function_privilege");
   register_object_priv.operator()<catalog::ObjectType::Database>(
     "has_database_privilege");
-  register_object_priv.operator()<catalog::ObjectType::PgSqlType>(
+  register_object_priv.operator()<catalog::ObjectType::Type>(
     "has_type_privilege");
 
   loader.RegisterFunction(duckdb::ScalarFunction{

@@ -34,6 +34,7 @@
 #include "catalog/catalog.h"
 #include "catalog/user_type.h"
 #include "catalog/virtual_table.h"
+#include "connector/functions/ts_query_codec.h"
 #include "connector/pg_logical_types.h"
 #include "pg/connection_context.h"
 #include "pg/errcodes.h"
@@ -200,6 +201,9 @@ PgTypeInfo Logical2Pg(const duckdb::LogicalType& type, bool in_array) {
       if (IsInet(type)) {
         return make(kInet, kInetArray, -1);
       }
+      if (connector::IsTSQueryStructType(type)) {
+        return make(kText, kTextArray, -1);
+      }
       auto ext = type.GetExtensionInfo();
       // null in case of anonymous record types (e.g. SELECT ROW(1, 2))
       if (ext) {
@@ -236,6 +240,8 @@ PgTypeInfo Logical2Pg(const duckdb::LogicalType& type, bool in_array) {
       return Logical2Pg(duckdb::ArrayType::GetChildType(type), true);
     case VARIANT:
       return make(kVariant, kVariantArray, -1);
+    case UNION:
+      return make(kUnion, kUnionArray, -1);
     default:
       return {kUnknown, static_cast<int16_t>(-1), -1};
   }
@@ -288,9 +294,10 @@ duckdb::LogicalType Oid2Type(int32_t oid, const catalog::Snapshot& snapshot) {
     SDB_OID2TYPE(kRegconfig, REGCONFIG())
     SDB_OID2TYPE(kRegdictionary, REGDICTIONARY())
     SDB_OID2TYPE(kVariant, LogicalType::VARIANT())
+    SDB_OID2TYPE(kUnion, LogicalType::VARCHAR)
     default: {
       if (auto obj = snapshot.GetObject(ObjectId{static_cast<uint64_t>(oid)});
-          obj && obj->GetType() == catalog::ObjectType::PgSqlType) {
+          obj && obj->GetType() == catalog::ObjectType::Type) {
         return basics::downCast<catalog::PgSqlType>(obj)->GetLogicalType();
       }
       THROW_SQL_ERROR(ERR_CODE(ERRCODE_INTERNAL_ERROR),
@@ -412,6 +419,7 @@ std::string RegtypeOut(uint64_t oid) {
     SDB_REGTYPE_OUT(kPgBrinBloomSummary, "pg_brin_bloom_summary")
     SDB_REGTYPE_OUT(kPgBrinMinmaxMultiSummary, "pg_brin_minmax_multi_summary")
     SDB_REGTYPE_WITH_ARRAY_OUT(kVariant, "variant")
+    SDB_REGTYPE_WITH_ARRAY_OUT(kUnion, "union")
   }
   return absl::StrCat(oid);
 }
@@ -549,7 +557,8 @@ static const containers::FlatHashMap<std::string_view, PgTypeOID>
       .SDB_REGTYPE_IN("anycompatiblemultirange", kAnycompatiblemultirange)
       .SDB_REGTYPE_IN("pg_brin_bloom_summary", kPgBrinBloomSummary)
       .SDB_REGTYPE_IN("pg_brin_minmax_multi_summary", kPgBrinMinmaxMultiSummary)
-      .SDB_REGTYPE_WITH_ARRAY_IN("variant", kVariant);
+      .SDB_REGTYPE_WITH_ARRAY_IN("variant", kVariant)
+      .SDB_REGTYPE_WITH_ARRAY_IN("union", kUnion);
     return std::move(builder.map);
   }();
 

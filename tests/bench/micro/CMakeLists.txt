@@ -35,13 +35,36 @@ add_bench(consecutive_run_length)
 add_bench(parse_query)
 add_bench(literal_lookup)
 add_bench(ci_hash)
-add_bench(ci_lower)
-add_bench(ci_fold128)
 add_bench(ci_compare)
 add_bench(socket_write)
 add_bench(duckdb_collector)
 add_bench(columnstore_vs_duckdb)
 add_bench(select_thresholds)
+add_bench(clustering)
+add_bench(simd_base64)
+add_bench(simd_json_validate)
+add_bench(simd_utf8_validate)
+
+if(ARCH_AMD64)
+    add_bench(ci_lower)
+    add_bench(ci_fold128)
+    add_bench(frozen_vs_alternatives)
+endif()
+
+# SIMD string-encoding benches: link the candidate libraries directly.
+target_link_libraries(serenedb-bench-micro-simd_base64 PRIVATE simdutf)
+target_link_libraries(serenedb-bench-micro-simd_json_validate PRIVATE simdjson)
+target_link_libraries(
+    serenedb-bench-micro-simd_utf8_validate
+    PRIVATE simdutf simdjson
+)
+# Utf8Proc baseline lives in duckdb's vendored utf8proc (not a target-interface
+# include), so add its header dir explicitly for the utf8 bench.
+target_include_directories(
+    serenedb-bench-micro-simd_utf8_validate
+    SYSTEM
+    PRIVATE ${CMAKE_SOURCE_DIR}/third_party/duckdb/third_party/utf8proc/include
+)
 target_include_directories(
     serenedb-bench-micro-ci_hash
     SYSTEM
@@ -57,16 +80,41 @@ target_link_options(
     PRIVATE -fno-lto
 )
 
+# frozen_vs_alternatives measures the boost::text frozen::set use-cases against
+# what we already vendor; needs frozen headers + the boost::text data tables.
+if(ARCH_AMD64)
+    target_link_libraries(
+        serenedb-bench-micro-frozen_vs_alternatives
+        PRIVATE text
+    )
+    target_compile_definitions(
+        serenedb-bench-micro-frozen_vs_alternatives
+        PRIVATE BOOST_TEXT_DISABLE_CONCEPTS
+    )
+    target_include_directories(
+        serenedb-bench-micro-frozen_vs_alternatives
+        SYSTEM
+        PRIVATE ${CMAKE_SOURCE_DIR}/third_party/frozen/include
+    )
+endif()
+
+# regexp_vs_wildcard splits UTF-8 via duckdb's vendored utf8proc + simdutf.
+target_link_libraries(serenedb-bench-micro-regexp_vs_wildcard PRIVATE simdutf)
+
 target_include_directories(
     serenedb-bench-micro-regexp_vs_wildcard
     SYSTEM
-    PRIVATE $<TARGET_PROPERTY:iresearch-utfcpp,INTERFACE_INCLUDE_DIRECTORIES>
+    PRIVATE ${CMAKE_SOURCE_DIR}/third_party/duckdb/third_party/utf8proc/include
 )
 
+target_link_libraries(
+    serenedb-bench-micro-sloppy_phrase_vs_disjunction
+    PRIVATE simdutf
+)
 target_include_directories(
     serenedb-bench-micro-sloppy_phrase_vs_disjunction
     SYSTEM
-    PRIVATE $<TARGET_PROPERTY:iresearch-utfcpp,INTERFACE_INCLUDE_DIRECTORIES>
+    PRIVATE ${CMAKE_SOURCE_DIR}/third_party/duckdb/third_party/utf8proc/include
 )
 
 target_include_directories(

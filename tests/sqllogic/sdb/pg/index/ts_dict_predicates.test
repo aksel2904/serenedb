@@ -1,5 +1,11 @@
 hash-threshold 100
 
+statement ok
+SET compaction_interval = 0
+
+statement ok
+SET refresh_interval = 0
+
 # Several term acceptors on the enumerated field compose: the most selective
 # claimable acceptor drives the enumeration (ByTerm > ByTerms > ByPrefix /
 # ByRange > automatons) and every other claimable acceptor becomes a term
@@ -53,15 +59,11 @@ FROM tp_idx WHERE body @@ ts_starts_with('a') AND body @@ ts_regexp('a.*e')
 QUERY PLAN
 ╭─ HASH_GROUP_BY ──────────────────────────────────╮
 │ Groups: #0                                       │
-│ ~0 rows                                          │
-╰─────────────────────────┬────────────────────────╯
-╭─ PROJECTION ────────────┴────────────────────────╮
-│ Projections: #0                                  │
-│ ~1 row                                           │
+│ ~4 rows                                          │
 ╰─────────────────────────┬────────────────────────╯
 ╭─ IRESEARCH_SCAN ────────┴────────────────────────╮
 │ Index: tp_idx                                    │
-│ Filter:                                          │
+│ Index Filter:                                    │
 │ ╭─ And ───────────────╮                          │
 │ ╰──────────┬──────────╯                          │
 │            ├────────────────────────╮            │
@@ -73,7 +75,7 @@ QUERY PLAN
 │ TsDict: body                                     │
 │ Projections:                                     │
 │ sdb_inverted_index_term$body                     │
-│ ~1 row                                           │
+│ ~8 rows                                          │
 ╰──────────────────────────────────────────────────╯
 
 query T
@@ -94,13 +96,9 @@ QUERY PLAN
 │ Groups: #0                               │
 │ ~0 rows                                  │
 ╰─────────────────────┬────────────────────╯
-╭─ PROJECTION ────────┴────────────────────╮
-│ Projections: #0                          │
-│ ~1 row                                   │
-╰─────────────────────┬────────────────────╯
 ╭─ IRESEARCH_SCAN ────┴────────────────────╮
 │ Index: tp_idx                            │
-│ Filter:                                  │
+│ Index Filter:                            │
 │ ╭─ Automaton ──────────╮                 │
 │ │ Field: cat(string)   │                 │
 │ │ Pattern: a%&[ap..az] │                 │
@@ -140,10 +138,6 @@ QUERY PLAN
 │ Groups: #0                               │
 │ ~0 rows                                  │
 ╰─────────────────────┬────────────────────╯
-╭─ PROJECTION ────────┴────────────────────╮
-│ Projections: #0                          │
-│ ~1 row                                   │
-╰─────────────────────┬────────────────────╯
 ╭─ FILTER ────────────┴────────────────────╮
 │ Expression:                              │
 │ length(sdb_inverted_index_term$cat) = 7  │
@@ -151,7 +145,7 @@ QUERY PLAN
 ╰─────────────────────┬────────────────────╯
 ╭─ IRESEARCH_SCAN ────┴────────────────────╮
 │ Index: tp_idx                            │
-│ Filter:                                  │
+│ Index Filter:                            │
 │ ╭─ Automaton ──────────╮                 │
 │ │ Field: cat(string)   │                 │
 │ │ Pattern: a%&[ap..az] │                 │
@@ -242,15 +236,11 @@ WHERE body @@ ts_starts_with('ax') OR body @@ ts_starts_with('ban')
 QUERY PLAN
 ╭─ HASH_GROUP_BY ─────────────────╮
 │ Groups: #0                      │
-│ ~0 rows                         │
-╰────────────────┬────────────────╯
-╭─ PROJECTION ───┴────────────────╮
-│ Projections: #0                 │
-│ ~1 row                          │
+│ ~4 rows                         │
 ╰────────────────┬────────────────╯
 ╭─ IRESEARCH_SCAN ────────────────╮
 │ Index: tp_idx                   │
-│ Filter:                         │
+│ Index Filter:                   │
 │ ╭─ Automaton ─────────────────╮ │
 │ │ Field: body(string)         │ │
 │ │ Pattern: (?:ax.*)|(?:ban.*) │ │
@@ -258,7 +248,7 @@ QUERY PLAN
 │ TsDict: body                    │
 │ Projections:                    │
 │ sdb_inverted_index_term$body    │
-│ ~1 row                          │
+│ ~8 rows                         │
 ╰─────────────────────────────────╯
 
 # Negation claims into the tree: SQL NOT and the TSQUERY !! prefix both
@@ -296,15 +286,11 @@ WHERE body @@ ts_starts_with('a') AND NOT (body @@ ts_regexp('.*e'))
 QUERY PLAN
 ╭─ HASH_GROUP_BY ──────────────────────────────────╮
 │ Groups: #0                                       │
-│ ~0 rows                                          │
-╰─────────────────────────┬────────────────────────╯
-╭─ PROJECTION ────────────┴────────────────────────╮
-│ Projections: #0                                  │
-│ ~1 row                                           │
+│ ~4 rows                                          │
 ╰─────────────────────────┬────────────────────────╯
 ╭─ IRESEARCH_SCAN ────────┴────────────────────────╮
 │ Index: tp_idx                                    │
-│ Filter:                                          │
+│ Index Filter:                                    │
 │ ╭─ Exclusion ─────────╮                          │
 │ ╰──────────┬──────────╯                          │
 │            ├────────────────────────╮            │
@@ -316,7 +302,7 @@ QUERY PLAN
 │ TsDict: body                                     │
 │ Projections:                                     │
 │ sdb_inverted_index_term$body                     │
-│ ~1 row                                           │
+│ ~8 rows                                          │
 ╰──────────────────────────────────────────────────╯
 
 
@@ -390,13 +376,9 @@ QUERY PLAN
 │ Groups: #0                     │
 │ ~0 rows                        │
 ╰────────────────┬───────────────╯
-╭─ PROJECTION ───┴───────────────╮
-│ Projections: #0                │
-│ ~1 row                         │
-╰────────────────┬───────────────╯
 ╭─ IRESEARCH_SCAN ───────────────╮
 │ Index: tp_idx                  │
-│ Filter:                        │
+│ Index Filter:                  │
 │ ╭─ Starts With ───────╮        │
 │ │ Field: body(string) │        │
 │ │ Prefix: ap          │        │
@@ -441,13 +423,9 @@ QUERY PLAN
 │ Groups: #0                                  │
 │ ~0 rows                                     │
 ╰──────────────────────┬──────────────────────╯
-╭─ PROJECTION ─────────┴──────────────────────╮
-│ Projections: #0                             │
-│ ~1 row                                      │
-╰──────────────────────┬──────────────────────╯
 ╭─ IRESEARCH_SCAN ─────┴──────────────────────╮
 │ Index: tp_idx                               │
-│ Filter:                                     │
+│ Index Filter:                               │
 │ ╭─ Automaton ─────────────────────────────╮ │
 │ │ Field: cat(string)                      │ │
 │ │ Pattern: (?:ap.*)|(?:banana)|(?:.*cado) │ │
@@ -490,13 +468,9 @@ QUERY PLAN
 │ Groups: #0                                       │
 │ ~0 rows                                          │
 ╰─────────────────────────┬────────────────────────╯
-╭─ PROJECTION ────────────┴────────────────────────╮
-│ Projections: #0                                  │
-│ ~1 row                                           │
-╰─────────────────────────┬────────────────────────╯
 ╭─ IRESEARCH_SCAN ────────┴────────────────────────╮
 │ Index: tp_idx                                    │
-│ Filter:                                          │
+│ Index Filter:                                    │
 │ ╭─ Or ─────────────────╮                         │
 │ ╰───────────┬──────────╯                         │
 │             ├────────────────────────╮           │

@@ -46,12 +46,6 @@ class PhrasePosition final : public PosAttr, public Frequency {
     std::tie(_start, _end) = this->GetOffsets();
   }
 
-  explicit PhrasePosition(std::vector<typename Frequency::TermPosition>&& pos,
-                          PosAttr::value_t max_slop) noexcept
-    : Frequency{std::move(pos), max_slop} {
-    std::tie(_start, _end) = this->GetOffsets();
-  }
-
   explicit PhrasePosition(
     std::vector<typename Frequency::TermPosition>&& pos,
     PosAttr::value_t max_slop,
@@ -97,9 +91,8 @@ struct TermInterval {
   PosAttr::value_t offs_min{};
   PosAttr::value_t lead_offset{};
   // Per-slot term-group id: equal ids == same connectivity component of
-  // query term sets (fixed: same term; variadic: computed per segment at
-  // prepare-collect). The slop matcher scopes position uniqueness to a
-  // component. 0 for all slots when unused (slop == 0 paths).
+  // query term sets (fixed: same term; variadic: ComputeTermGroups in
+  // phrase_filter.cpp). 0 for all slots when unused (slop == 0 paths).
   uint32_t term_group{};
 };
 

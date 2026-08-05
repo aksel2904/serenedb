@@ -26,10 +26,12 @@
 #include <iresearch/search/phrase_filter.hpp>
 #include <iresearch/search/phrase_query.hpp>
 #include <iresearch/search/range_filter.hpp>
+#include <iresearch/search/scorer.hpp>
 #include <iresearch/utils/string.hpp>
 #include <limits>
 
 #include "basics/assert.h"
+#include "connector/functions/ts_query_codec.h"
 #include "pg/errcodes.h"
 #include "pg/sql_exception_macro.h"
 #include "search.h"
@@ -37,9 +39,6 @@
 #include "ts_common.hpp"
 
 namespace sdb::connector {
-
-TSQueryOp ClassifyTSQueryFunction(std::string_view name);
-
 namespace {
 
 // DECIMAL/DOUBLE -> BIGINT rounds even under a strict cast, so
@@ -83,9 +82,7 @@ PhraseGap ParsePhraseGap(const duckdb::Value& val, std::string_view label,
 
   const auto id = val.type().id();
   if (id == duckdb::LogicalTypeId::LIST || id == duckdb::LogicalTypeId::ARRAY) {
-    const auto& children = id == duckdb::LogicalTypeId::ARRAY
-                             ? duckdb::ArrayValue::GetChildren(val)
-                             : duckdb::ListValue::GetChildren(val);
+    const auto& children = ListOrArrayChildren(val);
     if (children.size() != 2) {
       error(" interval gap must be a 2-element list [min, max], got ",
             children.size(), " elements");
@@ -121,8 +118,7 @@ void FromPhrase(irs::BooleanFilter& filter, const FilterContext& ctx,
                     ERR_HINT(kSyntaxHint));
   }
 
-  auto& phrase = ctx.negated ? Negate<irs::ByPhrase>(filter)
-                             : AddFilter<irs::ByPhrase>(filter);
+  auto& phrase = AddMaybeNegated<irs::ByPhrase>(filter, ctx, column_info);
   phrase.boost(ctx.boost);
   *phrase.mutable_field_id() =
     PickPerKindFieldId(column_info, duckdb::LogicalTypeId::VARCHAR);
@@ -395,8 +391,7 @@ void BuildFtsPhrase(irs::BooleanFilter& parent, const FilterContext& ctx,
     THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
                     ERR_MSG("ts_phrase field is not VARCHAR"));
   }
-  auto& phrase = ctx.negated ? Negate<irs::ByPhrase>(parent)
-                             : AddFilter<irs::ByPhrase>(parent);
+  auto& phrase = AddMaybeNegated<irs::ByPhrase>(parent, ctx, column_info);
   *phrase.mutable_field_id() =
     PickPerKindFieldId(column_info, duckdb::LogicalTypeId::VARCHAR);
   phrase.boost(ctx.boost);
@@ -591,8 +586,7 @@ void EmitPhraseSeq(irs::BooleanFilter& parent, const FilterContext& ctx,
     THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
                     ERR_MSG("## field is not VARCHAR"), ERR_HINT(kSyntaxHint));
   }
-  auto& phrase = ctx.negated ? Negate<irs::ByPhrase>(parent)
-                             : AddFilter<irs::ByPhrase>(parent);
+  auto& phrase = AddMaybeNegated<irs::ByPhrase>(parent, ctx, column_info);
   *phrase.mutable_field_id() =
     PickPerKindFieldId(column_info, duckdb::LogicalTypeId::VARCHAR);
   phrase.boost(ctx.boost);
@@ -618,13 +612,23 @@ void EmitPhraseSeq(irs::BooleanFilter& parent, const FilterContext& ctx,
         duckdb::ExpressionClass::BOUND_CONSTANT) {
       const auto& val =
         part_expr_ref.Cast<duckdb::BoundConstantExpression>().GetValue();
-      if (val.IsNull() || (val.type().id() != duckdb::LogicalTypeId::VARCHAR &&
-                           val.type().id() != duckdb::LogicalTypeId::BLOB)) {
+      if (auto parts = TryGetTSQueryParts(val)) {
+        if (parts->boost != irs::kNoBoost || !parts->tokenizer.empty()) {
+          THROW_SQL_ERROR(
+            ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
+            ERR_MSG("## part must not carry boost or tokenize modifiers"),
+            ERR_HINT(kSyntaxHint));
+        }
+        bare_text = std::move(parts->text);
+      } else if (!val.IsNull() &&
+                 (val.type().id() == duckdb::LogicalTypeId::VARCHAR ||
+                  val.type().id() == duckdb::LogicalTypeId::BLOB)) {
+        bare_text = duckdb::StringValue::Get(val);
+      } else {
         THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
                         ERR_MSG("## part must be a VARCHAR constant"),
                         ERR_HINT(kSyntaxHint));
       }
-      bare_text = duckdb::StringValue::Get(val);
       leaf_op = TSQueryOp::Term;
     } else if (part_expr_ref.GetExpressionClass() ==
                duckdb::ExpressionClass::BOUND_FUNCTION) {
@@ -640,11 +644,10 @@ void EmitPhraseSeq(irs::BooleanFilter& parent, const FilterContext& ctx,
     }
 
     auto get_text_arg = [&] {
-      std::string out;
       if (!f) {
-        out = bare_text;
-        return out;
+        return std::move(bare_text);
       }
+      std::string out;
       if (f->GetChildren().size() != 1) {
         THROW_SQL_ERROR(
           ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),

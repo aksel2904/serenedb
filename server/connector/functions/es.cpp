@@ -176,13 +176,16 @@ CreateIndexRequest ParseCreateIndexBody(std::string_view index,
   if (body.empty()) {
     return request;
   }
+  simdjson::padded_string padded{body};
+  simdjson::ondemand::parser parser;
+  simdjson::ondemand::document doc;
+  if (const auto ec = parser.iterate(padded).get(doc);
+      ec != simdjson::SUCCESS) {
+    THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_TEXT_REPRESENTATION),
+                    ERR_MSG("Failed to parse mapping for index [", index,
+                            "]: ", simdjson::error_message(ec)));
+  }
   try {
-    simdjson::padded_string padded{body};
-    simdjson::ondemand::parser parser;
-    simdjson::ondemand::document doc;
-    if (parser.iterate(padded).get(doc) != simdjson::SUCCESS) {
-      throw std::runtime_error{"invalid JSON"};
-    }
     basics::JsonSource source{doc};
     basics::ReadObject(source, request);
   } catch (const std::exception& e) {
@@ -277,8 +280,9 @@ void CreateTextIndex(duckdb::ClientContext& context, ObjectId database_id,
   }
 
   catalog::InvertedIndexOptions options{
-    .row_group_size = ResolveUintSetting(context, "row_group_size"),
-    .norm_row_group_size = ResolveUintSetting(context, "norm_row_group_size"),
+    .row_group_size = ResolveUintSetting(context, kRowGroupSizeSetting),
+    .norm_row_group_size =
+      ResolveUintSetting(context, kNormRowGroupSizeSetting),
     .refresh_interval_ms = ResolveUintSetting(context, kRefreshIntervalSetting),
     .compaction_interval_ms =
       ResolveUintSetting(context, kCompactionIntervalSetting),
@@ -289,7 +293,7 @@ void CreateTextIndex(duckdb::ClientContext& context, ObjectId database_id,
   const auto index_name = absl::StrCat(index, kEsTextIndexSuffix);
   catalog.CreateInvertedIndex(catalog::NoAccessCheck(), context, database_id,
                               kEsSchema, index, index_name,
-                              std::move(idx_columns), std::move(options),
+                              std::move(idx_columns), std::move(options), {},
                               {.create_with_tombstone = true});
 
   auto fresh = catalog.GetCatalogSnapshot();
@@ -853,10 +857,11 @@ void EsDocExecute(duckdb::ClientContext& context,
   simdjson::padded_string padded{data.body};
   simdjson::ondemand::parser parser;
   simdjson::ondemand::document doc;
-  if (parser.iterate(padded).get(doc) != simdjson::SUCCESS) {
-    THROW_SQL_ERROR(
-      ERR_CODE(ERRCODE_INVALID_TEXT_REPRESENTATION),
-      ERR_MSG("failed to parse document for index [", data.index, "]"));
+  if (const auto ec = parser.iterate(padded).get(doc);
+      ec != simdjson::SUCCESS) {
+    THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_TEXT_REPRESENTATION),
+                    ERR_MSG("failed to parse document for index [", data.index,
+                            "]: ", simdjson::error_message(ec)));
   }
   WriteDocRow(data, doc, data.id, data.body, output, 0);
   output.SetChildCardinality(1);

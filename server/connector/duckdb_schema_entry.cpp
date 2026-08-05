@@ -20,6 +20,8 @@
 
 #include "connector/duckdb_schema_entry.h"
 
+#include <absl/algorithm/container.h>
+
 #include <duckdb/catalog/catalog.hpp>
 #include <duckdb/catalog/catalog_entry/duck_table_entry.hpp>
 #include <duckdb/common/constants.hpp>
@@ -29,6 +31,7 @@
 #include <duckdb/parser/constraints/not_null_constraint.hpp>
 #include <duckdb/parser/constraints/unique_constraint.hpp>
 #include <duckdb/parser/expression/columnref_expression.hpp>
+#include <duckdb/parser/expression/constant_expression.hpp>
 #include <duckdb/parser/expression/operator_expression.hpp>
 #include <duckdb/parser/parsed_data/alter_scalar_function_info.hpp>
 #include <duckdb/parser/parsed_data/alter_table_info.hpp>
@@ -59,6 +62,7 @@
 #include "connector/duckdb_client_state.h"
 #include "connector/duckdb_entry_cache.h"
 #include "connector/duckdb_table_entry.h"
+#include "connector/inverted_index_options_util.h"
 #include "connector/pg_logical_types.h"
 #include "connector/search_table_dispatch.h"
 #include "connector/with_option_resolver.h"
@@ -127,9 +131,9 @@ duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::LookupEntry(
     if (object && name.GetIdentifierName() != StaticStrings::kPgCatalogSchema) {
       const auto need = [&] {
         switch (object->GetType()) {
-          case catalog::ObjectType::PgSqlFunction:
+          case catalog::ObjectType::Function:
             return catalog::AclMode::Execute;
-          case catalog::ObjectType::PgSqlType:
+          case catalog::ObjectType::Type:
             return catalog::AclMode::Usage;
           default:
             return catalog::AclMode::NoRights;
@@ -266,6 +270,7 @@ duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateTable(
     auto& sdb_col =
       options.columns.emplace_back(ObjectId{}, catalog::NextId(),
                                    col.Name().GetIdentifierName(), col.Type());
+    sdb_col.compression = col.CompressionType();
 
     bool is_smallserial = pg::IsSmallserial(sdb_col.type);
     bool is_serial = pg::IsSerial(sdb_col.type);
@@ -603,8 +608,8 @@ duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateIndex(
       return ResolveUintWithOption(context, key, find_with(key));
     };
     catalog::InvertedIndexOptions options{
-      .row_group_size = resolve_uint("row_group_size"),
-      .norm_row_group_size = resolve_uint("norm_row_group_size"),
+      .row_group_size = resolve_uint(kRowGroupSizeSetting),
+      .norm_row_group_size = resolve_uint(kNormRowGroupSizeSetting),
       .refresh_interval_ms = resolve_uint(kRefreshIntervalSetting),
       .compaction_interval_ms = resolve_uint(kCompactionIntervalSetting),
       .cleanup_interval_step = resolve_uint(kCleanupIntervalStepSetting),
@@ -618,15 +623,18 @@ duckdb::optional_ptr<duckdb::CatalogEntry> SereneDBSchemaEntry::CreateIndex(
       catalog::ActingAs(context), context, database_id,
       name.GetIdentifierName(), sdb_table->GetName(),
       info.GetIndexName().GetIdentifierName(), std::move(idx_columns),
-      std::move(options),
-      /*operation_options=*/{.if_not_exists = if_not_exists});
+      std::move(options), {}, {.if_not_exists = if_not_exists});
   } else {
+    if (!info.options.empty()) {
+      THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
+                      ERR_MSG("unrecognized parameter \"",
+                              info.options.begin()->first, "\""));
+    }
     bool unique = (info.constraint_type == duckdb::IndexConstraintType::UNIQUE);
     created = catalog_impl.CreateSecondaryIndex(
       catalog::ActingAs(context), database_id, name.GetIdentifierName(),
       sdb_table->GetName(), info.GetIndexName().GetIdentifierName(),
-      std::move(idx_columns), unique,
-      /*operation_options=*/{.if_not_exists = if_not_exists});
+      std::move(idx_columns), unique, {.if_not_exists = if_not_exists});
   }
   if (!created) {
     return nullptr;
@@ -882,9 +890,10 @@ void SereneDBSchemaEntry::Alter(duckdb::CatalogTransaction transaction,
   }
 
   // COMMENT ON TABLE/COLUMN are top-level AlterTypes (not inside ALTER_TABLE),
-  // so intercept them before the ALTER_TABLE guard. Both route through
-  // ChangeTable copy-on-write; the comment surfaces in duckdb_tables()/
-  // duckdb_columns(). NULL clears the comment (empty string).
+  // so intercept them before the ALTER_TABLE guard. The comment surfaces in
+  // duckdb_tables()/duckdb_columns()/duckdb_views()/duckdb_indexes()/
+  // duckdb_sequences()/duckdb_types()/duckdb_functions(). NULL clears the
+  // comment (empty string).
   if (info.type == duckdb::AlterType::SET_COMMENT) {
     auto& comment_info = info.Cast<duckdb::SetCommentInfo>();
     std::string comment =
@@ -892,16 +901,66 @@ void SereneDBSchemaEntry::Alter(duckdb::CatalogTransaction transaction,
         ? std::string{}
         : comment_info.comment_value.DefaultCastAs(duckdb::LogicalType::VARCHAR)
             .GetValue<std::string>();
-    catalog_impl.ChangeTable(
-      ax, db, name.GetIdentifierName(),
-      info.GetQualifiedName().Name().GetIdentifierName(),
-      [&](const catalog::Table& table,
-          std::shared_ptr<catalog::Table>& updated) {
-        table.SetComment(updated, comment);
-      },
-      {.missing_ok =
-         info.if_not_found == duckdb::OnEntryNotFound::RETURN_NULL});
-    return;
+    const bool missing_ok =
+      info.if_not_found == duckdb::OnEntryNotFound::RETURN_NULL;
+    switch (comment_info.entry_catalog_type) {
+      case duckdb::CatalogType::TABLE_ENTRY: {
+        auto relation = catalog_impl.GetCatalogSnapshot()->GetRelation(
+          catalog::NoAccessCheck(), db, name.GetIdentifierName(),
+          info.GetQualifiedName().Name().GetIdentifierName());
+        if (relation && relation->GetType() == catalog::ObjectType::View) {
+          catalog_impl.SetObjectComment(
+            ax, db, name.GetIdentifierName(),
+            info.GetQualifiedName().Name().GetIdentifierName(),
+            catalog::ObjectType::View, comment, missing_ok);
+          return;
+        }
+        catalog_impl.ChangeTable(
+          ax, db, name.GetIdentifierName(),
+          info.GetQualifiedName().Name().GetIdentifierName(),
+          [&](const catalog::Table& table,
+              std::shared_ptr<catalog::Table>& updated) {
+            table.SetComment(updated, comment);
+          },
+          {.missing_ok = missing_ok});
+        return;
+      }
+      case duckdb::CatalogType::VIEW_ENTRY:
+        catalog_impl.SetObjectComment(
+          ax, db, name.GetIdentifierName(),
+          info.GetQualifiedName().Name().GetIdentifierName(),
+          catalog::ObjectType::View, comment, missing_ok);
+        return;
+      case duckdb::CatalogType::SEQUENCE_ENTRY:
+        catalog_impl.SetObjectComment(
+          ax, db, name.GetIdentifierName(),
+          info.GetQualifiedName().Name().GetIdentifierName(),
+          catalog::ObjectType::Sequence, comment, missing_ok);
+        return;
+      case duckdb::CatalogType::INDEX_ENTRY:
+        catalog_impl.SetObjectComment(
+          ax, db, name.GetIdentifierName(),
+          info.GetQualifiedName().Name().GetIdentifierName(),
+          catalog::ObjectType::SecondaryIndex, comment, missing_ok);
+        return;
+      case duckdb::CatalogType::TYPE_ENTRY:
+        catalog_impl.SetObjectComment(
+          ax, db, name.GetIdentifierName(),
+          info.GetQualifiedName().Name().GetIdentifierName(),
+          catalog::ObjectType::Type, comment, missing_ok);
+        return;
+      case duckdb::CatalogType::MACRO_ENTRY:
+      case duckdb::CatalogType::TABLE_MACRO_ENTRY:
+        catalog_impl.SetObjectComment(
+          ax, db, name.GetIdentifierName(),
+          info.GetQualifiedName().Name().GetIdentifierName(),
+          catalog::ObjectType::Function, comment, missing_ok);
+        return;
+      default:
+        THROW_SQL_ERROR(
+          ERR_CODE(ERRCODE_FEATURE_NOT_SUPPORTED),
+          ERR_MSG("COMMENT ON is not supported for this object type"));
+    }
   }
 
   if (info.type == duckdb::AlterType::SET_COLUMN_COMMENT) {
@@ -911,6 +970,15 @@ void SereneDBSchemaEntry::Alter(duckdb::CatalogTransaction transaction,
         ? std::string{}
         : comment_info.comment_value.DefaultCastAs(duckdb::LogicalType::VARCHAR)
             .GetValue<std::string>();
+    const bool missing_ok =
+      info.if_not_found == duckdb::OnEntryNotFound::RETURN_NULL;
+    if (comment_info.catalog_entry_type == duckdb::CatalogType::VIEW_ENTRY) {
+      catalog_impl.SetViewColumnComment(
+        ax, db, name.GetIdentifierName(),
+        info.GetQualifiedName().Name().GetIdentifierName(),
+        comment_info.column_name.GetIdentifierName(), comment, missing_ok);
+      return;
+    }
     catalog_impl.ChangeTable(
       ax, db, name.GetIdentifierName(),
       info.GetQualifiedName().Name().GetIdentifierName(),
@@ -919,8 +987,7 @@ void SereneDBSchemaEntry::Alter(duckdb::CatalogTransaction transaction,
         table.SetColumnComment(
           updated, comment_info.column_name.GetIdentifierName(), comment);
       },
-      {.missing_ok =
-         info.if_not_found == duckdb::OnEntryNotFound::RETURN_NULL});
+      {.missing_ok = missing_ok});
     return;
   }
 
@@ -931,6 +998,98 @@ void SereneDBSchemaEntry::Alter(duckdb::CatalogTransaction transaction,
 
   auto& table_info = info.Cast<duckdb::AlterTableInfo>();
   auto table_name = info.GetQualifiedName().Name().GetIdentifierName();
+
+  // ALTER INDEX <name> SET/RESET (option = ...): the maintenance/perf subset
+  // of the inverted-index WITH options is alterable; SET writes the given
+  // value, RESET restores the session-level default. Structural options
+  // (row_group_size, store_pk, optimize_top_k, ...) shape the indexed data
+  // and stay create-time only.
+  if (table_info.alter_table_type ==
+        duckdb::AlterTableType::SET_TABLE_OPTIONS ||
+      table_info.alter_table_type ==
+        duckdb::AlterTableType::RESET_TABLE_OPTIONS) {
+    auto& context = transaction.GetContext();
+    // ALTER TABLE <name> SET/RESET (...) (PG storage params) parses into the
+    // same info as ALTER INDEX: resolve the target first, only inverted
+    // indexes have alterable options. A missing name falls through to
+    // AlterInvertedIndexOptions (IF EXISTS / does-not-exist handling).
+    if (auto relation = catalog_impl.GetCatalogSnapshot()->GetRelation(
+          catalog::NoAccessCheck(), db, name.GetIdentifierName(), table_name)) {
+      if (relation->GetType() == catalog::ObjectType::SecondaryIndex) {
+        THROW_SQL_ERROR(
+          ERR_CODE(ERRCODE_WRONG_OBJECT_TYPE),
+          ERR_MSG("\"", table_name, "\" is not an inverted index"));
+      }
+      if (relation->GetType() != catalog::ObjectType::InvertedIndex) {
+        THROW_SQL_ERROR(ERR_CODE(ERRCODE_FEATURE_NOT_SUPPORTED),
+                        ERR_MSG("this ALTER TABLE operation is not supported"));
+      }
+    }
+    const auto require_alterable = [](std::string_view option) {
+      if (!absl::c_contains(kAlterableInvertedOptions, option)) {
+        THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
+                        ERR_MSG("option \"", option,
+                                "\" cannot be changed with ALTER INDEX"));
+      }
+    };
+    std::vector<std::pair<std::string, uint64_t>> changes;
+    if (table_info.alter_table_type ==
+        duckdb::AlterTableType::SET_TABLE_OPTIONS) {
+      for (auto& [option, expr] :
+           table_info.Cast<duckdb::SetTableOptionsInfo>().table_options) {
+        if (!expr ||
+            expr->GetExpressionClass() != duckdb::ExpressionClass::CONSTANT) {
+          THROW_SQL_ERROR(
+            ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
+            ERR_MSG("option \"", option, "\" requires a constant value"));
+        }
+        require_alterable(option);
+        changes.emplace_back(
+          option,
+          ValidateInvertedIndexOptionValue(
+            option, expr->Cast<duckdb::ConstantExpression>().GetValue()));
+      }
+    } else {
+      // RESET stores the session-resolved value, which goes through the same
+      // validator as an explicit SET.
+      for (const auto& option :
+           table_info.Cast<duckdb::ResetTableOptionsInfo>().table_options) {
+        const auto& option_name = option.GetIdentifierName();
+        require_alterable(option_name);
+        changes.emplace_back(
+          option_name,
+          ValidateInvertedIndexOptionValue(
+            option_name, duckdb::Value::UBIGINT(ResolveUbigintWithOption(
+                           context, option_name, nullptr))));
+      }
+    }
+    catalog_impl.AlterInvertedIndexOptions(
+      ax, db, name.GetIdentifierName(), table_name,
+      [&](catalog::InvertedIndexOptions& options) {
+        for (const auto& [option, value] : changes) {
+          if (option == kRefreshIntervalSetting) {
+            options.refresh_interval_ms = static_cast<uint32_t>(value);
+          } else if (option == kCompactionIntervalSetting) {
+            options.compaction_interval_ms = static_cast<uint32_t>(value);
+          } else if (option == kCleanupIntervalStepSetting) {
+            options.cleanup_interval_step = static_cast<uint32_t>(value);
+          } else if (option == kSegmentMemoryMaxSetting) {
+            options.segment_memory_max = value;
+          } else if (option == kSegmentDocsMaxSetting) {
+            options.segment_docs_max = static_cast<uint32_t>(value);
+          } else if (option == kCompactionMaxSegmentsSetting) {
+            options.compaction_max_segments = static_cast<uint32_t>(value);
+          } else if (option == kCompactionMaxSegmentsBytesSetting) {
+            options.compaction_max_segments_bytes = value;
+          } else {
+            SDB_ASSERT(option == kCompactionFloorSegmentBytesSetting);
+            options.compaction_floor_segment_bytes = value;
+          }
+        }
+      },
+      info.if_not_found == duckdb::OnEntryNotFound::RETURN_NULL);
+    return;
+  }
 
   // Search-backed tables have a fixed iresearch schema, so structural ALTERs
   // are rejected. Renames (table/column/constraint) are catalog-only metadata
@@ -1165,6 +1324,7 @@ void SereneDBSchemaEntry::Alter(duckdb::CatalogTransaction transaction,
       }
       catalog::Column column{ObjectId{}, catalog::NextId(),
                              cd.Name().GetIdentifierName(), cd.Type()};
+      column.compression = cd.CompressionType();
       if (cd.HasDefaultValue()) {
         column.expr = std::make_shared<ColumnExpr>(cd.DefaultValue().Copy());
       }
