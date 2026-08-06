@@ -178,9 +178,12 @@ a
 # Error paths.
 # ----------------------------------------------------------------------
 
-# Negative slop.
-statement error
+query error
 SELECT a FROM sloppy_idx WHERE b @@ ts_phrase('quick fox', slop := -1);
+----
+db error: ERROR: ts_phrase slop must be >= 0, got -1
+HINT: Example: ts_phrase('quick brown fox') or ts_phrase('a', 1, 'b', slop := 2). INTEGER / INTEGER[] gap allowed between text args; `slop := N` is a non-negative budget for position rearrangements (incompatible with interval gaps).
+
 
 # NULL slop folds the predicate to NULL at bind: no rows, no error.
 query
@@ -188,13 +191,19 @@ SELECT a FROM sloppy_idx WHERE b @@ ts_phrase('quick fox', slop := NULL) ORDER B
 ----
 a
 
-# Interval gaps are incompatible with a slop budget.
-statement error
+query error
 SELECT a FROM sloppy_idx WHERE b @@ ts_phrase('quick', [1, 3], 'fox', slop := 2);
+----
+db error: ERROR: slop is incompatible with interval gaps ([min, max])
+HINT: Use exact gaps (single INTEGER) with slop, or drop it.
 
-# ::slop on a non-phrase leaf.
-statement error
+
+query error
 SELECT a FROM sloppy_idx WHERE b @@ ts_like('quick')::slop(2);
+----
+db error: ERROR: ::slop(N) is only valid on a phrase
+HINT: Apply ::slop to ts_phrase(...), e.g. ts_phrase('a b c')::slop(2).
+
 
 # ::slop over NULL: casting a NULL constant retypes it without a cast
 # node, so the modifier dissolves with the NULL and the predicate
@@ -205,25 +214,38 @@ SELECT a FROM sloppy_idx WHERE b @@ NULL::tsquery::slop(2) ORDER BY a;
 ----
 a
 
-# Slop on a tsquery_phrase / ## part.
-statement error
+query error
 SELECT a FROM sloppy_idx WHERE b @@ tsquery_phrase(ts_phrase('quick')::slop(1), ts_phrase('fox'), 2);
+----
+db error: ERROR: ## part must not carry a slop modifier
+HINT: Use ts_phrase(..., slop := N) or ts_phrase(...)::slop(N) for a sloppy phrase.
 
-# ::slop applied twice.
-statement error
+
+query error
 SELECT a FROM sloppy_idx WHERE b @@ ts_phrase('quick fox')::slop(1)::slop(2);
+----
+db error: ERROR: ::slop specified more than once
+HINT: Apply ::slop(N) at most once per phrase.
 
-# ::slop plus the slop argument (two budgets collide).
-statement error
+
+query error
 SELECT a FROM sloppy_idx WHERE b @@ ts_phrase('quick fox', slop := 1)::slop(2);
+----
+db error: ERROR: slop specified more than once
+HINT: Use either the `slop := N` argument or `::slop(N)`, not both.
 
-# ::slop budget must be >= 0 (rejected at bind by the type binder).
-statement error
+
+query error
 SELECT a FROM sloppy_idx WHERE b @@ ts_phrase('quick fox')::slop(-2);
+----
+db error: ERROR: slop() budget must be >= 0, got -2
 
-# ::slop budget above the position-attribute range.
-statement error
+
+query error
 SELECT a FROM sloppy_idx WHERE b @@ ts_phrase('quick fox')::slop(5000000000);
+----
+db error: ERROR: ::slop too large: 5000000000
+
 
 # Additional corpus for the multi-term, repeated-term, and gap cases.
 
@@ -311,23 +333,38 @@ a
 # Budget validation: strict integer, no silent rounding.
 # ----------------------------------------------------------------------
 
-statement error
+query error
 SELECT a FROM sloppy_idx WHERE b @@ ts_phrase('quick fox')::slop(1.5);
+----
+db error: ERROR: slop() budget must be a non-null integer, got 1.5
 
-statement error
+
+query error
 SELECT a FROM sloppy_idx WHERE b @@ ts_phrase('quick fox')::slop(NULL);
+----
+db error: ERROR: slop() budget must be a non-null integer, got NULL
 
-# Function form above the position-attribute range: same error as the
-# ::slop form.
-statement error
+
+query error
 SELECT a FROM sloppy_idx WHERE b @@ ts_phrase('quick fox', slop := 5000000000);
+----
+db error: ERROR: ts_phrase slop too large: 5000000000
+HINT: Example: ts_phrase('quick brown fox') or ts_phrase('a', 1, 'b', slop := 2). INTEGER / INTEGER[] gap allowed between text args; `slop := N` is a non-negative budget for position rearrangements (incompatible with interval gaps).
 
-# Fractional gaps error the same way as fractional budgets.
-statement error
+
+query error
 SELECT a FROM sloppy_idx WHERE b @@ ts_phrase('quick', 1.5, 'fox');
+----
+db error: ERROR: ts_phrase gap must be a non-null non-negative integer, got 1.5 of type DECIMAL(2,1) (argument 1)
+HINT: Example: ts_phrase('quick brown fox') or ts_phrase('a', 1, 'b', slop := 2). INTEGER / INTEGER[] gap allowed between text args; `slop := N` is a non-negative budget for position rearrangements (incompatible with interval gaps).
 
-statement error
+
+query error
 SELECT a FROM sloppy_idx WHERE b @@ ts_phrase('quick', 1.5, 'fox', slop := 0);
+----
+db error: ERROR: ts_phrase gap must be a non-null non-negative integer, got 1.5 of type DECIMAL(2,1) (argument 1)
+HINT: Example: ts_phrase('quick brown fox') or ts_phrase('a', 1, 'b', slop := 2). INTEGER / INTEGER[] gap allowed between text args; `slop := N` is a non-negative budget for position rearrangements (incompatible with interval gaps).
+
 
 query
 EXPLAIN SELECT a FROM sloppy_idx WHERE b @@ ts_phrase('quick fox', slop := 1);
