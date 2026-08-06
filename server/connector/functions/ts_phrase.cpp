@@ -18,6 +18,7 @@
 /// Copyright holder is SereneDB GmbH, Berlin, Germany
 ////////////////////////////////////////////////////////////////////////////////
 
+#include <absl/strings/match.h>
 #include <absl/strings/str_cat.h>
 
 #include <cstdint>
@@ -107,8 +108,10 @@ void FromPhrase(irs::BooleanFilter& filter, const FilterContext& ctx,
                 const SearchColumnInfo& column_info,
                 const duckdb::BoundFunctionExpression& func) {
   static constexpr std::string_view kSyntaxHint =
-    "Example: ts_phrase('quick brown fox') or ts_phrase('a', 1, 'b'). "
-    "INTEGER / INTEGER[] gap allowed between text args.";
+    "Example: ts_phrase('quick brown fox') or ts_phrase('a', 1, 'b', "
+    "slop := 2). INTEGER / INTEGER[] gap allowed between text args; "
+    "`slop := N` is a non-negative budget for position rearrangements "
+    "(incompatible with interval gaps).";
   SDB_ASSERT(!func.GetChildren().empty());
 
   if (column_info.logical_type.id() != duckdb::LogicalTypeId::VARCHAR &&
@@ -116,6 +119,35 @@ void FromPhrase(irs::BooleanFilter& filter, const FilterContext& ctx,
     THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
                     ERR_MSG("ts_phrase field is not VARCHAR"),
                     ERR_HINT(kSyntaxHint));
+  }
+
+  // `slop := N`: the binder appends named varargs after the positional
+  // ones and keeps the name as the child's alias.
+  std::optional<int64_t> arg_slop;
+  for (const auto& child : func.GetChildren()) {
+    if (!absl::EqualsIgnoreCase(child->GetAlias().GetIdentifierName(),
+                                "slop")) {
+      continue;
+    }
+    int64_t slop_raw = 0;
+    GetIntArg(*child, slop_raw, {"ts_phrase slop", kSyntaxHint});
+    if (slop_raw < 0) {
+      THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
+                      ERR_MSG("ts_phrase slop must be >= 0, got ", slop_raw),
+                      ERR_HINT(kSyntaxHint));
+    }
+    if (slop_raw > std::numeric_limits<irs::PosAttr::value_t>::max()) {
+      THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
+                      ERR_MSG("ts_phrase slop too large: ", slop_raw),
+                      ERR_HINT(kSyntaxHint));
+    }
+    arg_slop = slop_raw;
+  }
+  if (arg_slop && ctx.slop > 0) {
+    THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
+                    ERR_MSG("slop specified more than once"),
+                    ERR_HINT("Use either the `slop := N` argument or "
+                             "`::slop(N)`, not both."));
   }
 
   auto& phrase = AddMaybeNegated<irs::ByPhrase>(filter, ctx, column_info);
@@ -129,6 +161,10 @@ void FromPhrase(irs::BooleanFilter& filter, const FilterContext& ctx,
   std::optional<PhraseGap> pending_gap;
 
   for (size_t i = 0; i < func.GetChildren().size(); ++i) {
+    if (absl::EqualsIgnoreCase(
+          func.GetChildren()[i]->GetAlias().GetIdentifierName(), "slop")) {
+      continue;
+    }
     const auto* const_val = TryGetConstant(*func.GetChildren()[i]);
     if (!const_val) {
       THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -195,158 +231,15 @@ void FromPhrase(irs::BooleanFilter& filter, const FilterContext& ctx,
                "single-term ts_phrase / ts_like."));
   }
 
-  // Composable ::slop(N): ctx.slop > 0 only when a ::slop cast wrapped
-  // this phrase; otherwise a no-op and exact-phrase options are emitted
-  // byte-for-byte as before. Slop + interval gaps are mutually exclusive
-  // (see SDB_ENSURE in phrase_query.cpp).
-  if (ctx.slop > 0) {
-    for (const auto& info : *opts) {
-      if (info.offs_min != info.offs_max) {
-        THROW_SQL_ERROR(
-          ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
-          ERR_MSG("::slop is incompatible with interval gaps ([min, max])"),
-          ERR_HINT("Use exact gaps (single INTEGER) with ::slop, or drop it."));
-      }
-    }
-    opts->set_slop(ctx.slop);
-  }
-}
-
-void FromSloppyPhrase(irs::BooleanFilter& filter, const FilterContext& ctx,
-                      const SearchColumnInfo& column_info,
-                      const duckdb::BoundFunctionExpression& func) {
-  static constexpr std::string_view kSyntaxHint =
-    "Example: ts_sloppy_phrase('quick brown fox', 2). slop is a "
-    "non-negative INTEGER budget for position rearrangements. "
-    "Interval gaps ([min, max]) are not allowed with slop - use "
-    "exact gaps (single INTEGER) only.";
-  SDB_ASSERT(func.GetChildren().size() >= 2);
-
-  if (column_info.logical_type.id() != duckdb::LogicalTypeId::VARCHAR &&
-      column_info.logical_type.id() != duckdb::LogicalTypeId::BLOB) {
-    THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
-                    ERR_MSG("ts_sloppy_phrase field is not VARCHAR"),
-                    ERR_HINT(kSyntaxHint));
-  }
-
-  // children[1] is slop (BIGINT per registration).
-  int64_t slop_raw = 0;
-  GetIntArg(*func.GetChildren()[1], slop_raw,
-            {"ts_sloppy_phrase slop", kSyntaxHint});
-  if (slop_raw < 0) {
-    THROW_SQL_ERROR(
-      ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
-      ERR_MSG("ts_sloppy_phrase slop must be >= 0, got ", slop_raw),
-      ERR_HINT(kSyntaxHint));
-  }
-  if (slop_raw > std::numeric_limits<irs::PosAttr::value_t>::max()) {
-    THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
-                    ERR_MSG("ts_sloppy_phrase slop too large: ", slop_raw),
-                    ERR_HINT(kSyntaxHint));
-  }
-  const auto slop = static_cast<irs::PosAttr::value_t>(slop_raw);
-
-  auto& phrase = ctx.negated ? Negate<irs::ByPhrase>(filter)
-                             : AddFilter<irs::ByPhrase>(filter);
-  phrase.boost(ctx.boost);
-  *phrase.mutable_field_id() =
-    PickPerKindFieldId(column_info, duckdb::LogicalTypeId::VARCHAR);
-  auto* opts = phrase.mutable_options();
-  auto& analyzer = ctx.tokenizer;
-  const irs::TermAttr* token = irs::get<irs::TermAttr>(analyzer);
-
-  std::optional<PhraseGap> pending_gap;
-
-  // Walk children: [0] is the first text, [1] is slop (already
-  // consumed), [2..] alternates text and gap exactly like ts_phrase.
-  for (size_t i = 0; i < func.GetChildren().size(); ++i) {
-    if (i == 1) {
-      continue;  // slop, already consumed above
-    }
-    const auto* const_val = TryGetConstant(*func.GetChildren()[i]);
-    if (!const_val) {
-      THROW_SQL_ERROR(
-        ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
-        ERR_MSG("ts_sloppy_phrase argument ", i, " must be a constant"),
-        ERR_HINT(kSyntaxHint));
-    }
-    if (const_val->type().id() == duckdb::LogicalTypeId::VARCHAR ||
-        const_val->type().id() == duckdb::LogicalTypeId::BLOB) {
-      auto text = duckdb::StringValue::Get(*const_val);
-      analyzer.reset(std::string_view{text});
-      while (analyzer.next()) {
-        if (pending_gap) {
-          opts
-            ->push_back<irs::ByTermOptions>(pending_gap->min, pending_gap->max)
-            .term.assign(token->value);
-        } else {
-          opts->push_back<irs::ByTermOptions>().term.assign(token->value);
-        }
-        pending_gap.reset();
-      }
-      continue;
-    }
-    if (opts->empty()) {
-      THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
-                      ERR_MSG("ts_sloppy_phrase gap at argument ", i,
-                              " must be preceded by a text pattern"),
-                      ERR_HINT(kSyntaxHint));
-    }
-    if (pending_gap) {
-      THROW_SQL_ERROR(
-        ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
-        ERR_MSG("ts_sloppy_phrase has consecutive gaps at argument ", i),
-        ERR_HINT(kSyntaxHint));
-    }
-    pending_gap =
-      ParsePhraseGap(*const_val, "ts_sloppy_phrase", kSyntaxHint, i);
-  }
-
-  if (pending_gap) {
-    THROW_SQL_ERROR(
-      ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
-      ERR_MSG("ts_sloppy_phrase ends with a gap; a text pattern must "
-              "follow each gap"),
-      ERR_HINT(kSyntaxHint));
-  }
-  if (opts->empty()) {
-    THROW_SQL_ERROR(
-      ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
-      ERR_MSG("ts_sloppy_phrase text arguments produced no searchable "
-              "terms"),
-      ERR_HINT("All text arguments tokenised to nothing (e.g. all-stopword "
-               "input). Provide at least one searchable term."));
-  }
-
-  // Mirrors FromPhrase: a single-term phrase reduces to a term query
-  // at prepare time (GetKind -> kSingleWord) and the matcher ignores
-  // slop for phrase_size == 1, so positions are only required for
-  // multi-term phrases.
-  if (opts->size() > 1 &&
-      (column_info.tokenizer.features &
-       irs::PhraseQuery<irs::FixedPhraseState>::kRequiredFeatures) !=
-        irs::PhraseQuery<irs::FixedPhraseState>::kRequiredFeatures) {
-    THROW_SQL_ERROR(
-      ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
-      ERR_MSG("ts_sloppy_phrase field should have Positions and Frequency "
-              "features enabled for multi-term phrases"),
-      ERR_HINT("Recreate the inverted index with both `Positions` and "
-               "`Frequency` features attached to the column, or query with "
-               "a single-term ts_sloppy_phrase / ts_like."));
-  }
-
-  // Slop + interval gaps are mutually exclusive (see SDB_ENSURE in
-  // phrase_query.cpp). Reject here for a precise error.
+  const auto slop =
+    arg_slop ? static_cast<irs::PosAttr::value_t>(*arg_slop) : ctx.slop;
   if (slop > 0) {
     for (const auto& info : *opts) {
       if (info.offs_min != info.offs_max) {
         THROW_SQL_ERROR(
           ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
-          ERR_MSG("ts_sloppy_phrase: slop budget is incompatible with "
-                  "interval gaps ([min, max])"),
-          ERR_HINT("Use a single INTEGER gap (e.g. ts_sloppy_phrase("
-                   "'a', 2, 1, 'b')), or drop slop and use ts_phrase "
-                   "with interval gaps."));
+          ERR_MSG("slop is incompatible with interval gaps ([min, max])"),
+          ERR_HINT("Use exact gaps (single INTEGER) with slop, or drop it."));
       }
     }
     opts->set_slop(slop);
@@ -612,8 +505,9 @@ void EmitPhraseSeq(irs::BooleanFilter& parent, const FilterContext& ctx,
           part_expr_ref.Cast<duckdb::BoundCastExpression>().GetReturnType())) {
       THROW_SQL_ERROR(ERR_CODE(ERRCODE_INVALID_PARAMETER_VALUE),
                       ERR_MSG("## part must not carry a slop modifier"),
-                      ERR_HINT("Use ts_phrase(...)::slop(N) or "
-                               "ts_sloppy_phrase(...) for a sloppy phrase."));
+                      ERR_HINT("Use ts_phrase(..., slop := N) or "
+                               "ts_phrase(...)::slop(N) for a sloppy "
+                               "phrase."));
     }
     const PhraseGap gap = i > 0 ? seq.gaps[i - 1] : PhraseGap{};
 

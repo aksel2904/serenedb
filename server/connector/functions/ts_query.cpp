@@ -596,25 +596,6 @@ void RegisterTSQueryConstructors(duckdb::ExtensionLoader& loader) {
     loader.RegisterFunction(std::move(set));
   }
 
-  // ts_sloppy_phrase(text, slop [, gap, text, ...]) -- same grammar
-  // as ts_phrase plus a non-negative integer slop budget. slop=0
-  // falls through to the exact path; slop>0 picks the sloppy matcher.
-  // Interval gaps + slop is rejected at filter-build time. BIGINT
-  // (not INTEGER) so out-of-range budgets reach the builder's "slop
-  // too large" check instead of a generic binder cast error --
-  // symmetric with `::slop(N)`.
-  {
-    duckdb::ScalarFunctionSet set{duckdb::Identifier{kTSQSloppyPhrase}};
-    for (auto first_arg :
-         {duckdb::LogicalType::VARCHAR, duckdb::LogicalType::BLOB}) {
-      auto fn = TSQConstructor(duckdb::Identifier{kTSQSloppyPhrase},
-                               {first_arg, duckdb::LogicalType::BIGINT});
-      fn.SetVarArgs(duckdb::LogicalType::ANY);
-      set.AddFunction(std::move(fn));
-    }
-    loader.RegisterFunction(std::move(set));
-  }
-
   // NGRAM(text [, threshold]) -- tokenises via ambient analyzer.
   {
     duckdb::ScalarFunctionSet set{duckdb::Identifier{kTSQNgram}};

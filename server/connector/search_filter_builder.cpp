@@ -88,8 +88,6 @@ customize::enum_name<sdb::connector::TSQueryOp>(
   switch (value) {
     case Phrase:
       return sdb::connector::kTSQPhrase;
-    case SloppyPhrase:
-      return sdb::connector::kTSQSloppyPhrase;
     case Like:
       return sdb::connector::kTSQLike;
     case Prefix:
@@ -1752,9 +1750,6 @@ void GetDoubleArg(const duckdb::Expression& expr, double& out, ArgError err) {
 void FromPhrase(irs::BooleanFilter&, const FilterContext&,
                 const SearchColumnInfo&,
                 const duckdb::BoundFunctionExpression&);
-void FromSloppyPhrase(irs::BooleanFilter&, const FilterContext&,
-                      const SearchColumnInfo&,
-                      const duckdb::BoundFunctionExpression&);
 void FromNgram(irs::BooleanFilter&, const FilterContext&,
                const SearchColumnInfo&, const duckdb::BoundFunctionExpression&);
 void FromLevenshtein(irs::BooleanFilter&, const FilterContext&,
@@ -1943,8 +1938,7 @@ void BuildTSQuery(irs::BooleanFilter& parent, const FilterContext& ctx,
 
   // Only the phrase emitters consume ctx.slop. Any other op carrying a
   // non-zero slop (ts_like('x')::slop(2); ## which builds a phrase but
-  // ignores ctx.slop; ts_sloppy_phrase(...)::slop(N)) is rejected to
-  // avoid silently dropping the budget.
+  // ignores ctx.slop) is rejected to avoid silently dropping the budget.
   if (op != TSQueryOp::Phrase && op != TSQueryOp::PhraseToTsquery) {
     RejectSlopOnNonPhrase(ctx);
   }
@@ -1952,8 +1946,6 @@ void BuildTSQuery(irs::BooleanFilter& parent, const FilterContext& ctx,
   switch (op) {
     case TSQueryOp::Phrase:
       return FromPhrase(parent, ctx, column_info, func);
-    case TSQueryOp::SloppyPhrase:
-      return FromSloppyPhrase(parent, ctx, column_info, func);
     case TSQueryOp::Term:
       return FromTerm(parent, ctx, column_info, func);
     case TSQueryOp::Like:
