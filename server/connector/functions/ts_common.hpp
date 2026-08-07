@@ -92,6 +92,7 @@ struct FilterContext {
       .tokenizer = tokenizer,
       .client_context = client_context,
       .scored_terms_limit = scored_terms_limit,
+      .levenshtein_max_terms = levenshtein_max_terms,
     };
   }
 
