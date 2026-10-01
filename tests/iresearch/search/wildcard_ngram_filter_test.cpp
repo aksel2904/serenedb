@@ -158,6 +158,17 @@ TEST(WildcardNGramFilterOptionsTest, one_null_matcher) {
   EXPECT_FALSE(with_matcher == no_matcher);
 }
 
+TEST(WildcardNGramFilterOptionsTest, equality_deferred_verify) {
+  irs::analysis::WildcardTokenizer analyzer{nullptr, 3};
+
+  irs::ByWildcardNGramOptions inline_check{"foo%bar", analyzer, false};
+  irs::ByWildcardNGramOptions deferred{"foo%bar", analyzer, false};
+  EXPECT_FALSE(deferred.deferred_verify);
+  EXPECT_TRUE(inline_check == deferred);
+  deferred.deferred_verify = true;
+  EXPECT_FALSE(inline_check == deferred);
+}
+
 // ---------------------------------------------------------------------------
 // ByWildcardNGram unit tests
 // ---------------------------------------------------------------------------
@@ -310,6 +321,98 @@ TEST(WildcardNGramFilterTest, query) {
   }
 }
 
+TEST(WildcardNGramFilterTest, deferred_verify_returns_candidates) {
+  static constexpr std::string_view kValues[]{"foobaz", "bazfoo", "hello"};
+  static constexpr irs::doc_id_t kBase = irs::doc_limits::min();
+
+  irs::analysis::WildcardTokenizer analyzer{nullptr, 3};
+  irs::MemoryDirectory dir;
+  {
+    auto writer = irs::IndexWriter::Make(dir, irs::kOmCreate,
+                                         irs::tests::DefaultWriterOptions());
+    ASSERT_NE(nullptr, writer);
+    WildcardField field;
+    field.id = kTextId;
+    field.analyzer = &analyzer;
+    auto ctx = writer->GetBatch();
+    for (auto v : kValues) {
+      field.value = v;
+      auto doc = ctx.Insert();
+      ASSERT_TRUE(tests::InsertField(doc, field));
+      auto* cs = doc.GetColWriter();
+      ASSERT_NE(nullptr, cs);
+      irs::tests::StoreFieldAt(*cs, kStoreId, doc.DocId(), field);
+    }
+    ctx.Commit();
+    writer->RefreshCommit();
+  }
+  irs::DirectoryReader reader{dir, irs::tests::DefaultReaderOptions()};
+  ASSERT_NE(nullptr, reader);
+
+  MaxMemoryCounter counter;
+  const auto execute = [&](const irs::Filter& q) {
+    tests::PreparedFilter prepared{q, *reader, nullptr, counter};
+    std::vector<irs::doc_id_t> result;
+    for (size_t i = 0, n = prepared.size(); i < n; ++i) {
+      auto docs = prepared.Execute(i);
+      while (!irs::doc_limits::eof(docs->Next())) {
+        result.push_back(docs->Value() - kBase);
+      }
+    }
+    return result;
+  };
+  using Docs = std::vector<irs::doc_id_t>;
+
+  auto like = MakeFilter(kTextId, "%baz%foo%", analyzer, false);
+  EXPECT_EQ(Docs{1}, execute(like));
+  like.mutable_options()->deferred_verify = true;
+  EXPECT_EQ((Docs{0, 1}), execute(like));
+  like.mutable_options()->store_field_id = kOtherId;
+  EXPECT_EQ(Docs{}, execute(like));
+
+  auto regexp = MakeRegexpFilter(kTextId, ".*baz.*foo.*", analyzer, false);
+  EXPECT_EQ(Docs{1}, execute(regexp));
+  regexp.mutable_options()->deferred_verify = true;
+  EXPECT_EQ((Docs{0, 1}), execute(regexp));
+}
+
+TEST(WildcardNGramFilterTest, match_stored_terms) {
+  irs::analysis::WildcardTokenizer analyzer{nullptr, 3};
+  const auto stored = [&](std::span<const std::string_view> values) {
+    irs::bstring blob;
+    for (const auto v : values) {
+      irs::ValueAnalyzer value_analyzer;
+      irs::ValueTokens tokens;
+      EXPECT_TRUE(
+        value_analyzer.Analyze(analyzer, tests::ToStringT(v), tokens));
+      blob += tokens.store();
+    }
+    return blob;
+  };
+  const auto like = [&](std::string_view pattern) {
+    return irs::ByWildcardNGramOptions{pattern, analyzer, false}.matcher;
+  };
+  const auto regexp = [&](std::string_view pattern) {
+    return MakeRegexpOptions(pattern, analyzer, false).matcher;
+  };
+
+  static constexpr std::string_view kOne[]{"foobar"};
+  static constexpr std::string_view kThree[]{"abc", "foobar", "xyz"};
+  const auto one = stored(kOne);
+  const auto three = stored(kThree);
+
+  EXPECT_FALSE(irs::MatchStoredTerms(*like("foo%"), {}));
+  EXPECT_TRUE(irs::MatchStoredTerms(*like("foo%"), one));
+  EXPECT_FALSE(irs::MatchStoredTerms(*like("%baz"), one));
+  EXPECT_TRUE(irs::MatchStoredTerms(*like("abc"), three));
+  EXPECT_TRUE(irs::MatchStoredTerms(*like("fo_bar"), three));
+  EXPECT_TRUE(irs::MatchStoredTerms(*like("xy%"), three));
+  EXPECT_FALSE(irs::MatchStoredTerms(*like("%qqq%"), three));
+  EXPECT_FALSE(irs::MatchStoredTerms(*like("abcfoo%"), three));
+  EXPECT_TRUE(irs::MatchStoredTerms(*regexp("fo+bar"), three));
+  EXPECT_FALSE(irs::MatchStoredTerms(*regexp("foo"), three));
+}
+
 TEST(RegexpNGramFilterOptionsTest, default_ctor) {
   irs::ByRegexpNGramOptions opts;
   EXPECT_TRUE(opts.pattern.empty());
@@ -359,6 +462,10 @@ TEST(RegexpNGramFilterOptionsTest, equality_is_by_pattern) {
     MakeRegexpOptions("abc", analyzer, true, irs::RegexpSyntax::PosixEre));
   EXPECT_FALSE(MakeRegexpOptions("abc", analyzer, true) ==
                MakeRegexpOptions("abc", analyzer, false));
+
+  auto deferred = MakeRegexpOptions("abc", analyzer);
+  deferred.deferred_verify = true;
+  EXPECT_FALSE(MakeRegexpOptions("abc", analyzer) == deferred);
 }
 
 TEST(RegexpNGramFilterOptionsTest, matcher_equality) {
