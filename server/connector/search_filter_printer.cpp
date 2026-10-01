@@ -71,6 +71,14 @@ void AddMergeAttribute(ExplainNode& node, ScoreMergeType merge) {
   }
 }
 
+template<typename Options>
+void AddVerify(ExplainNode& node, const Options& options) {
+  if (options.matcher) {
+    node.attributes["Verify"] =
+      options.deferred_verify ? "table filter" : "inline";
+  }
+}
+
 // Prints a binary term byte-by-byte, escaping non-printable chars.
 template<typename Term>
 std::string TermToString(Term term) {
@@ -523,6 +531,7 @@ struct FilterPrinter {
       node.attributes["Token"] = TermToString(f.options().token);
       node.attributes["Has Pos"] = f.options().has_pos ? "true" : "false";
       node.attributes["Parts"] = WildcardNGramParts(f);
+      AddVerify(node, f.options());
       return node;
     }
     if (type == Type<ByRegexpNGram>::id()) {
@@ -535,6 +544,7 @@ struct FilterPrinter {
         options.syntax == RegexpSyntax::Perl ? "perl" : "posix";
       node.attributes["Has Pos"] = options.has_pos ? "true" : "false";
       node.attributes["Query"] = irs::ToString(options.query);
+      AddVerify(node, options);
       return node;
     }
     if (type == Type<Empty>::id()) {
