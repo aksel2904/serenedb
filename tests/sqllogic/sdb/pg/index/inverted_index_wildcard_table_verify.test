@@ -2098,3 +2098,77 @@ QUERY PLAN
 
 statement ok
 DROP TABLE tv_t
+
+# A throwing filter on a stored column sees only rows that pass the check:
+# rows 2 and 4 hold the n-grams of '%foo%bar%' but not the pattern, and their
+# s is not a number.
+
+statement ok
+CREATE TABLE tv_thr (id BIGINT PRIMARY KEY, x INTEGER, msg VARCHAR, s VARCHAR)
+
+statement ok
+CREATE INDEX tv_thr_idx ON tv_thr USING inverted(id, msg tv_dict) INCLUDE (x, s)
+  WITH (refresh_interval = 0, compaction_interval = 0)
+
+statement ok
+INSERT INTO tv_thr VALUES
+    (1, 5, 'foo-bar one', '10'),
+    (2, 5, 'bar-foo two', 'abc'),
+    (3, 0, 'foo then bar', '20'),
+    (4, 5, 'bar then foo', 'xyz'),
+    (5, 5, 'nothing here', 'zzz'),
+    (6, 7, 'foobar', '30'),
+    (7, 5, NULL, 'qqq')
+
+statement ok
+VACUUM (REFRESH_TABLE) tv_thr
+
+query
+SELECT count(*) AS c FROM tv_thr_idx WHERE msg @@ ts_like('%foo%bar%')
+----
+c
+3
+
+query
+SELECT count(*) AS c FROM tv_thr_idx WHERE msg @@ ts_like('%foo%bar%') AND CAST(s AS INTEGER) > 0
+----
+c
+3
+
+query
+SELECT id, s FROM tv_thr_idx WHERE msg @@ ts_like('%foo%bar%') AND CAST(s AS INTEGER) > 0 ORDER BY id
+----
+id	s
+1	10
+3	20
+6	30
+
+query
+SELECT id, s FROM (SELECT id, s FROM tv_thr_idx WHERE msg @@ ts_like('%foo%bar%') AND CAST(s AS INTEGER) > 0
+      ORDER BY BM25(tv_thr_idx.tableoid) DESC LIMIT 10) t ORDER BY id
+----
+id	s
+1	10
+3	20
+6	30
+
+query
+SELECT count(*) AS c FROM tv_thr_idx WHERE msg @@ ts_like('%foo%bar%') AND CAST(s AS INTEGER) > 0 AND x > 0
+----
+c
+2
+
+query
+SELECT count(*) AS c FROM tv_thr_idx WHERE msg @@ ts_regexp('.*foo.*bar.*') AND CAST(s AS INTEGER) > 0
+----
+c
+3
+
+query
+SELECT count(*) AS c FROM tv_thr_idx WHERE msg @@ ts_like('%foo%') AND msg @@ ts_like('%foo%bar%') AND CAST(s AS INTEGER) > 0
+----
+c
+3
+
+statement ok
+DROP TABLE tv_thr

@@ -20,6 +20,8 @@
 
 #include "connector/scan/deferred_verify.h"
 
+#include <absl/algorithm/container.h>
+
 #include <duckdb/common/vector_operations/unary_executor.hpp>
 #include <duckdb/function/scalar_function.hpp>
 #include <duckdb/planner/expression/bound_function_expression.hpp>
@@ -128,10 +130,24 @@ void DeferWildcardVerify(irs::Filter& root) {
 }
 
 void AddDeferredVerifyFilters(ScanGlobalState& state, const irs::Filter& root) {
+  const auto pushed = state.col_filters.size();
   VisitConjuncts(root, [&](const irs::Filter& filter) {
     AddDeferred<irs::ByWildcardNGram>(state, filter);
     AddDeferred<irs::ByRegexpNGram>(state, filter);
   });
+  if (state.col_filters.size() == pushed) {
+    return;
+  }
+  using ColFilter = ScanGlobalState::ColFilter;
+  const bool can_throw =
+    absl::c_any_of(state.col_filters, [](const ColFilter& cf) {
+      return !cf.is_score &&
+             cf.filter->Cast<duckdb::ExpressionFilter>().expr->CanThrow();
+    });
+  if (can_throw) {
+    absl::c_stable_partition(state.col_filters,
+                             [](const ColFilter& cf) { return cf.row_gather; });
+  }
 }
 
 }  // namespace sdb::connector
