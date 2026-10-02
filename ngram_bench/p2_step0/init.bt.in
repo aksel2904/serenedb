@@ -1,0 +1,64 @@
+// Part 2 step 0: dict_fsst CompressedStringScanState::Initialize per call.
+// @SERENED@ is replaced by run.sh with the binary path. Offsets are from
+// the disassembly of the e4581109f perf binary
+// (decompression.cpp:65-79): this+0x8 segment, this+0x78 baseptr;
+// ColumnSegment+0x0 count. Header: +4 dict_count, +8 mode,
+// +0x10 prefix_count, +0x14 prefix_bytes, +0x18 suffix_bytes (plus modes).
+uprobe:@SERENED@:_ZN6duckdb9dict_fsst25CompressedStringScanState10InitializeEb
+{
+  @t0[tid] = nsecs;
+  @self[tid] = arg0;
+  @flag[tid] = arg1 & 0xff;
+}
+
+uretprobe:@SERENED@:_ZN6duckdb9dict_fsst25CompressedStringScanState10InitializeEb
+/@t0[tid]/
+{
+  $d = nsecs - @t0[tid];
+  $s = @self[tid];
+  $base = *(uint64 *)($s + 0x78);
+  $mode = *(uint8 *)($base + 8);
+  $dc = *(uint32 *)($base + 4);
+  $pc = *(uint32 *)($base + 0x10);
+  $pb = *(uint32 *)($base + 0x14);
+  $sb = *(uint32 *)($base + 0x18);
+  $cnt = *(uint64 *)(*(uint64 *)($s + 8));
+  $f = @flag[tid];
+  @calls[$f, $mode] = count();
+  @ns[$f, $mode] = sum($d);
+  @blk[$f, $mode, $cnt, $dc, $pc, $pb, $sb] = count();
+  @blkns[$f, $mode, $cnt, $dc, $pc, $pb, $sb] = sum($d);
+  delete(@t0[tid]);
+  delete(@self[tid]);
+  delete(@flag[tid]);
+}
+
+uprobe:@SERENED@:_ZN6duckdb9dict_fsst26DictFSSTCompressionStorage14StringFetchRowERNS_13ColumnSegmentERNS_16ColumnFetchStateElRNS_6VectorEm
+{
+  @fetch = count();
+}
+
+uprobe:@SERENED@:_ZN6duckdb11FSSTStorage14StringFetchRowERNS_13ColumnSegmentERNS_16ColumnFetchStateElRNS_6VectorEm,
+uprobe:@SERENED@:_ZN6duckdb11ZSTDStorage14StringFetchRowERNS_13ColumnSegmentERNS_16ColumnFetchStateElRNS_6VectorEm,
+uprobe:@SERENED@:_ZN6duckdb25UncompressedStringStorage14StringFetchRowERNS_13ColumnSegmentERNS_16ColumnFetchStateElRNS_6VectorEm,
+uprobe:@SERENED@:_ZN6duckdb28DictionaryCompressionStorage14StringFetchRowERNS_13ColumnSegmentERNS_16ColumnFetchStateElRNS_6VectorEm
+{
+  @fetch_other[probe] = count();
+}
+
+// Readiness marker: bpftrace prints "Attaching" before the uprobes are live,
+// and printf to -o is buffered; $1 is the marker file to create.
+uprobe:@SERENED@:_ZN6duckdb12_GLOBAL__N_111MD5FunctionERNS_9DataChunkERNS_15ExpressionStateERNS_6VectorE
+/@ready == 0/
+{
+  @ready = 1;
+  system("touch %s", str($1));
+}
+
+END
+{
+  clear(@t0);
+  clear(@self);
+  clear(@flag);
+  clear(@ready);
+}
